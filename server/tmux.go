@@ -139,8 +139,11 @@ func tmuxList(conf string) ([]struct {
 	out, err := runTmux(conf, "list-sessions", "-F", "#{session_created}\t#{session_attached}\t#{session_name}")
 	if err != nil {
 		msg := err.Error()
-		// socket 无服务端（尚未创建任何会话）是空列表，不是环境故障
+		// socket 无服务端（尚未创建任何会话 / server 刚被 kill）是空列表，
+		// 不是环境故障。tmux 3.3 的两种报错文本分别覆盖 socket 缺失与
+		// socket 残留但 server 已退出两种形态。
 		if strings.Contains(msg, "no server running") ||
+			strings.Contains(msg, "server exited unexpectedly") ||
 			(strings.Contains(msg, "error connecting") && strings.Contains(msg, "No such file")) {
 			return nil, nil
 		}
