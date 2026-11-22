@@ -180,6 +180,17 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Shell 退出（会话结束）时主动关闭 WS。否则主循环会一直堵在
+	// c.Read 等客户端输入：会话已从 map 移除、进程已死，连接却还挂着，
+	// 客户端永远停在「已连接」。ctx.Done() 保证处理器返回后监视器退出。
+	go func() {
+		select {
+		case <-s.done:
+			c.Close(websocket.StatusNormalClosure, "session ended")
+		case <-ctx.Done():
+		}
+	}()
+
 	// PTY → WS
 	go func() {
 		buf := make([]byte, 32*1024)
