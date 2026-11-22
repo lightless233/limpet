@@ -349,12 +349,34 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	done := make(chan struct{})
 
 	// 启动入口：只在未启动且未关闭时 spawn tmux 客户端，
-	// 由主循环（首条尺寸消息）与超时兜底定时器共用，s.mu 串行化。
+	// 由主循环（首条尺寸消息）与超时兜底定时器共用。
+	// 两个调用方可能并发进入，检查-捕获-发送-启动必须整体串行化
+	// （spawnMu），否则双 spawn 会让 replayCh/ptyReady 管道卡死。
+	// spawn 前捕获 pane 历史（spec 001：接入回放），ready 后先行回放，
+	// 让浏览器滚动缓冲拥有断开前的内容；捕获失败降级为无回放。
+	var spawnMu sync.Mutex
+	replayCh := make(chan []byte, 1)
 	spawnNow := func(sz pty.Winsize) error {
+		spawnMu.Lock()
+		defer spawnMu.Unlock()
 		if closing.Load() || s.ptmx != nil {
 			return nil
 		}
-		return spawnTmuxClient(s, sz, done)
+		s.mu.Lock()
+		sessionID := s.id
+		s.mu.Unlock()
+		log.Printf("term %s DEBUG capture start", id)
+		out, cerr := runTmux(tmuxConfPath, "capture-pane", "-p", "-e", "-S", "-10000", "-t", sessionID)
+		log.Printf("term %s DEBUG capture done: err=%v len=%d", id, cerr, len(out))
+		if cerr == nil {
+			replayCh <- []byte(out)
+			log.Printf("term %s DEBUG replay queued", id)
+		} else {
+			log.Printf("term %s capture: %v", id, cerr)
+		}
+		err := spawnTmuxClient(s, sz, done)
+		log.Printf("term %s DEBUG spawn done: err=%v", id, err)
+		return err
 	}
 	spawnFailed := func(where string, err error) {
 		// 会话真实存在（创建即建），不删条目；本次接入以 1011 结束，
@@ -364,11 +386,9 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 初始化超时：迟迟等不到尺寸消息时按兜底尺寸启动，避免永久等待。
+	// 注意不要持有 s.mu 调 spawnNow（其内部会再取 s.mu，非重入锁会自死锁）。
 	initTimer := time.AfterFunc(initTimeout, func() {
-		s.mu.Lock()
-		err := spawnNow(fallback)
-		s.mu.Unlock()
-		if err != nil {
+		if err := spawnNow(fallback); err != nil {
 			spawnFailed("timeout", err)
 		}
 	})
@@ -394,6 +414,17 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"ready"}`)); err != nil {
 			return
+		}
+		// 接入回放：先于实时输出发送 pane 历史（spec 001）。
+		replay := <-replayCh
+		for i := 0; i < len(replay); i += 64 * 1024 {
+			end := i + 64 * 1024
+			if end > len(replay) {
+				end = len(replay)
+			}
+			if werr := c.Write(ctx, websocket.MessageBinary, replay[i:end]); werr != nil {
+				return
+			}
 		}
 		buf := make([]byte, 32*1024)
 		for {
@@ -422,16 +453,18 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 				Rows uint16 `json:"rows"`
 			}
 			if json.Unmarshal(data, &ctl) == nil && ctl.Type == "resize" && ctl.Cols > 0 && ctl.Rows > 0 {
-				s.mu.Lock()
+				// spawnNow 绝不能在持有 s.mu 时调用（其内部会再取 s.mu，
+				// 非重入锁自死锁）——与上方定时器路径同理。
 				err := spawnNow(pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
-				if err == nil && s.ptmx != nil {
-					_ = pty.Setsize(s.ptmx, &pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
-				}
-				s.mu.Unlock()
 				if err != nil {
 					spawnFailed("resize", err)
 					return
 				}
+				s.mu.Lock()
+				if s.ptmx != nil {
+					_ = pty.Setsize(s.ptmx, &pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
+				}
+				s.mu.Unlock()
 			}
 			continue
 		}

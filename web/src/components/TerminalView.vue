@@ -234,6 +234,7 @@ const statusText = {
         ref="term"
         :core="core"
         auto-resize
+        :scrollback-lines="10000"
         class="h-full w-full"
         @data="onData"
         @binary="onBinary"
