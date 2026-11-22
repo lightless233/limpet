@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/creack/pty"
@@ -33,6 +34,9 @@ var (
 	sessionsMu sync.Mutex
 	sessions   = map[string]*termSession{}
 )
+
+// pendingSessionTTL 是预留会话（未接入）的存活时间。
+const pendingSessionTTL = 30 * time.Second
 
 func newSessionID() string {
 	b := make([]byte, 8)
@@ -70,34 +74,56 @@ func terminalEnviron() []string {
 	return env
 }
 
-// POST /api/term —— 创建终端会话，返回终端 ID。
+// POST /api/term —— 预留终端会话，返回终端 ID。
+// Shell 不在此刻 spawn：PTY 必须以接入方的真实尺寸创建，否则 Shell 在
+// 旧尺寸下写出的首屏（提示符、PROMPT_SP 标记行）不会回流。真正的
+// spawn 在首次 WS 接入时按 query/控制消息给出的尺寸进行。
 func handleTermCreate(w http.ResponseWriter, r *http.Request) {
 	id := newSessionID()
-	cmd := exec.Command(shellPath())
-	cmd.Env = terminalEnviron()
+	s := &termSession{id: id, done: make(chan struct{})}
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	s := &termSession{id: id, cmd: cmd, ptmx: ptmx, done: make(chan struct{})}
 	sessionsMu.Lock()
 	sessions[id] = s
 	sessionsMu.Unlock()
+
+	// 无人接入的预留会话定时回收，防止 map 泄漏。
+	time.AfterFunc(pendingSessionTTL, func() {
+		s.mu.Lock()
+		claimed := s.claimed
+		s.mu.Unlock()
+		if !claimed {
+			sessionsMu.Lock()
+			delete(sessions, id)
+			sessionsMu.Unlock()
+		}
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+// spawnShell 创建 PTY 并启动 Shell，size 来自接入请求。
+func spawnShell(s *termSession, size pty.Winsize) error {
+	cmd := exec.Command(shellPath())
+	cmd.Env = terminalEnviron()
+
+	ptmx, err := pty.StartWithSize(cmd, &size)
+	if err != nil {
+		return err
+	}
+
+	s.cmd = cmd
+	s.ptmx = ptmx
 
 	// 进程退出后回收会话与 PTY。
 	go func() {
 		_ = cmd.Wait()
 		_ = ptmx.Close()
 		sessionsMu.Lock()
-		delete(sessions, id)
+		delete(sessions, s.id)
 		sessionsMu.Unlock()
 		close(s.done)
 	}()
-
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+	return nil
 }
 
 // GET /api/ws/term/{id}?cols=&rows= —— 接入终端会话。
@@ -131,7 +157,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("term %s attached", id)
 
-	// 初始窗口尺寸（缺省 80x24）。
+	// 初始窗口尺寸（缺省 80x24）。Shell 以该尺寸 spawn，保证首屏排版正确。
 	size := pty.Winsize{Rows: 24, Cols: 80}
 	if v := queryUint(r, "cols"); v > 0 {
 		size.Cols = v
@@ -139,7 +165,11 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	if v := queryUint(r, "rows"); v > 0 {
 		size.Rows = v
 	}
-	_ = pty.Setsize(s.ptmx, &size)
+	if err := spawnShell(s, size); err != nil {
+		log.Printf("term %s spawn: %v", id, err)
+		c.Close(websocket.StatusInternalError, "spawn failed")
+		return
+	}
 
 	ctx := r.Context()
 
