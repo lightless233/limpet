@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* wterm 滚动修复：库默认给 .wterm 设 overflow:hidden，只支持程序化
+   scrollTop；用户滚轮/触摸在 hidden 下不产生原生滚动（应用未开启鼠标
+   跟踪时 wterm 也不处理滚轮，直接放行）。放开为 auto 后：
+   - 普通状态：滚轮/触摸原生滚动回放的历史（选中复制不变）
+   - 应用开启鼠标跟踪（vim 等）：wterm 自己接管滚轮并 preventDefault，
+     与原生滚动不冲突 */
+.wterm {
+  overflow-y: auto;
+}
