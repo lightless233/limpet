@@ -9,7 +9,12 @@ import '@wterm/vue/css'
 
 const term = useTemplateRef('term')
 const core = ref<GhosttyCore | null>(null)
-const loadError = ref('')
+// 两类错误分开处理：
+// - fatalError：core 加载或 Terminal 初始化失败，终端组件无法存在，
+//   以全屏错误替代终端；重连会重建 core 并重新挂载组件。
+// - connError：会话创建 / WS 失败，终端组件完好，错误显示在头部。
+const fatalError = ref('')
+const connError = ref('')
 
 type Status = 'connecting' | 'connected' | 'closed' | 'error'
 const status = ref<Status>('connecting')
@@ -17,39 +22,56 @@ const sessionId = ref('')
 
 const encoder = new TextEncoder()
 let ws: WebSocket | null = null
+// Terminal 组件挂载后长期存活，@ready 在其生命周期内只触发一次；
+// ready 只置位一次、绝不随 connect() 重置，否则重连后输出会永远排队。
+let termReady = false
 // ready 之前到达的输出先排队，避免丢首屏（提示符、banner）。
 const pending: Uint8Array[] = []
-let ready = false
 // autoResize 的首次回调早于 WS 握手完成，必须把尺寸存下来，
 // 在 onopen 时补发，否则 PTY 永远停在初始 80x24：
 // zsh 的 PROMPT_SP 标记行按错误列数填充，会在网格里提前换行留下可见的 %。
 let lastSize: { cols: number; rows: number } | null = null
 
-onMounted(async () => {
-  try {
-    core.value = await GhosttyCore.load()
-  } catch (e) {
-    loadError.value = e instanceof Error ? e.message : String(e)
-    status.value = 'error'
-    return
-  }
-  connect()
-})
+onMounted(connect)
 
 onBeforeUnmount(() => {
-  ws?.close()
-  ws = null
+  detachSocket()
 })
 
+function detachSocket() {
+  if (!ws) return
+  // 先摘回调再关闭，避免旧连接的 onclose 污染新一轮连接的状态。
+  ws.onopen = ws.onmessage = ws.onclose = null
+  ws.close()
+  ws = null
+}
+
 async function connect() {
-  ws?.close()
-  ready = false
+  detachSocket()
   pending.length = 0
   status.value = 'connecting'
+  connError.value = ''
+
+  if (fatalError.value) {
+    // 终端组件此前因错误被卸载：重建 core 并重新挂载，等待新的 @ready。
+    fatalError.value = ''
+    termReady = false
+    core.value = null
+  }
+
+  if (!core.value) {
+    try {
+      core.value = await GhosttyCore.load()
+    } catch (e) {
+      fatalError.value = e instanceof Error ? e.message : String(e)
+      status.value = 'error'
+      return
+    }
+  }
 
   try {
     const res = await fetch('/api/term', { method: 'POST' })
-    if (!res.ok) throw new Error(`创建会话失败: HTTP ${res.status}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data: { id: string } = await res.json()
     sessionId.value = data.id
 
@@ -60,10 +82,11 @@ async function connect() {
     ws.onopen = () => {
       status.value = 'connected'
       sendResize()
+      term.value?.focus()
     }
     ws.onmessage = (e) => {
       const bytes = new Uint8Array(e.data as ArrayBuffer)
-      if (!ready) {
+      if (!termReady) {
         pending.push(bytes)
       } else {
         term.value?.write(bytes)
@@ -73,7 +96,7 @@ async function connect() {
       if (status.value !== 'error') status.value = 'closed'
     }
   } catch (e) {
-    loadError.value = e instanceof Error ? e.message : String(e)
+    connError.value = e instanceof Error ? e.message : String(e)
     status.value = 'error'
   }
 }
@@ -104,9 +127,17 @@ function onResize(cols: number, rows: number) {
 }
 
 function onReady(wt: WTerm) {
-  ready = true
+  // 组件生命周期内只触发一次；不重挂载就不会再来。
+  termReady = true
   flushPending()
   wt.focus()
+}
+
+// WTerm 初始化失败（wasm 加载/实例化问题）：终端不可用，转为 fatalError；
+// 下次重连会重建 core 并重新挂载组件。
+function onTerminalError(e: unknown) {
+  fatalError.value = String(e)
+  status.value = 'error'
 }
 </script>
 
@@ -126,6 +157,7 @@ function onReady(wt: WTerm) {
         {{ status === 'connecting' && sessionId ? '接入中' : { connecting: '连接中', connected: '已连接', closed: '已断开', error: '错误' }[status] }}
       </span>
       <span v-if="sessionId" class="font-mono text-xs text-neutral-500">{{ sessionId }}</span>
+      <span v-if="connError" class="truncate text-red-400">{{ connError }}</span>
       <button
         v-if="status === 'closed' || status === 'error'"
         class="ml-auto rounded-md bg-neutral-800 px-3 py-1 text-xs hover:bg-neutral-700 active:scale-95"
@@ -135,8 +167,8 @@ function onReady(wt: WTerm) {
       </button>
     </header>
 
-    <div v-if="loadError" class="flex-1 overflow-auto p-6 font-mono text-sm text-red-400">
-      {{ loadError }}
+    <div v-if="fatalError" class="flex-1 overflow-auto p-6 font-mono text-sm text-red-400">
+      {{ fatalError }}
     </div>
 
     <div v-else class="min-h-0 flex-1 px-2 pb-2">
@@ -150,7 +182,7 @@ function onReady(wt: WTerm) {
         @binary="onBinary"
         @resize="onResize"
         @ready="onReady"
-        @error="(e: unknown) => { loadError = String(e); status = 'error' }"
+        @error="onTerminalError"
       />
     </div>
   </div>
