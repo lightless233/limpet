@@ -68,10 +68,21 @@ async function submitSheet() {
   }
 }
 
+const closeError = ref('')
+
 async function closeSession(s: SessionItem) {
   if (!confirm(`关闭会话「${s.id}」？其中的 Shell 将被终止。`)) return
-  await fetch(`/api/term/${encodeURIComponent(s.id)}/close`, { method: 'POST' })
-  await refresh()
+  closeError.value = ''
+  try {
+    const res = await fetch(`/api/term/${encodeURIComponent(s.id)}/close`, { method: 'POST' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error ?? `HTTP ${res.status}`)
+    }
+    await refresh()
+  } catch (e) {
+    closeError.value = `关闭失败: ${e instanceof Error ? e.message : String(e)}`
+  }
 }
 
 function fmtTime(iso: string) {
@@ -97,6 +108,7 @@ function fmtTime(iso: string) {
     </header>
 
     <main class="min-h-0 flex-1 overflow-y-auto px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
+      <p v-if="closeError" class="px-1 py-2 text-sm text-red-400">{{ closeError }}</p>
       <p v-if="loadError" class="px-1 py-2 text-sm text-red-400">{{ loadError }}</p>
       <p v-else-if="loading && !sessions.length" class="px-1 py-2 text-sm text-neutral-500">加载中…</p>
       <p v-else-if="!sessions.length" class="px-1 py-6 text-center text-sm text-neutral-500">

@@ -9,7 +9,7 @@
 
 **问题**：`server/term.go` 的 `spawnShell` 直接启动 zsh，WS 断开即杀进程，无接续能力。
 
-**改动**：PTY 子进程从 Shell 换成 tmux 客户端进程。会话首次接入（首条尺寸消息到达）时：会话不存在则 `tmux -L limpet -f <limpet-conf> new-session -s <id> -x -y`，已存在则 `attach -t <id>`。WS 断开只杀客户端进程，不再触碰会话。tmux 会话的创建从接入时机移到创建接口（见单元 2，本单元先保持「接入时创建」的现有结构跑通，单元 2 调整为创建即建）。会话结束监视器语义改为：tmux 会话消失（Shell 内 exit / kill-session）→ 关闭当前客户端连接。
+**改动**：PTY 子进程从 Shell 换成 tmux 客户端进程。会话在创建接口即以 `tmux new-session -d` 建立（Shell 随会话启动并出现在列表）；接入路径只执行 `attach-session`（精确目标 `-t =<name>`），绝不创建会话。WS 断开只杀客户端进程并释放接入占用，不触碰会话。会话结束监视器语义：tmux 会话消失（Shell 内 exit / kill-session）→ 关闭当前客户端连接。启动流程为异步（读循环保持能读，断线即时取消捕获并释放占用）。
 
 **保持不变**：帧协议、首条尺寸消息启动、ready 帧、1008 拒绝、claimed 单接入 409、TTL 预留、尾部清理（未启动回收改为回收「预留条目」，tmux 会话不存在时同样成立）、每会话重建前端 core。
 
@@ -22,7 +22,7 @@
 **问题**：现在只有「预留 + 接入」，没有列表，创建时机不产生可见会话。
 
 **改动**：
-- `POST /api/term` 接受可选 `name`：校验字符集（禁 `:` `.`、长度 ≤ 100）与重名（409），创建即 `tmux new-session`（Shell 随会话启动），返回 id。预留（未接入）与 tmux 会话并存：预留条目承载「已创建待接入」状态，TTL 语义不变。
+- `POST /api/term` 接受可选 `name`：校验字符集（禁 `:` `.` 与控制字符、长度 ≤ 100）与重名（409），创建即 `tmux new-session`（Shell 随会话启动），返回 id；请求体非空时必须是合法 JSON（否则 400）。
 - `GET /api/term`：从 `tmux list-sessions` 实时映射（id/created/attached），创建时间倒序；预留未接入的条目同样列出。
 - `POST /api/term/{id}/rename`：校验 + 409 语义同创建。
 - `POST /api/term/{id}/close`：kill-session + 清理预留条目；会话不存在 404。

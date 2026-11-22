@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 const tmuxSocket = "limpet"
@@ -89,9 +90,13 @@ func runTmuxCtx(ctx context.Context, conf string, args ...string) (string, error
 	return stdout.String(), nil
 }
 
-// tmuxSessionNameValid 校验会话名：非空、长度受限、不含 tmux 目标解析保留字符。
+// tmuxSessionNameValid 校验会话名：非空、长度受限、不含 tmux 目标解析
+// 保留字符（: .）与控制字符（Tab 等会破坏 list-sessions 的分隔解析）。
 func tmuxSessionNameValid(name string) bool {
 	if name == "" || uint(len([]rune(name))) > maxSessionNameLen {
+		return false
+	}
+	if strings.ContainsFunc(name, unicode.IsControl) {
 		return false
 	}
 	return !strings.ContainsAny(name, ":.")
@@ -133,7 +138,10 @@ func tmuxList(conf string) ([]struct {
 }, error) {
 	out, err := runTmux(conf, "list-sessions", "-F", "#{session_created}\t#{session_attached}\t#{session_name}")
 	if err != nil {
-		if strings.Contains(err.Error(), "no server running") {
+		msg := err.Error()
+		// socket 无服务端（尚未创建任何会话）是空列表，不是环境故障
+		if strings.Contains(msg, "no server running") ||
+			(strings.Contains(msg, "error connecting") && strings.Contains(msg, "No such file")) {
 			return nil, nil
 		}
 		return nil, err
@@ -171,6 +179,17 @@ func tmuxList(conf string) ([]struct {
 func tmuxRename(conf, oldID, newID string) error {
 	_, err := runTmux(conf, "rename-session", "-t", exactTarget(oldID), newID)
 	return err
+}
+
+// tmuxActivePaneID 解析会话当前活动 pane 的 ID（%N）。
+// capture-pane 的 -t 是 target-pane，会话名恰好等于其他会话的 pane ID
+// 时会被优先按 pane ID 解析——两步寻址（会话名 → pane ID）规避歧义。
+func tmuxActivePaneID(conf, sessionID string) (string, error) {
+	out, err := runTmux(conf, "display-message", "-p", "-t", exactTarget(sessionID), "#{pane_id}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }
 
 // tmuxKill 关闭会话（Shell 一并终止）。

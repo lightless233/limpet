@@ -42,6 +42,11 @@ func main() {
 	mux.HandleFunc("POST /api/term/{id}/close", handleTermClose)
 	mux.HandleFunc("POST /api/term/{id}/rename", handleTermRename)
 	mux.HandleFunc("GET /api/ws/term/{id}", handleTermWS)
+	// 未知 API 一律 404 JSON：不能落进静态托管（SPA fallback 会把
+	// 不存在的接口变成 200 text/html，调用方无法察觉错误）。
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown api"})
+	})
 	serveStatic(mux)
 
 	log.Printf("limpet server listening on %s", addr)

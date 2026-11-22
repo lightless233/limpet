@@ -120,7 +120,12 @@ func handleTermCreate(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if b, err := io.ReadAll(io.LimitReader(r.Body, 4096)); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-		_ = json.Unmarshal(b, &body) // 解析失败按无名称处理
+		// 非空 body 必须是合法 JSON：静默忽略会让调用方拿到意料之外的
+		// 随机名会话且无从察觉。
+		if err := json.Unmarshal(b, &body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+			return
+		}
 	}
 	name := strings.TrimSpace(body.Name)
 	if name == "" {
@@ -364,47 +369,17 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	exitCode := websocket.StatusNormalClosure
 	exitReason := "session ended"
 
-	// 启动入口：只在未启动且未关闭时 spawn tmux 客户端，
-	// 由主循环（首条尺寸消息）与超时兜底定时器共用。
-	// 两个调用方可能并发进入，检查-捕获-复查-启动必须整体串行化
-	// （spawnMu），否则双 spawn 会让 replayCh/ptyReady 管道卡死。
-	// spawn 前捕获 pane 历史（spec 001：接入回放），ready 后先行回放，
-	// 让浏览器滚动缓冲拥有断开前的内容；捕获失败降级为无回放。
-	// 捕获绑定连接上下文（可取消），返回后在锁内复查 closing：
-	// 清理要么阻止启动，要么拿到刚启动的客户端并将其收掉。
+	// 启动流程：首条尺寸与兜底定时器都只「触发」它（幂等），真正的
+	// 检查-捕获-启动在独立 goroutine 里执行——读循环必须保持能读，
+	// 否则 capture 期间断线要等捕获结束才能被发现。
+	// spawnMu 让启动与断线清理串行化：清理要么阻止启动（锁内复查
+	// closing），要么拿到刚启动的客户端并将其收掉。
+	// spawn 前捕获 pane 历史（spec 001：接入回放），ready 后先行回放；
+	// 捕获失败降级为无回放（交付空结果，不阻塞输出协程）。
+	var latestSize atomic.Pointer[pty.Winsize]
+	var spawnStarted atomic.Bool
 	var spawnMu sync.Mutex
 	replayCh := make(chan []byte, 1)
-	spawnNow := func(sz pty.Winsize) error {
-		spawnMu.Lock()
-		defer spawnMu.Unlock()
-		if closing.Load() || s.ptmx != nil {
-			return nil
-		}
-		s.mu.Lock()
-		sessionID := s.id
-		s.mu.Unlock()
-		// 会话可能在查找与首条尺寸消息之间被关闭：接入路径绝不复活
-		// 会话，存在性消失则清条目并以 1011 结束本次接入。
-		if !tmuxSessionExists(tmuxConfPath, sessionID) {
-			sessionsMu.Lock()
-			delete(sessions, sessionID)
-			sessionsMu.Unlock()
-			return errSessionClosed
-		}
-		out, cerr := runTmuxCtx(captureCtx, tmuxConfPath, "capture-pane", "-p", "-e", "-S", "-10000", "-t", sessionID)
-		if closing.Load() {
-			return errConnectionClosed
-		}
-		// 每次接入必交付一个结果（失败=空历史），输出协程才不会在
-		// replayCh 上永久阻塞——历史取不到时实时输出必须继续。
-		if cerr == nil {
-			replayCh <- []byte(out)
-		} else {
-			log.Printf("term %s capture: %v", id, cerr)
-			replayCh <- nil
-		}
-		return spawnTmuxClient(s, sz, done)
-	}
 
 	var initTimer *time.Timer
 	// endConnection 是所有退出路径的统一收口：标记关闭、停兜底定时器、
@@ -427,12 +402,77 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		endConnection()
 	}
 
-	// 初始化超时：迟迟等不到尺寸消息时按兜底尺寸启动，避免永久等待。
-	// 不要持有 s.mu 调 spawnNow（其内部会再取 s.mu，非重入锁会自死锁）。
-	initTimer = time.AfterFunc(initTimeout, func() {
-		if err := spawnNow(fallback); err != nil {
-			spawnFailed("timeout", err)
+	// 启动流程：首条尺寸与兜底定时器都只「触发」它（幂等），真正的
+	// 检查-捕获-启动在独立 goroutine 里执行——读循环必须保持能读，
+	// 否则 capture 期间断线要等捕获结束才能被发现。
+	// spawnMu 让启动与断线清理串行化：清理要么阻止启动（锁内复查
+	// closing），要么拿到刚启动的客户端并将其收掉。
+	// spawn 前捕获 pane 历史（spec 001：接入回放），ready 后先行回放；
+	// 捕获失败降级为无回放（交付空结果，不阻塞输出协程）。
+	runSpawnFlow := func() error {
+		spawnMu.Lock()
+		defer spawnMu.Unlock()
+		if closing.Load() || s.ptmx != nil {
+			return nil
 		}
+		s.mu.Lock()
+		sessionID := s.id
+		s.mu.Unlock()
+		// 会话可能在查找与首条尺寸消息之间被关闭：接入路径绝不复活
+		// 会话，存在性消失则清条目并以 1011 结束本次接入。
+		if !tmuxSessionExists(tmuxConfPath, sessionID) {
+			sessionsMu.Lock()
+			delete(sessions, sessionID)
+			sessionsMu.Unlock()
+			return errSessionClosed
+		}
+		// 历史捕获：先按精确会话名解析活动 pane，再以 pane ID 捕获——
+		// capture-pane 的 -t 是 target-pane，会话名恰好等于其他会话的
+		// pane ID（%N）时会被解析到别人的 pane。
+		paneID, err := tmuxActivePaneID(tmuxConfPath, sessionID)
+		if err != nil {
+			return err
+		}
+		out, cerr := runTmuxCtx(captureCtx, tmuxConfPath, "capture-pane", "-p", "-e", "-S", "-10000", "-E", "-1", "-t", paneID)
+		if closing.Load() {
+			return errConnectionClosed
+		}
+		// 每次接入必交付一个结果（失败=空历史），输出协程才不会在
+		// replayCh 上永久阻塞——历史取不到时实时输出必须继续。
+		// capture-pane 以 LF 结行，回放字节绕过 tty 的 onlcr，必须
+		// 自行补 CR，否则历史行阶梯缩进。-E -1 只取可见屏之前的历史，
+		// 可见屏由接入时的实时重绘覆盖。
+		if cerr == nil {
+			replayCh <- []byte(strings.ReplaceAll(out, "\n", "\r\n"))
+		} else {
+			log.Printf("term %s capture: %v", id, cerr)
+			replayCh <- nil
+		}
+		sz := pty.Winsize{Rows: 24, Cols: 80}
+		if p := latestSize.Load(); p != nil {
+			sz = *p
+		}
+		return spawnTmuxClient(s, sz, done)
+	}
+
+	startSpawn := func() {
+		if spawnStarted.Swap(true) {
+			return
+		}
+		go func() {
+			if err := runSpawnFlow(); err != nil {
+				spawnFailed("spawn", err)
+			}
+		}()
+	}
+
+	// 初始化超时：迟迟等不到尺寸消息时按 URL query 兜底尺寸触发启动。
+	initTimer = time.AfterFunc(initTimeout, func() {
+		if latestSize.Load() == nil {
+			fb := fallback
+			latestSize.Store(&fb)
+		}
+		startSpawn()
 	})
 
 	// tmux 会话消失（Shell 内退出 / kill-session）时客户端进程退出，
@@ -458,7 +498,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 接入回放：先于实时输出发送 pane 历史（spec 001）。
-		// 结果由 spawnNow 保证先于 ptyReady 交付；select 防御性地让
+		// 结果由启动流程保证先于 ptyReady 交付；select 防御性地让
 		// 等待随连接取消。
 		var replay []byte
 		select {
@@ -502,15 +542,12 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 				Rows uint16 `json:"rows"`
 			}
 			if json.Unmarshal(data, &ctl) == nil && ctl.Type == "resize" && ctl.Cols > 0 && ctl.Rows > 0 {
-				// spawnNow 绝不能在持有 s.mu 时调用（其内部会再取 s.mu，
-				// 非重入锁自死锁）——与上方定时器路径同理。
-				err := spawnNow(pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
-				if err != nil {
-					if !errors.Is(err, errConnectionClosed) {
-						spawnFailed("resize", err)
-					}
-					break
-				}
+				// 记录最新尺寸并触发启动流程（幂等）。启动在异步
+				// goroutine 里进行，读循环保持能读，断线即时可见。
+				latestSize.Store(&pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
+				startSpawn()
+				// 已启动的客户端直接应用新尺寸；启动中的由启动流程
+				// 读取最新尺寸处理。
 				s.mu.Lock()
 				if s.ptmx != nil {
 					_ = pty.Setsize(s.ptmx, &pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
@@ -520,11 +557,12 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// 二进制输入：PTY 未启动属于协议违规（前端以 ready 为输入闸门），
-		// 以 1008 明确拒绝。
+		// 以 1008 明确拒绝，由统一清理路径发送关闭帧并回收条目。
 		s.mu.Lock()
 		if s.ptmx == nil {
 			s.mu.Unlock()
-			c.Close(websocket.StatusPolicyViolation, "terminal not ready")
+			exitCode = websocket.StatusPolicyViolation
+			exitReason = "terminal not ready"
 			break
 		}
 		_, werr := s.ptmx.Write(data)
@@ -534,20 +572,23 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 清理：停掉兜底定时器并关闸，再处理客户端进程。
+	// 统一清理：标记关闭 → 停兜底 → 取消捕获 → 发关闭帧 →
+	// 在 spawnMu 下回收本连接的客户端资源（若已启动）→ 释放接入占用。
 	// 条目永不在此删除：会话常驻，断开只是 detach——
 	// 客户端退出后的条目去向（保留/删除）由回收协程按 tmux 会话存活判定。
-	closing.Store(true)
-	initTimer.Stop()
+	endConnection()
 
+	spawnMu.Lock()
 	s.mu.Lock()
 	cmd, ptmx := s.cmd, s.ptmx
 	s.mu.Unlock()
+	spawnMu.Unlock()
 
-	c.Close(websocket.StatusNormalClosure, "session ended")
 	if ptmx != nil {
 		_ = cmd.Process.Kill()
+		_ = ptmx.Close()
 		<-done
+		// claimed 由回收协程复位（等客户端进程与转发协程退出后）。
 	} else {
 		// 尚未启动客户端：复位接入态，会话等待下一次接入。
 		s.mu.Lock()
@@ -556,6 +597,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("term %s closed", id)
 }
+
 
 // spawnTmuxClient 在 PTY 中启动 tmux 客户端（attach 到既有会话）。
 // 调用方需持有 s.mu。
@@ -578,8 +620,9 @@ func spawnTmuxClient(s *termSession, size pty.Winsize, done chan struct{}) error
 
 	go func() {
 		_ = cmd.Wait()
+		_ = ptmx.Close()
 		// 清空客户端引用：会话常驻，下次接入需要重新 spawn；
-		// 残留的旧 PTY 会让 spawnNow 误判「已启动」。
+		// 残留的旧 PTY 会让启动流程误判「已启动」。
 		s.mu.Lock()
 		id := s.id
 		s.cmd = nil

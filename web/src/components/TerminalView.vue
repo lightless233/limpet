@@ -120,6 +120,17 @@ function sendInput(bytes: Uint8Array) {
 }
 
 function onData(chunk: string) {
+  if (ctrlSticky.value) {
+    ctrlSticky.value = false
+    if (chunk.length === 1) {
+      const code = chunk.toUpperCase().charCodeAt(0)
+      if (code >= 64 && code <= 95) {
+        // @A-Z[\]^_ → 控制字符 0x00-0x1F
+        sendInput(encoder.encode(String.fromCharCode(code & 0x1f)))
+        return
+      }
+    }
+  }
   sendInput(encoder.encode(chunk))
 }
 
@@ -157,7 +168,9 @@ function onTerminalError(e: unknown) {
 }
 
 // 移动按键栏：以终端输入形式发送常用按键（charter 验收 3）。
-// pointerdown + preventDefault 避免按钮抢走终端焦点。
+// 用 click 发送：横滑滚动按键栏的触摸手势不会误发按键；
+// 发送后把焦点还给终端。Ctrl 为粘性修饰键（spec 001）：
+// 点亮后下一个字母输入组合成控制字符，组合完成自动熄灭。
 const KEY_DEFS: { label: string; bytes: string }[] = [
   { label: 'Esc', bytes: '\x1b' },
   { label: 'Ctrl+C', bytes: '\x03' },
@@ -169,9 +182,16 @@ const KEY_DEFS: { label: string; bytes: string }[] = [
   { label: 'Enter', bytes: '\r' },
 ]
 
-function sendKey(bytes: string, e: PointerEvent) {
-  e.preventDefault()
+const ctrlSticky = ref(false)
+
+function sendKey(bytes: string) {
   sendInput(encoder.encode(bytes))
+  term.value?.focus()
+}
+
+function toggleCtrl() {
+  ctrlSticky.value = !ctrlSticky.value
+  term.value?.focus()
 }
 
 function goBack() {
@@ -227,7 +247,7 @@ const statusText = {
     <div
       v-else
       class="min-h-0 flex-1 px-2"
-      :inert="status !== 'connected'"
+      :inert="status === 'connecting'"
     >
       <Terminal
         v-if="core"
@@ -251,10 +271,19 @@ const statusText = {
       <button
         v-for="k in KEY_DEFS"
         :key="k.label"
-        class="min-w-[3.25rem] shrink-0 rounded-md bg-neutral-800 px-2 py-2 text-sm active:bg-neutral-600"
-        @pointerdown="sendKey(k.bytes, $event)"
+        class="min-w-[3.25rem] shrink-0 rounded-md px-2 py-2 text-sm active:bg-neutral-600"
+        :class="k.label === 'Ctrl+C' && ctrlSticky ? 'bg-emerald-700 text-white' : 'bg-neutral-800 text-neutral-200'"
+        @click="sendKey(k.bytes)"
       >
         {{ k.label }}
+      </button>
+      <button
+        class="min-w-[3.25rem] shrink-0 rounded-md px-2 py-2 text-sm active:bg-neutral-600"
+        :class="ctrlSticky ? 'bg-emerald-700 text-white' : 'bg-neutral-800 text-neutral-200'"
+        title="粘性 Ctrl：点亮后下一个字母以 Ctrl 组合发送"
+        @click="toggleCtrl"
+      >
+        Ctrl
       </button>
     </div>
   </div>
