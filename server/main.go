@@ -1,18 +1,20 @@
 // Limpet 后端入口。
-// 开发阶段监听 :4040，仅提供 /api 前缀的 HTTP 与 WebSocket 接口；
-// 前端页面由 Vite dev server (:4041) 托管并代理 /api 到这里。
-// 生产阶段由 go:build 之后的静态资源托管接管（见 serveStatic）。
+// 开发阶段监听 :4040（可用 LIMPET_ADDR 覆盖）；
+// 生产形态：web/dist 存在时由 Go 直接托管 H5，远程访问走 Cloudflare Tunnel。
 package main
 
 import (
-	"encoding/json"
 	"log"
+	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"time"
+)
 
-	"github.com/coder/websocket"
+var (
+	tmuxConfPath string
+	tmuxMissing  bool
 )
 
 func main() {
@@ -21,45 +23,30 @@ func main() {
 		addr = "127.0.0.1:4040"
 	}
 
+	if _, err := exec.LookPath("tmux"); err != nil {
+		log.Printf("tmux 未安装或不在 PATH 中: %v", err)
+		tmuxMissing = true
+	} else {
+		conf, err := tmuxConf()
+		if err != nil {
+			log.Printf("tmux 配置初始化失败: %v", err)
+			tmuxMissing = true
+		} else {
+			tmuxConfPath = conf
+		}
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/hello", handleHello)
-	mux.HandleFunc("GET /api/ws/echo", handleEcho)
 	mux.HandleFunc("POST /api/term", handleTermCreate)
+	mux.HandleFunc("GET /api/term", handleTermList)
+	mux.HandleFunc("POST /api/term/{id}/close", handleTermClose)
+	mux.HandleFunc("POST /api/term/{id}/rename", handleTermRename)
 	mux.HandleFunc("GET /api/ws/term/{id}", handleTermWS)
 	serveStatic(mux)
 
 	log.Printf("limpet server listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
-	}
-}
-
-func handleHello(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "hello from limpet",
-		"time":    time.Now().Format(time.RFC3339),
-	})
-}
-
-// handleEcho 是 WebSocket 链路的冒烟测试端点：收到什么就回什么。
-// 后续真正的终端转发会替换掉它。
-func handleEcho(w http.ResponseWriter, r *http.Request) {
-	c, err := websocket.Accept(w, r, nil)
-	if err != nil {
-		log.Printf("ws accept: %v", err)
-		return
-	}
-	defer c.Close(websocket.StatusInternalError, "internal error")
-
-	ctx := r.Context()
-	for {
-		msgType, data, err := c.Read(ctx)
-		if err != nil {
-			return
-		}
-		if err := c.Write(ctx, msgType, data); err != nil {
-			return
-		}
 	}
 }
 
