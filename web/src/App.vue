@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 终端页：wterm(ghostty core) ↔ WebSocket ↔ Go(PTY)。
 // 帧约定与后端一致：二进制帧 = 终端 I/O，文本帧 = 控制 JSON。
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useTemplateRef } from 'vue'
 import { Terminal, type WTerm } from '@wterm/vue'
 import { GhosttyCore } from '@wterm/ghostty'
@@ -54,9 +54,13 @@ async function connect() {
   // 每次连接都是新会话：重建 core 并重新挂载终端组件，让新会话拥有
   // 干净的屏幕状态（旧会话可能停在备用屏幕或特殊输入模式）。
   // 组件重挂载会重新触发 @ready，termReady 随之复位。
+  // lastSize 一并清空：新终端实例会在 @ready 时上报自己的初始尺寸，
+  // 不能沿用上一会话的旧值。断言是为了阻止 TS 把它窄化成 null
+  // （onResize/onReady 会在闭包里重新赋值）。
   core.value = null
   termReady = false
   fatalError.value = ''
+  lastSize = null as { cols: number; rows: number } | null
 
   try {
     core.value = await GhosttyCore.load()
@@ -77,17 +81,20 @@ async function connect() {
     ws = new WebSocket(`${proto}//${location.host}/api/ws/term/${data.id}${sizeQuery}`)
     ws.binaryType = 'arraybuffer'
     // onopen 不等于可用：后端要等首条尺寸消息才启动 Shell。
-    // 发送当前尺寸触发启动，收到 ready 帧后才显示「已连接」。
+    // 发送当前尺寸触发启动，收到 ready 帧后才显示「已连接」并开放输入。
     ws.onopen = () => {
       sendResize()
-      term.value?.focus()
     }
     ws.onmessage = (e) => {
       if (typeof e.data === 'string') {
         // 文本帧 = 控制 JSON（目前只有后端→ready）。
         try {
           const ctl = JSON.parse(e.data)
-          if (ctl.type === 'ready') status.value = 'connected'
+          if (ctl.type === 'ready') {
+            status.value = 'connected'
+            // 等 Vue 移除 inert 后再聚焦，否则 focus 会被吞掉。
+            nextTick(() => term.value?.focus())
+          }
         } catch { /* 忽略无法解析的控制帧 */ }
         return
       }
@@ -124,12 +131,14 @@ function flushPending() {
 const INPUT_CHUNK = 64 * 1024
 
 function sendInput(bytes: Uint8Array) {
-  if (ws?.readyState !== WebSocket.OPEN) return
+  if (ws?.readyState !== WebSocket.OPEN || status.value !== 'connected') return
   for (let i = 0; i < bytes.length; i += INPUT_CHUNK) {
     ws.send(bytes.slice(i, i + INPUT_CHUNK))
   }
 }
 
+// 输入闸门：WS 打开 + 已收到 ready。接入中不发输入帧，
+// 后端对启动前的二进制输入也会以 1008 显式拒绝。
 function onData(chunk: string) {
   sendInput(encoder.encode(chunk))
 }
@@ -152,9 +161,12 @@ function onResize(cols: number, rows: number) {
 
 function onReady(wt: WTerm) {
   // 组件生命周期内只触发一次；不重挂载就不会再来。
+  // 初始网格与默认尺寸（80x24）一致时 ResizeObserver 不触发 @resize，
+  // 首个尺寸必须直接从实例读取，否则后端会等满 3s 超时兜底。
+  lastSize = { cols: wt.cols, rows: wt.rows }
+  sendResize()
   termReady = true
   flushPending()
-  wt.focus()
 }
 
 // WTerm 初始化失败（wasm 加载/实例化问题）：终端不可用，转为 fatalError；
@@ -195,7 +207,7 @@ function onTerminalError(e: unknown) {
       {{ fatalError }}
     </div>
 
-    <div v-else class="min-h-0 flex-1 px-2 pb-2">
+    <div v-else class="min-h-0 flex-1 px-2 pb-2" :inert="status !== 'connected'">
       <Terminal
         v-if="core"
         ref="term"

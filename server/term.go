@@ -157,9 +157,10 @@ func spawnShell(s *termSession, size pty.Winsize) error {
 //
 // 启动时机：Accept 成功后并不立即 spawn，而是等首条有效 resize 消息——
 // URL query 里的尺寸在握手期间可能已过期，按它启动会让 Shell 用旧宽度
-// 排出首屏（% 伪影）。等待期间到达的输入按序缓冲；超时未收到尺寸则
-// 按 query 兜底尺寸启动。spawn 成功后服务端先发 ready 再转发输出，
-// 客户端据此区分「已连接」与「Shell 启动失败」（1011）。
+// 排出首屏（% 伪影）。超时未收到尺寸则按 query 兜底尺寸启动；等待期间
+// 到达的二进制输入以 1008 拒绝（前端以 ready 为输入闸门）。
+// spawn 成功后服务端先发 ready 再转发输出，客户端据此区分「已连接」
+// 与「Shell 启动失败」（1011）。
 func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// 查找与占用必须在 sessionsMu 下原子完成：TTL 回收持同一锁检查
@@ -203,23 +204,13 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// 预启动输入缓冲：spawn 前到达的按键/粘贴，启动后按序写入。
-	// 主循环与超时定时器都经 s.mu 访问。
-	var pendingInput [][]byte
-	pendingBytes := 0
+	// 启动入口：只在未启动且未关闭时 spawn，由主循环（首条尺寸消息）
+	// 与超时兜底定时器共用，s.mu 串行化。
 	spawnNow := func(sz pty.Winsize) error {
 		if s.closing || s.ptmx != nil {
 			return nil
 		}
-		if err := spawnShell(s, sz); err != nil {
-			return err
-		}
-		for _, b := range pendingInput {
-			s.ptmx.Write(b)
-		}
-		pendingInput = nil
-		pendingBytes = 0
-		return nil
+		return spawnShell(s, sz)
 	}
 	spawnFailed := func(where string, err error) {
 		// 已占用但 spawn 失败：不再有人能接入成功，删除条目，
@@ -304,17 +295,14 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		// 二进制输入：PTY 未启动则按序缓冲（总量与单条消息同上限）。
+		// 二进制输入：PTY 未启动属于协议违规（前端以 ready 为输入闸门），
+		// 静默缓冲会让调用方把残缺输入当成完整输入，这里以 1008 明确拒绝，
+		// 并走未启动会话的清理路径回收条目。
 		s.mu.Lock()
 		if s.ptmx == nil {
-			if pendingBytes+len(data) <= maxInputMessageBytes {
-				b := make([]byte, len(data))
-				copy(b, data)
-				pendingInput = append(pendingInput, b)
-				pendingBytes += len(data)
-			}
 			s.mu.Unlock()
-			continue
+			c.Close(websocket.StatusPolicyViolation, "terminal not ready")
+			break
 		}
 		_, werr := s.ptmx.Write(data)
 		s.mu.Unlock()
@@ -323,8 +311,10 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 清理：先关闸（阻止超时兜底再启动），再回收已有进程。
-	// spawn 可能尚未发生（从未收到尺寸且未超时，或已失败），分情况处理。
+	// 清理：先关闸（同锁串行化，阻止超时兜底再启动），再按是否已启动回收。
+	// 已启动：终止进程并等待回收 goroutine 删除条目、关闭 done。
+	// 未启动（从未收到尺寸 / 协议违规 / 握手后立即断开）：条目已占用且
+	// 无人会再回收，必须在此删除，否则 claimed=true 会让 TTL 跳过它。
 	s.mu.Lock()
 	s.closing = true
 	cmd, ptmx := s.cmd, s.ptmx
@@ -334,6 +324,10 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	if ptmx != nil {
 		_ = cmd.Process.Kill()
 		<-s.done
+	} else {
+		sessionsMu.Lock()
+		delete(sessions, id)
+		sessionsMu.Unlock()
 	}
 	log.Printf("term %s closed", id)
 }
