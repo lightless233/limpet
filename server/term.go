@@ -38,6 +38,12 @@ var (
 // pendingSessionTTL 是预留会话（未接入）的存活时间。
 const pendingSessionTTL = 30 * time.Second
 
+// maxInputMessageBytes 是单条 WS 输入消息的读取上限。
+// coder/websocket 默认 32 KiB：大段粘贴会作为一条消息到达，
+// 超限会让连接进入错误态断开，并连带结束本阶段的 Shell。
+// 前端会按 64 KiB 主动切块，1 MiB 只是兜底。
+const maxInputMessageBytes = 1 << 20
+
 func newSessionID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -155,6 +161,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		return
 	}
+	c.SetReadLimit(maxInputMessageBytes)
 	log.Printf("term %s attached", id)
 
 	// 初始窗口尺寸（缺省 80x24）。Shell 以该尺寸 spawn，保证首屏排版正确。

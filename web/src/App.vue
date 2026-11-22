@@ -106,13 +106,25 @@ function flushPending() {
   pending.length = 0
 }
 
+// 单条 WS 输入消息的目标大小。后端读取上限为 1 MiB（超限会断连），
+// 这里按 64 KiB 主动切块：任意大小的粘贴都会变成多条消息按序送达，
+// WS 消息边界对 PTY 无意义（Shell 读的是字节流），因此透明安全。
+const INPUT_CHUNK = 64 * 1024
+
+function sendInput(bytes: Uint8Array) {
+  if (ws?.readyState !== WebSocket.OPEN) return
+  for (let i = 0; i < bytes.length; i += INPUT_CHUNK) {
+    ws.send(bytes.slice(i, i + INPUT_CHUNK))
+  }
+}
+
 function onData(chunk: string) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(encoder.encode(chunk))
+  sendInput(encoder.encode(chunk))
 }
 
 // 终端程序开启鼠标跟踪后的原始 X10 报告。
 function onBinary(bytes: Uint8Array) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(new Uint8Array(bytes))
+  sendInput(new Uint8Array(bytes))
 }
 
 function sendResize() {
