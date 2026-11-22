@@ -5,7 +5,9 @@
    跟踪时 wterm 也不处理滚轮，直接放行）。放开为 auto 后：
    - 普通状态：滚轮/触摸原生滚动回放的历史（选中复制不变）
    - 应用开启鼠标跟踪（vim 等）：wterm 自己接管滚轮并 preventDefault，
-     与原生滚动不冲突 */
-.wterm {
+     与原生滚动不冲突
+   双写 .wterm.wterm 提高特异性：库的 overflow:hidden 由组件样式注入，
+   加载顺序晚于本文件，单类选择器会被简写覆盖回去 */
+.wterm.wterm {
   overflow-y: auto;
 }
