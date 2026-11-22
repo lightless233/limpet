@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -53,6 +54,11 @@ const initTimeout = 3 * time.Second
 // coder/websocket 默认 32 KiB：大段粘贴会作为一条消息到达，
 // 超限会让连接进入错误态断开。前端按 64 KiB 主动切块，1 MiB 只是兜底。
 const maxInputMessageBytes = 1 << 20
+
+var (
+	errConnectionClosed = errors.New("connection closed")
+	errSessionClosed    = errors.New("session closed")
+)
 
 func newSessionID() string {
 	b := make([]byte, 8)
@@ -349,12 +355,23 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	// 回收协程关闭，监视器据此结束当前连接。
 	done := make(chan struct{})
 
+	// 捕获上下文：断线时立即取消 capture-pane，不必等处理器返回。
+	captureCtx, cancelCapture := context.WithCancel(context.Background())
+	defer cancelCapture()
+
+	// 连接结束原因：正常断开为 Normal；1008/1011 分支先行设置，
+	// 统一由清理路径发送关闭帧（避免在分支内先行 c.Close 抢跑）。
+	exitCode := websocket.StatusNormalClosure
+	exitReason := "session ended"
+
 	// 启动入口：只在未启动且未关闭时 spawn tmux 客户端，
 	// 由主循环（首条尺寸消息）与超时兜底定时器共用。
-	// 两个调用方可能并发进入，检查-捕获-发送-启动必须整体串行化
+	// 两个调用方可能并发进入，检查-捕获-复查-启动必须整体串行化
 	// （spawnMu），否则双 spawn 会让 replayCh/ptyReady 管道卡死。
 	// spawn 前捕获 pane 历史（spec 001：接入回放），ready 后先行回放，
 	// 让浏览器滚动缓冲拥有断开前的内容；捕获失败降级为无回放。
+	// 捕获绑定连接上下文（可取消），返回后在锁内复查 closing：
+	// 清理要么阻止启动，要么拿到刚启动的客户端并将其收掉。
 	var spawnMu sync.Mutex
 	replayCh := make(chan []byte, 1)
 	spawnNow := func(sz pty.Winsize) error {
@@ -372,9 +389,12 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 			sessionsMu.Lock()
 			delete(sessions, sessionID)
 			sessionsMu.Unlock()
-			return errors.New("session closed")
+			return errSessionClosed
 		}
-		out, cerr := runTmux(tmuxConfPath, "capture-pane", "-p", "-e", "-S", "-10000", "-t", sessionID)
+		out, cerr := runTmuxCtx(captureCtx, tmuxConfPath, "capture-pane", "-p", "-e", "-S", "-10000", "-t", sessionID)
+		if closing.Load() {
+			return errConnectionClosed
+		}
 		if cerr == nil {
 			replayCh <- []byte(out)
 		} else {
@@ -382,16 +402,31 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		}
 		return spawnTmuxClient(s, sz, done)
 	}
+
+	var initTimer *time.Timer
+	// endConnection 是所有退出路径的统一收口：标记关闭、停兜底定时器、
+	// 取消捕获、发送关闭帧。资源回收在 tail 的 spawnMu 段进行。
+	endConnection := func() {
+		closing.Store(true)
+		if initTimer != nil {
+			initTimer.Stop()
+		}
+		cancelCapture()
+		c.Close(exitCode, exitReason)
+	}
 	spawnFailed := func(where string, err error) {
-		// 会话真实存在（创建即建），不删条目；本次接入以 1011 结束，
-		// 后续接入可重试。
+		if errors.Is(err, errConnectionClosed) {
+			return
+		}
 		log.Printf("term %s spawn(%s): %v", id, where, err)
-		c.Close(websocket.StatusInternalError, "spawn failed")
+		exitCode = websocket.StatusInternalError
+		exitReason = "spawn failed"
+		endConnection()
 	}
 
 	// 初始化超时：迟迟等不到尺寸消息时按兜底尺寸启动，避免永久等待。
-	// 注意不要持有 s.mu 调 spawnNow（其内部会再取 s.mu，非重入锁会自死锁）。
-	initTimer := time.AfterFunc(initTimeout, func() {
+	// 不要持有 s.mu 调 spawnNow（其内部会再取 s.mu，非重入锁会自死锁）。
+	initTimer = time.AfterFunc(initTimeout, func() {
 		if err := spawnNow(fallback); err != nil {
 			spawnFailed("timeout", err)
 		}
@@ -461,8 +496,10 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 				// 非重入锁自死锁）——与上方定时器路径同理。
 				err := spawnNow(pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
 				if err != nil {
-					spawnFailed("resize", err)
-					return
+					if !errors.Is(err, errConnectionClosed) {
+						spawnFailed("resize", err)
+					}
+					break
 				}
 				s.mu.Lock()
 				if s.ptmx != nil {

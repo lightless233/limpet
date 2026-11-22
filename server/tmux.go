@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -53,10 +54,24 @@ func tmuxBase(conf string) []string {
 	return []string{"-L", tmuxSocket, "-f", conf}
 }
 
+// tmuxBin 返回 tmux 可执行文件路径。LIMPET_TMUX_BIN 可覆盖（测试用：
+// 指向包装脚本以模拟 capture-pane 卡顿等异常时序）。
+func tmuxBin() string {
+	if b := os.Getenv("LIMPET_TMUX_BIN"); b != "" {
+		return b
+	}
+	return "tmux"
+}
+
 // runTmux 执行 tmux 子命令，返回 stdout；失败时错误信息取自 stderr。
 func runTmux(conf string, args ...string) (string, error) {
+	return runTmuxCtx(context.Background(), conf, args...)
+}
+
+// runTmuxCtx 支持取消：接入回放的捕获绑定本次连接的生命周期。
+func runTmuxCtx(ctx context.Context, conf string, args ...string) (string, error) {
 	full := append(tmuxBase(conf), args...)
-	cmd := exec.Command("tmux", full...)
+	cmd := exec.CommandContext(ctx, tmuxBin(), full...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
