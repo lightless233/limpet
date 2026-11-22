@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -365,18 +366,21 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		sessionID := s.id
 		s.mu.Unlock()
-		log.Printf("term %s DEBUG capture start", id)
+		// 会话可能在查找与首条尺寸消息之间被关闭：接入路径绝不复活
+		// 会话，存在性消失则清条目并以 1011 结束本次接入。
+		if !tmuxSessionExists(tmuxConfPath, sessionID) {
+			sessionsMu.Lock()
+			delete(sessions, sessionID)
+			sessionsMu.Unlock()
+			return errors.New("session closed")
+		}
 		out, cerr := runTmux(tmuxConfPath, "capture-pane", "-p", "-e", "-S", "-10000", "-t", sessionID)
-		log.Printf("term %s DEBUG capture done: err=%v len=%d", id, cerr, len(out))
 		if cerr == nil {
 			replayCh <- []byte(out)
-			log.Printf("term %s DEBUG replay queued", id)
 		} else {
 			log.Printf("term %s capture: %v", id, cerr)
 		}
-		err := spawnTmuxClient(s, sz, done)
-		log.Printf("term %s DEBUG spawn done: err=%v", id, err)
-		return err
+		return spawnTmuxClient(s, sz, done)
 	}
 	spawnFailed := func(where string, err error) {
 		// 会话真实存在（创建即建），不删条目；本次接入以 1011 结束，
@@ -513,7 +517,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 //   会话已消失（Shell 退出 / kill-session）→ 删除条目。
 // done 在任何退出原因下都会关闭，驱动监视器结束当前连接。
 func spawnTmuxClient(s *termSession, size pty.Winsize, done chan struct{}) error {
-	cmd := exec.Command("tmux", tmuxClientArgs(tmuxConfPath, s.id, size.Cols, size.Rows)...)
+	cmd := exec.Command("tmux", tmuxAttachArgs(tmuxConfPath, s.id)...)
 	cmd.Env = terminalEnviron()
 
 	ptmx, err := pty.StartWithSize(cmd, &size)

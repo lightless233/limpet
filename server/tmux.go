@@ -78,9 +78,16 @@ func tmuxSessionNameValid(name string) bool {
 	return !strings.ContainsAny(name, ":.")
 }
 
-// tmuxSessionExists 判断会话是否存在（socket 无服务端视为不存在）。
+// exactTarget 返回 tmux 精确目标语法（=前缀）。tmux 的 -t 目标解析
+// 依次尝试精确匹配、前缀匹配、通配符匹配——不带 = 时，关闭/重命名/
+// 接入一个不存在的名字可能误中前缀相同的其他会话。
+func exactTarget(id string) string {
+	return "=" + id
+}
+
+// tmuxSessionExists 判断会话是否精确存在（socket 无服务端视为不存在）。
 func tmuxSessionExists(conf, id string) bool {
-	_, err := runTmux(conf, "has-session", "-t", id)
+	_, err := runTmux(conf, "has-session", "-t", exactTarget(id))
 	return err == nil
 }
 
@@ -90,13 +97,12 @@ func tmuxCreate(conf, id string) error {
 	return err
 }
 
-// tmuxClientArgs 构造接入命令：会话存在则 attach，不存在则创建并接入。
-// 由调用方先行确认会话存在，-A 仅作为兜底。
-func tmuxClientArgs(conf, id string, cols, rows uint16) []string {
-	return append(tmuxBase(conf),
-		"new-session", "-A", "-s", id,
-		"-x", fmt.Sprint(cols), "-y", fmt.Sprint(rows),
-	)
+// tmuxAttachArgs 构造接入命令：纯 attach，精确目标。
+// 会话的创建只发生在 POST /api/term；接入路径绝不创建会话，
+// 避免目标解析歧义导致「接错会话」或「已关闭会话复活」。
+// 客户端尺寸由其 tty 决定（pty.StartWithSize 传入），无需 -x/-y。
+func tmuxAttachArgs(conf, id string) []string {
+	return append(tmuxBase(conf), "attach-session", "-t", exactTarget(id))
 }
 
 // tmuxList 列出会话：返回 (名, 创建epoch秒, 客户端数) 列表。
@@ -142,14 +148,14 @@ func tmuxList(conf string) ([]struct {
 	return sessions, nil
 }
 
-// tmuxRename 重命名会话。
+// tmuxRename 重命名会话（旧名精确目标；新名是字面量非目标）。
 func tmuxRename(conf, oldID, newID string) error {
-	_, err := runTmux(conf, "rename-session", "-t", oldID, newID)
+	_, err := runTmux(conf, "rename-session", "-t", exactTarget(oldID), newID)
 	return err
 }
 
 // tmuxKill 关闭会话（Shell 一并终止）。
 func tmuxKill(conf, id string) error {
-	_, err := runTmux(conf, "kill-session", "-t", id)
+	_, err := runTmux(conf, "kill-session", "-t", exactTarget(id))
 	return err
 }
