@@ -42,6 +42,10 @@ set -g renumber-windows on
 set -g mouse off
 # 浏览器页面本身就是 chrome（会话信息在页头），关闭状态栏省出一整行
 set -g status off
+# 禁用外层（网页 wterm）的备用屏幕切换：客户端接入时 tmux 不再发
+# smcup/rmcup，普通输出的历史始终落在主屏，滚动缓冲可用。pane 内部的
+# alternate-screen 保持原样，Vim/Codex 等全屏程序不受影响。
+set -s 'terminal-overrides[0]' 'xterm-256color:smcup@:rmcup@'
 `
 	if err := os.WriteFile(path, []byte(conf), 0o644); err != nil {
 		return "", err
