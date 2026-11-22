@@ -93,15 +93,18 @@ func handleTermCreate(w http.ResponseWriter, r *http.Request) {
 	sessionsMu.Unlock()
 
 	// 无人接入的预留会话定时回收，防止 map 泄漏。
+	// 与接入占用同锁（sessionsMu）检查 claimed，避免删掉刚好在接入中的会话。
 	time.AfterFunc(pendingSessionTTL, func() {
-		s.mu.Lock()
-		claimed := s.claimed
-		s.mu.Unlock()
-		if !claimed {
-			sessionsMu.Lock()
-			delete(sessions, id)
-			sessionsMu.Unlock()
+		sessionsMu.Lock()
+		if s, ok := sessions[id]; ok {
+			s.mu.Lock()
+			claimed := s.claimed
+			s.mu.Unlock()
+			if !claimed {
+				delete(sessions, id)
+			}
 		}
+		sessionsMu.Unlock()
 	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
@@ -137,22 +140,25 @@ func spawnShell(s *termSession, size pty.Winsize) error {
 // 本阶段一个会话同一时间只允许一个连接。
 func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// 查找与占用必须在 sessionsMu 下原子完成：TTL 回收持同一锁检查
+	// claimed，分离两步会让回收删掉一个刚好在接入中的会话。
 	sessionsMu.Lock()
 	s := sessions[id]
-	sessionsMu.Unlock()
 	if s == nil {
+		sessionsMu.Unlock()
 		http.NotFound(w, r)
 		return
 	}
-
 	s.mu.Lock()
 	if s.claimed {
 		s.mu.Unlock()
+		sessionsMu.Unlock()
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "session already attached"})
 		return
 	}
 	s.claimed = true
 	s.mu.Unlock()
+	sessionsMu.Unlock()
 
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -173,6 +179,11 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		size.Rows = v
 	}
 	if err := spawnShell(s, size); err != nil {
+		// 已占用但 spawn 失败：会话不可用且不会再有人接入成功，
+		// 不删除的话 claimed=true 会让 TTL 回收跳过，条目永久泄漏。
+		sessionsMu.Lock()
+		delete(sessions, id)
+		sessionsMu.Unlock()
 		log.Printf("term %s spawn: %v", id, err)
 		c.Close(websocket.StatusInternalError, "spawn failed")
 		return
