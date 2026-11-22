@@ -51,22 +51,19 @@ async function connect() {
   pending.length = 0
   status.value = 'connecting'
   connError.value = ''
+  // 每次连接都是新会话：重建 core 并重新挂载终端组件，让新会话拥有
+  // 干净的屏幕状态（旧会话可能停在备用屏幕或特殊输入模式）。
+  // 组件重挂载会重新触发 @ready，termReady 随之复位。
+  core.value = null
+  termReady = false
+  fatalError.value = ''
 
-  if (fatalError.value) {
-    // 终端组件此前因错误被卸载：重建 core 并重新挂载，等待新的 @ready。
-    fatalError.value = ''
-    termReady = false
-    core.value = null
-  }
-
-  if (!core.value) {
-    try {
-      core.value = await GhosttyCore.load()
-    } catch (e) {
-      fatalError.value = e instanceof Error ? e.message : String(e)
-      status.value = 'error'
-      return
-    }
+  try {
+    core.value = await GhosttyCore.load()
+  } catch (e) {
+    fatalError.value = e instanceof Error ? e.message : String(e)
+    status.value = 'error'
+    return
   }
 
   try {
@@ -79,12 +76,21 @@ async function connect() {
     const sizeQuery = lastSize ? `?cols=${lastSize.cols}&rows=${lastSize.rows}` : ''
     ws = new WebSocket(`${proto}//${location.host}/api/ws/term/${data.id}${sizeQuery}`)
     ws.binaryType = 'arraybuffer'
+    // onopen 不等于可用：后端要等首条尺寸消息才启动 Shell。
+    // 发送当前尺寸触发启动，收到 ready 帧后才显示「已连接」。
     ws.onopen = () => {
-      status.value = 'connected'
       sendResize()
       term.value?.focus()
     }
     ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        // 文本帧 = 控制 JSON（目前只有后端→ready）。
+        try {
+          const ctl = JSON.parse(e.data)
+          if (ctl.type === 'ready') status.value = 'connected'
+        } catch { /* 忽略无法解析的控制帧 */ }
+        return
+      }
       const bytes = new Uint8Array(e.data as ArrayBuffer)
       if (!termReady) {
         pending.push(bytes)
@@ -92,7 +98,13 @@ async function connect() {
         term.value?.write(bytes)
       }
     }
-    ws.onclose = () => {
+    ws.onclose = (e) => {
+      if (e.code === 1011) {
+        // 后端以 1011 关闭 = Shell 启动失败，与普通断开区分开。
+        connError.value = 'Shell 启动失败'
+        status.value = 'error'
+        return
+      }
       if (status.value !== 'error') status.value = 'closed'
     }
   } catch (e) {
@@ -166,7 +178,7 @@ function onTerminalError(e: unknown) {
           'bg-red-900/60 text-red-400': status === 'error',
         }"
       >
-        {{ status === 'connecting' && sessionId ? '接入中' : { connecting: '连接中', connected: '已连接', closed: '已断开', error: '错误' }[status] }}
+        {{ { connecting: '接入中', connected: '已连接', closed: '已断开', error: '错误' }[status] }}
       </span>
       <span v-if="sessionId" class="font-mono text-xs text-neutral-500">{{ sessionId }}</span>
       <span v-if="connError" class="truncate text-red-400">{{ connError }}</span>
