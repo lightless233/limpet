@@ -395,10 +395,13 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		if closing.Load() {
 			return errConnectionClosed
 		}
+		// 每次接入必交付一个结果（失败=空历史），输出协程才不会在
+		// replayCh 上永久阻塞——历史取不到时实时输出必须继续。
 		if cerr == nil {
 			replayCh <- []byte(out)
 		} else {
 			log.Printf("term %s capture: %v", id, cerr)
+			replayCh <- nil
 		}
 		return spawnTmuxClient(s, sz, done)
 	}
@@ -455,7 +458,14 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 接入回放：先于实时输出发送 pane 历史（spec 001）。
-		replay := <-replayCh
+		// 结果由 spawnNow 保证先于 ptyReady 交付；select 防御性地让
+		// 等待随连接取消。
+		var replay []byte
+		select {
+		case replay = <-replayCh:
+		case <-ctx.Done():
+			return
+		}
 		for i := 0; i < len(replay); i += 64 * 1024 {
 			end := i + 64 * 1024
 			if end > len(replay) {
