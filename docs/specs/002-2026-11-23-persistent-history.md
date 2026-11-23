@@ -19,15 +19,18 @@
 
 ## 语义变更（需要评审确认）
 
-**「会话 ID 即 tmux 会话名」废止（修订 Spec 001）。** 新语义：创建时分配稳定 ID（uuid），作为唯一公开身份——列表、接入 WS、历史、删除都以稳定 ID 寻址；tmux 会话名降级为显示名（重命名只改名，不动身份）。稳定 ID 以 tmux 用户选项 `@limpet-id` 存在会话上（tmux 服务存活期间是权威来源）；注册表 `~/.limpet/sessions.json` 落盘元数据，覆盖已结束会话。Go 重启后从 tmux 的 `@limpet-id` 重建活会话映射，注册表只补死会话。名字合法性校验与重名 409 语义不变（名字仍是用户语义，也是 tmux 寻址的必要字段）。寻址键从名字换成 uuid 是一次性破坏性变更，前后端同批切换（无外部消费者，无兼容层）。
+**修订一：身份与改名。** Spec 001 的「会话 ID 即 tmux 会话名」废止。新语义：创建时分配稳定 ID（uuid），作为唯一公开身份——列表、接入 WS、历史、删除都以稳定 ID 寻址；**改名后 ID 保持不变**，tmux 会话名降级为显示名。稳定 ID 以 tmux 用户选项 `@limpet-id` 存在会话上（tmux 服务存活期间是权威来源）；注册表 `~/.limpet/sessions.json` 落盘元数据，覆盖已结束会话。Go 重启后从 tmux 的 `@limpet-id` 重建活会话映射，注册表只补死会话。名字合法性校验与重名 409 语义不变。寻址键从名字换成 uuid 是一次性破坏性变更，前后端同批切换（无外部消费者，无兼容层）。
 
-**接入回放保留，不随本工作项移除。** 方案稿原计划磁盘历史验收后移除 capture-pane 回放；核对发现这会打破 Spec 001 验收 3（重连后直接滚动可见断开前历史）——移除后重连只剩 tmux 重绘的当前屏，翻历史必须跳出终端页，等于回到被否决过的体验。本工作项不动回放管线；是否移除待历史视图经使用后另行评审。
+**修订二：关闭语义。** Spec 001 的「显式关闭 → 列表移除」（001 验收 5）废止。关闭或 Shell 退出后会话转入**已结束（归档）态**：仍出现在列表（含名字与结束时间），可打开只读历史、可删除；不可再接入（404）。
+
+**保留决策：接入回放不移除。** 方案稿原计划磁盘历史验收后移除 capture-pane 回放；这会打破 Spec 001 验收 3（重连后直接滚动可见断开前历史）——移除后重连只剩 tmux 重绘的当前屏，翻历史必须跳出终端页。分工定为：**重连首屏的近期彩色输出走回放，更早内容走历史页**。本工作项不动回放管线；是否移除待历史视图经使用后另行评审。
 
 ## 记录通道
 
-- 创建会话（`POST /api/term`）时：分配 uuid → `set-option @limpet-id` → 启动 `pipe-pane -t <paneID> 'cat >> ~/.limpet/history/<uuid>.log'`。**记录程序归属 tmux**（pipe-pane 的 shell 命令即 `cat`），Go 不在记录路径上：浏览器断开、Go 重启甚至崩溃都不中断记录。
+- 创建会话（`POST /api/term`）时：**创建、设 `@limpet-id`、启动 pipe 放进同一 tmux 进程的命令队列**（`;` 链接，全静态参数）一次下发——`new-session` + `set-option @limpet-id <uuid>` + `pipe-pane -t =<名> 'cat >> ~/.limpet/history/<uuid>.log'`。**分步执行会漏录 Shell 首条输出**（隔离实测：分步执行的即时输出录不到，同队列 20/20 录全）。**记录程序归属 tmux**（pipe-pane 的 shell 命令即 `cat`），Go 不在记录路径上：浏览器断开、Go 重启甚至崩溃都不中断记录。
+- 创建后立即读出原 pane ID（`display-message -p '#{pane_id}'`）存入 `@limpet-pane`。**录制始终绑定原 pane**：重武装一律按存储的 pane ID 恢复，绝不按「当前活动 pane」——split 后活动 pane 会变，按活动 pane 恢复会把另一 pane 的输出写进同一份历史（隔离实测确认）。`@limpet-pane` 缺失时（创建与存储之间的极端窗口）按单 pane 推导：唯一 pane 直接用，多 pane 不盲目恢复。
 - **tmux 3.3a 实测：`pipe-pane -o` 不幂等**——对已启动 pipe 的 pane 二次调用会把 pipe 关闭（`pane_pipe` 1→0，文件停止增长）。任何重新武装逻辑必须先查 `#{pane_pipe}`，为 0 才启动，不得用 `-o` 幂等假设。
-- 重武装时机（自愈）：Go 启动时、每次 `GET /api/term` 列表查询时，对每条活会话检查 `pane_pipe=0` 则重启 pipe（文件路径由 `@limpet-id` 推导）。
+- 重武装时机（自愈）：Go 启动时、每次 `GET /api/term` 列表查询时，对每条活会话按 `@limpet-pane` 检查 `pane_pipe=0` 则重启 pipe（文件路径由 `@limpet-id` 推导）；原 pane 已消失则不恢复。
 - pipe 启动失败不阻断会话创建：该会话 `hasHistory=false`，等下一次重武装机会补上。
 - 存量会话迁移（Go 升级后首次遇到无 `@limpet-id` 的活会话）：分配 uuid → `capture-pane -p -e -S -50000 -E -1` 一次性回填 tmux 内存历史进文件（种子）→ 启动 pipe。种子与 pipe 启动之间的毫秒级缝隙可接受。
 - `LIMPET_TMUX_BIN` 覆盖照常生效（测试可注入包装脚本）。
@@ -35,10 +38,11 @@
 ## 稳定 ID 与注册表
 
 - uuid：随机 16 字节 hex；历史文件名即 uuid，天然杜绝同名冲突。
-- 注册表 `~/.limpet/sessions.json`：`{uuid → {name, createdAt, endedAt|null}}`，原子写（tmp + rename），Go 内互斥。注册表是**死会话的唯一来源**；活会话以 tmux 为准（`list-sessions -F '#{session_name} #{@limpet-id} #{session_created}'` 单次查询同时取到当前名与稳定 ID，rename 竞态下不经过中间缓存）。
+- 注册表 `~/.limpet/sessions.json`：`{uuid → {name, createdAt, endedAt|null}}`，原子写（tmp + rename），Go 内互斥。注册表是**死会话的唯一来源**；活会话以 tmux 为准。用户选项存于 tmux server 内存：kill-server 后随会话一起消失，注册表是唯一幸存来源。
+- **tmux 目标解析（防关错/接错）**：uuid → 单次 `list-sessions -F '#{session_name} #{session_id} #{@limpet-id}'` 扫描，按 `@limpet-id` 匹配出目标并取其 tmux 内部 session_id（`$N`）。**接入、关闭、重命名一律以 `$N` 为目标，禁止「uuid → 名字 → `-t =<名>`」的两步寻址**。隔离实测两步寻址有 TOCTOU：查得 A 名 `build` 后 A 被改名、同名 B 重建，按名关闭会杀掉 B；`$N` 在 tmux server 存活期内唯一且不复用，不受改名影响。server 重启后 `$N` 可能重发，故操作前须核对目标会话的 `@limpet-id` 与 uuid 一致。
 - 结束判定：列表查询或接入解析时，注册表中有而 tmux 中无 → 写入 `endedAt`（首次观测时刻）。显式关闭与 Shell 内 exit 走同一条路径。
 - 删除：`DELETE /api/term/{id}` 仅限已结束会话（活会话 409），同时删除注册表条目与历史文件。
-- 列表响应扩展为：`{id(uuid), name, created, attached, live, hasHistory}`，活会话在前（创建时间倒序），已结束其后（结束时间倒序）。
+- 列表响应为：`{id(uuid), name, created, endedAt|null, live, attached, hasHistory}`（`endedAt` 供前端展示结束时间；`attached` 仅活会话有意义）。活会话在前（创建时间倒序），已结束其后（结束时间倒序）。
 
 ## 历史读取（HTTP 合同）
 
@@ -47,7 +51,7 @@
   - `limit` 默认 200、上限 1000；参数非法 400；uuid 不明（无文件且注册表无）404。
   - 响应 `{id, lines: [{i, text}], hasMore}`。
 - **磁盘格式 = 原始 pane 输出字节流（append-only）**，保真不动。行切分（LF 对齐）、ANSI 剥离（CSI / OSC / 其他 ESC 序列）、孤 `\r` 行内覆写合并（进度条不炸行数）、非法 UTF-8 → U+FFFD，全部在读路径完成——浏览页交付纯文本；将来若做全屏回放，原始字节流仍在磁盘上，无需迁移。
-- 行索引按需构建（LF 偏移扫描 + 以文件大小失效的内存缓存）；单文件整扫毫秒量级，不落索引文件。
+- 行索引按需构建：首次整扫建立 LF 偏移索引；此后按已扫描偏移只增量扫描新增字节，**不得以文件大小整体失效**——后台持续输出时翻页不能退化为整文件重扫。索引不落盘（重启后首次访问重建，毫秒量级）。
 - `hasHistory` = 历史文件存在且非空，随列表返回。
 
 ## 范围边界
@@ -71,7 +75,7 @@
 
 ## 验收标准
 
-1. 创建会话即出现 `~/.limpet/history/<uuid>.log`；终端产生输出后文件增长。
+1. 创建会话即出现 `~/.limpet/history/<uuid>.log`；Shell 的首条输出（即时 echo）被完整记录，不漏帧；终端持续输出时文件增长。
 2. 单次产生 30000+ 行输出后断开浏览器，重新接入并打开历史页：能翻到第 1 行附近（远超浏览器 10000 行缓冲）。
 3. 浏览器断开期间运行的输出任务，重连后历史页包含断开期间产生的行——记录不依赖接入。
 4. 重启 Go 服务：记录继续（文件持续增长），历史页可用，列表不丢、uuid 不变。
@@ -83,3 +87,5 @@
 10. 历史页文本无 ANSI 转义残留；含转义序列的原始输出不影响实时终端。
 11. DELETE 已结束会话：条目与历史文件消失；DELETE 活会话 409。
 12. 现有帧级协议测试全部保持通过（接入路径行为不变，仅寻址键换成 uuid）。
+13. 同 socket 手工 split 出第二 pane 后触发重武装：原 pane 输出继续记录，第二 pane 的输出不得写入同一历史。
+14. `kill-server` 后：已落盘的历史不丢，归档条目仍出现在列表并可打开只读查看（记录随 tmux 终止，属预期）。
