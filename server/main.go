@@ -1,21 +1,44 @@
-// Limpet server：自研会话宿主（spec 003）。
+// Limpet server：自研会话宿主（spec 003）。单二进制两种角色：
 //
-// 单二进制。当前阶段（首个竖切片）所有会话都在本进程内；worker 进程拆分、
-// 探测握手与 unix socket 协议按计划在生命周期单元引入，帧协议与路由不变。
+//	limpet-server            —— server：路由 + 注册表 + worker 监督（前台运行）
+//	limpet-server worker <uuid> —— worker：PTY 持有进程，自成会话，独立存活
+//
+// server 停止（Ctrl+C / kill / 崩溃）绝不触碰 worker——它们孤儿化继续运行，
+// 新 server 靠扫描 socket 目录 + 探测握手找回（spec 003「运行方式与生命周期边界」）。
+
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
 )
 
 func main() {
+	args := os.Args[1:]
+	if len(args) >= 2 && args[0] == "worker" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatal(err)
+		}
+		paths := sessionPaths{
+			histDir:   filepath.Join(home, ".limpet", "history"),
+			socketDir: filepath.Join(home, ".limpet", "workers"),
+		}
+		if err := runWorker(args[1], paths); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	addr := os.Getenv("LIMPET_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:4040"
 	}
-
 	m, err := newManager()
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
@@ -46,8 +69,19 @@ func main() {
 		})
 	}
 
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们孤儿化继续跑）。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		log.Printf("server 停止（worker 不受影响）")
+		_ = srv.Close()
+	}()
+
 	log.Printf("limpet-server 监听 %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }

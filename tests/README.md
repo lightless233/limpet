@@ -14,6 +14,10 @@
 | `limet-lifecycle-test.mjs` | 创建/列表/关闭的语义 | 保留（会话 id 变为 uuid） |
 | `limet-size-probe.mjs` | 首屏尺寸行为（首条尺寸生效） | 保留，观察用 |
 | `limet-replay-test.mjs` | 重连后收到断开前产生的历史行 | 保留（机制从 capture 回放换为 VT 重建，外部行为不变） |
+| `limet-alt-reconnect-test.mjs` | 备用屏中重连：影子主屏还原 + 顺序正确 + 退出后会话可用 | 保留 |
+| `limet-u3-lifecycle-test.mjs` | 关闭回收整棵进程树（前台+后台作业）；第二个接入升级前 409 | 保留 |
+| `limet-u3-recovery-test.mjs` | server 重启后的会话恢复断言（配合外部重启编排使用，见验收 9 三场景） | 保留 |
+| `cleanup.mjs` | 关闭全部会话并等 worker 进程退出（跑完套件后收尾） | 保留 |
 
 以下脚本随 tmux 退役（它们的 oracle 是 tmux 或旧启动流），不再维护，
 需要时从 git 历史翻：tmux-test、prefix-test、handoff、stall、stall2、race、

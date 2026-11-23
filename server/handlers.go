@@ -31,8 +31,13 @@ func nameValid(name string) bool {
 	return true
 }
 
-// handleCreate POST /api/term。创建即启动 Shell（80×24）并开始录制，
-// 创建请求在 PTY 就绪后才返回；Shell 启动失败 → 500，不留半死会话（spec 003 修订二）。
+// readBody 读取请求体（上限 4KiB，名称场景绰绰有余）。
+func readBody(r *http.Request) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r.Body, 4096))
+}
+
+// handleCreate POST /api/term。创建即启动 Shell（80×24）并开始录制，worker 就绪后
+// 才返回；失败 → 500，不留半死会话（spec 003）。
 func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
@@ -45,28 +50,26 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimSpace(body.Name)
 
-	s, err := m.create(name)
+	h, err := m.create(name)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": s.id})
+	writeJSON(w, http.StatusOK, map[string]string{"id": h.uuid})
 }
 
-// handleList GET /api/term。活会话实时查询；响应含 name（显示名），前端逐步切换。
+// handleList GET /api/term。活会话实时查询（逐 worker 探测）。
 func (m *manager) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m.list())
 }
 
-// handleClose POST /api/term/{id}/close。结束该会话启动的全部进程（回收单位是
-// 会话，不是 Shell 进程组——后台作业在独立进程组里，spec 003）。
+// handleClose POST /api/term/{id}/close。worker 回收整棵会话进程树
+// （前台任务 + 后台作业，验收 6），列表移除、endedAt 登记。
 func (m *manager) handleClose(w http.ResponseWriter, r *http.Request) {
-	s, ok := m.byID(r.PathValue("id"))
-	if !ok {
+	if !m.closeSession(r.PathValue("id")) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
 		return
 	}
-	s.shutdown("closed")
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -90,33 +93,29 @@ func (m *manager) handleRename(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m.mu.Lock()
-	s := m.byIDLocked(id)
-	if s == nil {
+	h := m.byIDLocked(id)
+	if h == nil {
 		m.mu.Unlock()
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
 		return
 	}
-	if name == s.name {
+	if name == h.name {
 		m.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]string{"id": id})
 		return
 	}
 	for _, other := range m.sessions {
-		if other.id != id && other.name == name {
+		if other.uuid != id && other.name == name {
 			m.mu.Unlock()
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "同名会话已存在"})
 			return
 		}
 	}
-	old := s.name
-	s.name = name
 	m.mu.Unlock()
 
-	m.registryRename(id, old, name)
+	if !m.renameSession(id, name) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
-}
-
-// readBody 读取请求体（上限 4KiB，名称场景绰绰有余）。
-func readBody(r *http.Request) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r.Body, 4096))
 }
