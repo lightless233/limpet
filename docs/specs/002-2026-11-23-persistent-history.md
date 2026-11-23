@@ -1,7 +1,7 @@
 # Spec 002：终端持久历史
 
 - 日期：2026-11-23
-- 状态：待评审
+- 状态：**暂缓（hold）——架构评审未通过。** 宿主地基变更：tmux 退役，切换到自研 worker + libghostty 架构（见 `docs/specs/003-2026-11-23-libghostty-worker-host.md`）。本 spec 的 uuid 身份由 003 平移落地；历史读取 API、前端历史视图仍属本工作项范围，待 003 落地后基于 worker 的 raw 录制重启；记录通道（pipe-pane）与 tmux 寻址机制（`@limpet-id`/`$N`）随 tmux 一并废弃。
 - 来源：会话讨论（2026-11-23）方案稿：pipe-pane 记录 + 稳定 ID + HTTP 按页读取 + 已结束会话只读入口；经代码核对与 tmux 3.3a 实测后定稿
 
 ## 背景与现状

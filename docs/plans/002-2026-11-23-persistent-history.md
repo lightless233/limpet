@@ -2,6 +2,7 @@
 
 - 日期：2026-11-23
 - 对应 Spec：`docs/specs/002-2026-11-23-persistent-history.md`
+- 状态：**暂缓（hold）**——随 Spec 002 暂缓（宿主地基变更，见 Spec 003）。U1 的 uuid 身份思路由 Plan 003 吸收；U3（历史读取 API）与 U4（前端历史视图）待 003 落地后重启评审；U2（pipe-pane）随 tmux 退役废弃。
 - 执行方式：INLINE，单人单会话
 - 依赖顺序：U1 → U2 → U3 → U4 → U5（U2 与 U3 可交错；U4 依赖 U1 的 API 形状）
 
