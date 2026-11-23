@@ -29,14 +29,21 @@ import (
 
 type termSession struct {
 	// id 即 tmux 会话名；rename 时在 s.mu 下更新。
-	id   string
-	cmd  *exec.Cmd
-	ptmx *os.File
+	id string
 
 	mu      sync.Mutex
 	claimed bool
-	// ptyReady 在客户端 spawn 成功时投递 PTY，供转发 goroutine 等待。
-	ptyReady chan *os.File
+}
+
+// connState 是单条 WebSocket 接入的私有资源：attach 客户端进程、其 PTY
+// 与退出信号。tmux 会话（termSession）跨连接常驻，绝不持有连接级资源——
+// 否则旧连接的关闭握手结束后会从共享字段读到新连接的客户端并将其断开。
+type connState struct {
+	mu       sync.Mutex // 保护 cmd/ptmx 的发布与读取（启动协程 vs 读循环/清理）
+	cmd      *exec.Cmd
+	ptmx     *os.File
+	ptyReady chan *os.File // spawn 成功后投递 PTY，转发协程在此等待
+	done     chan struct{} // 客户端进程退出（任何原因）后关闭
 }
 
 var (
@@ -146,7 +153,7 @@ func handleTermCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := &termSession{id: name, ptyReady: make(chan *os.File, 1)}
+	s := &termSession{id: name}
 	sessionsMu.Lock()
 	sessions[name] = s
 	sessionsMu.Unlock()
@@ -300,7 +307,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
 			return
 		}
-		s = &termSession{id: id, ptyReady: make(chan *os.File, 1)}
+		s = &termSession{id: id}
 		sessionsMu.Lock()
 		if existing, ok := sessions[id]; ok {
 			s = existing
@@ -356,9 +363,9 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	// closing 会卡死后续所有接入的启动。
 	var closing atomic.Bool
 
-	// done 是本连接的客户端进程生命周期信号：进程退出（任何原因）时由
-	// 回收协程关闭，监视器据此结束当前连接。
-	done := make(chan struct{})
+	// 本连接的私有资源：客户端进程、PTY、就绪与退出信号。
+	// 与会话字段彻底分离——旧连接的清理只会触碰自己的 connState。
+	st := &connState{ptyReady: make(chan *os.File, 1), done: make(chan struct{})}
 
 	// 捕获上下文：断线时立即取消 capture-pane，不必等处理器返回。
 	captureCtx, cancelCapture := context.WithCancel(context.Background())
@@ -412,7 +419,10 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	runSpawnFlow := func() error {
 		spawnMu.Lock()
 		defer spawnMu.Unlock()
-		if closing.Load() || s.ptmx != nil {
+		st.mu.Lock()
+		started := st.ptmx != nil
+		st.mu.Unlock()
+		if closing.Load() || started {
 			return nil
 		}
 		s.mu.Lock()
@@ -452,7 +462,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 		if p := latestSize.Load(); p != nil {
 			sz = *p
 		}
-		return spawnTmuxClient(s, sz, done)
+		return spawnTmuxClient(s, st, sz)
 	}
 
 	startSpawn := func() {
@@ -476,10 +486,10 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// tmux 会话消失（Shell 内退出 / kill-session）时客户端进程退出，
-	// 回收协程关闭 done，这里据此结束当前连接。
+	// 回收协程关闭 st.done，这里据此结束当前连接。
 	go func() {
 		select {
-		case <-done:
+		case <-st.done:
 			c.Close(websocket.StatusNormalClosure, "session ended")
 		case <-ctx.Done():
 		}
@@ -490,7 +500,7 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		var ptmx *os.File
 		select {
-		case ptmx = <-s.ptyReady:
+		case ptmx = <-st.ptyReady:
 		case <-ctx.Done():
 			return
 		}
@@ -548,64 +558,64 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 				startSpawn()
 				// 已启动的客户端直接应用新尺寸；启动中的由启动流程
 				// 读取最新尺寸处理。
-				s.mu.Lock()
-				if s.ptmx != nil {
-					_ = pty.Setsize(s.ptmx, &pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
+				st.mu.Lock()
+				if st.ptmx != nil {
+					_ = pty.Setsize(st.ptmx, &pty.Winsize{Rows: ctl.Rows, Cols: ctl.Cols})
 				}
-				s.mu.Unlock()
+				st.mu.Unlock()
 			}
 			continue
 		}
 		// 二进制输入：PTY 未启动属于协议违规（前端以 ready 为输入闸门），
 		// 以 1008 明确拒绝，由统一清理路径发送关闭帧并回收条目。
-		s.mu.Lock()
-		if s.ptmx == nil {
-			s.mu.Unlock()
+		st.mu.Lock()
+		if st.ptmx == nil {
+			st.mu.Unlock()
 			exitCode = websocket.StatusPolicyViolation
 			exitReason = "terminal not ready"
 			break
 		}
-		_, werr := s.ptmx.Write(data)
-		s.mu.Unlock()
+		_, werr := st.ptmx.Write(data)
+		st.mu.Unlock()
 		if werr != nil {
 			break
 		}
 	}
 
 	// 统一清理：标记关闭 → 停兜底 → 取消捕获 → 发关闭帧 →
-	// 在 spawnMu 下回收本连接的客户端资源（若已启动）→ 释放接入占用。
-	// 条目永不在此删除：会话常驻，断开只是 detach——
-	// 客户端退出后的条目去向（保留/删除）由回收协程按 tmux 会话存活判定。
+	// 回收本连接的客户端资源（若已启动）→ 末尾集中释放接入占用。
+	// 只触碰本连接的 connState：此刻共享字段上可能是后来接入的新连接，
+	// 旧清理绝不能断开它。条目永不在此删除：会话常驻，断开只是 detach。
 	endConnection()
 
-	spawnMu.Lock()
-	s.mu.Lock()
-	cmd, ptmx := s.cmd, s.ptmx
-	s.mu.Unlock()
-	spawnMu.Unlock()
+	st.mu.Lock()
+	cmd, ptmx := st.cmd, st.ptmx
+	st.mu.Unlock()
 
 	if ptmx != nil {
 		_ = cmd.Process.Kill()
 		_ = ptmx.Close()
-		<-done
-		// claimed 由回收协程复位（等客户端进程与转发协程退出后）。
-	} else {
-		// 尚未启动客户端：复位接入态，会话等待下一次接入。
-		s.mu.Lock()
-		s.claimed = false
-		s.mu.Unlock()
+		<-st.done
 	}
+
+	// 占用释放在清理末尾：关闭握手未完成前，新连接得到 409 而不是
+	// 被旧清理误杀。cleanup 完成后占用人已不复存在，安全复位。
+	s.mu.Lock()
+	if s.claimed {
+		s.claimed = false
+	}
+	s.mu.Unlock()
 	log.Printf("term %s closed", id)
 }
 
 
-// spawnTmuxClient 在 PTY 中启动 tmux 客户端（attach 到既有会话）。
-// 调用方需持有 s.mu。
-// 客户端进程退出后的条目去向由 tmux 会话存活判定：
-//   会话仍在（WS 断开的 detach）→ 保留条目、复位接入态，等待重连；
-//   会话已消失（Shell 退出 / kill-session）→ 删除条目。
-// done 在任何退出原因下都会关闭，驱动监视器结束当前连接。
-func spawnTmuxClient(s *termSession, size pty.Winsize, done chan struct{}) error {
+// spawnTmuxClient 在 PTY 中启动 tmux 客户端（attach 到既有会话），
+// 资源发布到本次接入的 connState。
+// 客户端退出协程只做两件事：报告退出（关闭 st.done，驱动监视器与
+// 清理等待）与判定条目去向（tmux 会话已消失 → 删除条目）。
+// 接入占用的释放集中在处理器清理末尾——提前释放会让旧连接的关闭
+// 握手期间插入的新连接，在握手结束后被旧清理误杀。
+func spawnTmuxClient(s *termSession, st *connState, size pty.Winsize) error {
 	cmd := exec.Command("tmux", tmuxAttachArgs(tmuxConfPath, s.id)...)
 	cmd.Env = terminalEnviron()
 
@@ -614,19 +624,18 @@ func spawnTmuxClient(s *termSession, size pty.Winsize, done chan struct{}) error
 		return err
 	}
 
-	s.cmd = cmd
-	s.ptmx = ptmx
-	s.ptyReady <- ptmx
+	// 发布经 st.mu：读循环的 resize/输入与启动协程并发访问。
+	st.mu.Lock()
+	st.cmd = cmd
+	st.ptmx = ptmx
+	st.mu.Unlock()
+	st.ptyReady <- ptmx
 
 	go func() {
 		_ = cmd.Wait()
 		_ = ptmx.Close()
-		// 清空客户端引用：会话常驻，下次接入需要重新 spawn；
-		// 残留的旧 PTY 会让启动流程误判「已启动」。
 		s.mu.Lock()
 		id := s.id
-		s.cmd = nil
-		s.ptmx = nil
 		s.mu.Unlock()
 		gone := !tmuxSessionExists(tmuxConfPath, id)
 		sessionsMu.Lock()
@@ -634,10 +643,7 @@ func spawnTmuxClient(s *termSession, size pty.Winsize, done chan struct{}) error
 			delete(sessions, id)
 		}
 		sessionsMu.Unlock()
-		s.mu.Lock()
-		s.claimed = false
-		s.mu.Unlock()
-		close(done)
+		close(st.done)
 	}()
 	return nil
 }

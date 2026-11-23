@@ -11,7 +11,7 @@
 
 **改动**：PTY 子进程从 Shell 换成 tmux 客户端进程。会话在创建接口即以 `tmux new-session -d` 建立（Shell 随会话启动并出现在列表）；接入路径只执行 `attach-session`（精确目标 `-t =<name>`），绝不创建会话。WS 断开只杀客户端进程并释放接入占用，不触碰会话。会话结束监视器语义：tmux 会话消失（Shell 内 exit / kill-session）→ 关闭当前客户端连接。启动流程为异步（读循环保持能读，断线即时取消捕获并释放占用）。
 
-**保持不变**：帧协议、首条尺寸消息启动、ready 帧、1008 拒绝、claimed 单接入 409、TTL 预留、尾部清理（未启动回收改为回收「预留条目」，tmux 会话不存在时同样成立）、每会话重建前端 core。
+**保持不变**：帧协议、首条尺寸消息启动、ready 帧、1008 拒绝、claimed 单接入 409、尾部清理（回收接入占用与连接级资源，tmux 会话常驻不受影响）、每会话重建前端 core。
 
 **边界**：Limpet 专属 tmux 配置文件与 `-L limpet` socket 由本单元引入；配置内容（escape-time、history-limit）在本单元定稿。
 
@@ -19,13 +19,13 @@
 
 ## 单元 2：会话管理 API（创建/列表/重命名/关闭）
 
-**问题**：现在只有「预留 + 接入」，没有列表，创建时机不产生可见会话。
+**问题**：现在只有「接入」，没有列表；创建时机不产生可见会话。
 
 **改动**：
 - `POST /api/term` 接受可选 `name`：校验字符集（禁 `:` `.` 与控制字符、长度 ≤ 100）与重名（409），创建即 `tmux new-session`（Shell 随会话启动），返回 id；请求体非空时必须是合法 JSON（否则 400）。
-- `GET /api/term`：从 `tmux list-sessions` 实时映射（id/created/attached），创建时间倒序；预留未接入的条目同样列出。
+- `GET /api/term`：从 `tmux list-sessions` 实时映射（id/created/attached），创建时间倒序。
 - `POST /api/term/{id}/rename`：校验 + 409 语义同创建。
-- `POST /api/term/{id}/close`：kill-session + 清理预留条目；会话不存在 404。
+- `POST /api/term/{id}/close`：kill-session（精确目标）；会话不存在 404。
 - tmux 可用性检查：socket 不可用统一 503 + 原因。
 
 **完成证据**：帧级/HTTP 测试覆盖——创建即出现在列表、重名 409、非法字符拒绝、rename 后旧名 404 新名可接入、close 后 Shell 进程消失且列表移除、close 已消失会话 404、列表在 Go 重启后从 tmux 重建。
