@@ -9,7 +9,7 @@
 
 **问题**：重建链路的最后一环是浏览器端 `@wterm/ghostty` WASM 吃下 VT 序列之后的实际渲染与滚动缓冲。单测能读出网格和样式，证明不了这条链路。另有四件事只能靠实证定案。
 
-**前置**：本机当前未安装 Zig、CMake 与 libghostty-vt。先安装 Zig（≥ 0.17.1）与 CMake，构建 libghostty-vt 静态库（`vt-1.0.1`）并让 pkg-config 可见；Go 绑定 `go.mitchellh.com/libghostty` 以当前伪版本 pin 入 `go.mod`。
+**前置**：本机当前未安装 Zig 与 libghostty-vt（gcc、pkg-config 已有）。安装 Zig 0.17.x，按官方 `PACKAGING-LIBGHOSTTY.md` 构建 `vt-1.0.1`：下载同版本的源码包与依赖包并排解包，`zig build --prefix /usr --system ../libghostty-vt-1.0.1-deps -Doptimize=ReleaseFast -Dcpu=baseline`，`ZIG_GLOBAL_CACHE_DIR` 须指向新的空目录（Zig 0.17 的缓存缺陷会让构建崩溃）；不需要 CMake。Go 绑定 `go.mitchellh.com/libghostty` 以当前伪版本 pin 入 `go.mod`。
 
 **改动**：最小 worker 原型（PTY + 网格 + 重建）对接**现有 H5 页面，不改前端**，依次验证：
 
@@ -75,7 +75,7 @@
 
 - libghostty 与 Go 绑定均需 pin 版本（库 ABI 自 1.0 稳定，绑定仍是无正式 tag 的伪版本）：升级纳入回归；spike 若证明绑定不可用，动工前必须回到用户做 fallback 决策。
 - 重建链路的最高风险项是滚动历史段的序列化——官方 formatter 只覆盖活动屏，这一段自建，且只有真实浏览器能证明它成立。U0 第 4 项是整条路线的门槛。
-- 本机工具链前置：Zig、CMake、libghostty-vt 均未安装，U0 开工第一步是搭起来；若 libghostty-vt 在本机构建受阻，先报告再决定，不绕路。
+- 本机工具链前置：Zig 与 libghostty-vt 均未安装，U0 开工第一步是搭起来；若 libghostty-vt 在本机构建受阻，先报告再决定，不绕路。
 - Shell 环境差异：tmux 注入的 `TERM`/环境消失，worker 显式设置——首屏行为是重点回归观察点（% 提示符一类问题若复现，优先查 `TERM` 与首屏重绘路径）。
 - 每会话一进程：worker 网格 scrollback 与回放深度对齐（~10k 行），内存低于 tmux 时代（50k 行）；进程数个人规模（几十）不构成问题。
 - 一致性窗口：worker 死亡到列表观测之间——「首次观测死亡」语义，与 002 注册表设计一致。

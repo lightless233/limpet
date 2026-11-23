@@ -92,7 +92,7 @@ H5 <--- WSS（帧协议不变）---> limpet-server（路由/注册表/HTTP API/�
 ## 约束与边界
 
 - **无兼容层**：现存 tmux 会话在切换时一次性失效（001 退役直接 PTY 时的先例重演）。
-- 单二进制部署；`go build` 产出含 cgo（libghostty-vt 静态链接），仅 WSL/Linux 本机目标。**构建前置**：libghostty-vt 静态库须先在本机构建（Zig ≥ 0.17.1 + CMake，产出可供 pkg-config 发现的 `libghostty-vt.pc`）；开发机当前三者皆未安装，属 U0 前置。
+- 单二进制部署；`go build` 产出含 cgo（libghostty-vt 静态链接），仅 WSL/Linux 本机目标。**构建前置**：官方预编译产物只有 Apple、WASM、Windows 三类，没有 Linux 包——libghostty-vt 静态库须在本机从源码构建，构建工具是 Zig（库以 Zig 编写并使用其构建系统），版本须为 0.17.x（主次版本精确匹配，`minimum_zig_version` = 0.17.0）。CMake 不是必需项。Zig 只参与这一次构建：产物为 `libghostty-vt.a` + 头文件 + pkg-config 文件，此后 `go build` 只依赖本机已有的 gcc。开发机当前未安装 Zig 与 libghostty-vt，属 U0 前置。
 - socket 目录权限 0700，单用户假设不变（001 非目标条款继续成立）。
 - libghostty-vt（`vt-1.0.x`）的 C ABI 自 1.0 起稳定；Go 绑定 `go.mitchellh.com/libghostty` 截至 2026-11-23 仍是无正式 tag 的伪版本，且明确不承诺 API 稳定。两者均 pin 版本，升级走回归。
 - **两端内核版本对齐**：worker 的 libghostty-vt 与前端 `@wterm/ghostty` 内置的 ghostty-vt WASM 是两个独立的版本来源，应一并对齐——VT 重建的保真以两端同核为前提，升级时一起回归。
