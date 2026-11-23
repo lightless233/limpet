@@ -42,30 +42,31 @@
 
 **完成证据**：`systemd-run` 方式下创建会话成功，worker 的控制组为 `limpet-worker-<uuid>.service`，环境与 server 一致；`direct` 方式回归不受影响。单元文件在 U4 落地，本单元先用等价环境验证。
 
-## 单元 4：服务单元与部署流程
+## 单元 4：发布构建、安装目录与服务单元
 
-**问题**：没有单元文件；构建依赖一个不在 pkg-config 默认搜索路径里的 `.pc` 文件（构建缓存一失效，`go build` 就失败）；升级步骤不成文。
+**问题**：没有单元文件；发布产物不完整（页面在二进制之外、靠工作目录去找）；构建依赖一个不在 pkg-config 默认搜索路径里的 `.pc` 文件（构建缓存一失效，`go build` 就失败）；安装与升级步骤不成文；开发仓库与正式运行之间没有边界。
 
 **改动**：
-- `deploy/limpet-server.service`：用户级单元。`WorkingDirectory` / `ExecStart` 指向仓库内的二进制；`LIMPET_WORKER_LAUNCH=systemd-run`；WSL 会话基线环境（spec 三，Windows 目录取自安装时真实会话的 PATH）；`Restart=on-failure`。
-- `deploy/build.sh`：固定携带 libghostty 的 pkg-config 路径；先写临时文件再改名（原子替换）；产物 `bin/limpet-server`（`.gitignore` 加 `/bin/`）。
-- `deploy/README.md`：安装（链接单元、启用）、启停、日志（journal）、升级、新增 Windows 工具后如何更新 PATH。
-- `tests/cleanup.mjs`：等 worker 退出的判定不再依赖二进制名（`new-server worker` 字样在服务方式下不成立）。
+- **前端内嵌**：`go.mod` 上移到仓库根（`go:embed` 只能引用模块内的路径）；`web/` 增加内嵌包，只在 `-tags limpet_embed` 的发布构建里编译，开发构建里为空。server 托管页面时内嵌优先，开发构建退回磁盘上的 `web/dist`（现有行为）；文件名带内容哈希的 `assets/` 允许长期缓存，`index.html` 不缓存。
+- **版本标记**：发布构建写入提交号；`limpet-server version` 可查，启动日志带版本。
+- `deploy/install.sh`：构建前端 → 发布构建（固定携带 libghostty 的 pkg-config 路径）→ 安装目录（默认 `/opt/limpet`；不可写时报错并给出创建命令）→ 生成单元文件（WSL 会话基线取自当前会话，Windows 目录取自当前 PATH，端口 13000）→ 链接进 `~/.config/systemd/user/` → `daemon-reload`、启用、重启。二进制与单元文件都先写临时文件再改名。
+- `deploy/README.md`：安装、升级、启停、日志、刷新 PATH 快照。
+- `tests/`：WS 地址从 `BASE` 推导（现有脚本写死 4040）；`cleanup.mjs` 等 worker 退出的判定不再依赖二进制名。
 
-**完成证据**：服务启用后，页面（不经 vite）可创建会话；stop / restart / kill -9 三场景下会话存活且新 server 找回；关闭会话与 worker `kill -9` 后无残留单元与进程；升级流程走通一次（spec 验收 8–12）。
+**完成证据**：安装目录里只有二进制与单元文件，单元经链接生效、不引用开发仓库路径（spec 验收 15）；服务在 13000 上页面可用（8）；stop / restart / kill -9 三场景下会话存活且新 server 找回；关闭会话与 worker `kill -9` 后无残留单元与进程；再执行一次安装脚本完成一次升级（9–12）；前台 server 与 vite 与服务并行可用（16）；上线前未登录请求被 Access 重定向（17）。
 
 ## 单元 5：验收与收尾
 
 **改动**：
-- 全套脚本在 `direct` 与 `systemd-run` 两种方式下各跑一遍；`-race`。
+- 全套脚本在 `direct`（4040）与 `systemd-run`（13000）两种方式下各跑一遍；`-race`。
 - spec / plan 回填结果；真机清单（spec 验收 7）交付用户。
 
-**完成证据**：spec 005 验收 1–6、8–14 有记录；7 待用户执行。
+**完成证据**：spec 005 验收 1–6、8–17 有记录；7 待用户执行。
 
 ## 风险与备注
 
 - **操作纪律**：停 server 一律用普通 `kill` 或 `systemctl`。按进程树整棵清理的停止方式（包括 agent 工具的「停止后台任务」）会带走 worker——今天已因此结束过一个空闲会话。服务方式下 worker 的父进程是 systemd，这类工具也追不到它。
-- 两种方式共用 4040：跑前台回归前先 `systemctl --user stop limpet-server`（会话不受影响），跑完再启动服务。
+- **上线检查**：13000 是公网入口。Limpet 自身不做认证，启用服务前先确认 Tunnel 域名在 Access 之后；确认不了就不启用，先报告。
 - 服务方式下 server 日志进 journal；worker 日志位置不变。
 - 心跳定时器与输出泵并发写同一条 WS，经现有写互斥串行；ping 写超时按慢消费者处理（4001）。
 - 测试每跑一轮新增约 250MB 录制（慢消费者测试各 30MB），不在本工作项范围；`~/.limpet/history` 今天已清空。

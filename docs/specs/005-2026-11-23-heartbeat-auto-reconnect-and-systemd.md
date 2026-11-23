@@ -1,7 +1,7 @@
 # Spec 005：心跳、前端自动重连与 systemd 部署
 
 - 日期：2026-11-23
-- 状态：待评审
+- 状态：已评审（2026-11-23），结论见「评审结论」
 - 来源：会话讨论（2026-11-23）。004 验收通过后的缺口盘点确认三件事要做：心跳、前端自动重连、systemd 部署。远程入口（Cloudflare Tunnel + Access）已由用户配置妥当，不在本工作项内。
 - 关联：落实 Spec 003「延后：systemd 部署」记录的约束（worker 必须在自己的单元里）；worker 协议 v2 不变；前端接入语义（重建 + 实时流，spec 003/004）不变。
 
@@ -20,6 +20,7 @@
 - 经 Tunnel 接入的页面，空闲多久都不掉线。
 - 网络抖动、切网、锁屏恢复、server 重启之后，页面自动接回原会话并恢复当前画面，不需要人管。
 - server 作为 systemd 服务常驻：WSL 启动即起、崩溃自动拉起；服务停止或重启不触碰会话。
+- 正式运行与开发仓库分离：开发仓库只用于开发，服务从独立的安装目录运行。
 
 ## 一、心跳
 
@@ -83,20 +84,26 @@
 - **用户级服务** `limpet-server.service`（`systemctl --user`），随用户管理器启动。依据：本机已启用 linger（用户管理器随 WSL 启动）、不需要 root、与系统级的 cloudflared 经 localhost 互通。Spec 003 留待确定的「用户级还是系统级」就此定为用户级。
 - **worker 经 `systemd-run --user` 启动为独立的临时单元** `limpet-worker-<uuid>.service`，不在 server 的控制组里（003 记录的机制）。server 单元保持 systemd 默认的 `KillMode`，不改成 `process` 或 `none`。
 - **启动方式由配置决定**：`LIMPET_WORKER_LAUNCH=direct`（默认，前台开发：server 直接 spawn）或 `systemd-run`（服务部署）。服务单元文件里显式设为后者，前台开发不受影响。
+- **开发仓库与正式安装分离**：开发仓库（`~/program/limpet`）只用于开发，任何服务路径都不指向它。正式安装放在独立目录 `/opt/limpet`，里面只有两样东西——发布二进制 `limpet-server` 和服务单元文件 `limpet-server.service`。`/opt` 归 root 所有，安装目录由安装者创建一次再交给当前用户（`sudo mkdir -p /opt/limpet && sudo chown $USER /opt/limpet`），此后不需要 root。
+- **部署靠复制，不靠 git**：发布产物从仓库构建后复制到安装目录。安装目录里没有 git 检出，仓库有没有远程、推没推送都不影响安装。
+- **前端内嵌进二进制**：发布构建把 `web/dist` 用 `go:embed` 打进 `limpet-server`，页面由二进制自己提供，不依赖工作目录，也不需要随二进制一起复制文件。开发构建不带内嵌（加构建标签才启用），开发时页面照旧走 vite。
+- **单元文件从安装目录读取**：systemd 只从它自己的搜索路径加载单元文件，所以在 `~/.config/systemd/user/` 下放一个指向 `/opt/limpet/limpet-server.service` 的链接。文件本体在安装目录，由安装脚本生成。
+- **端口 13000**：服务监听 `127.0.0.1:13000`（已有 Tunnel 路由）。开发用的前台 server 仍在 4040、vite 在 4041，两者可以同时运行。
 
 **行为**
 
 - `systemctl --user stop`、`restart`，或 server 崩溃后被自动拉起——会话、Shell、录制全部不受影响，新 server 启动后找回。003 验收 9 的存活保证在服务管理下继续成立。
 - 显式关闭会话后，对应的 worker 单元消失；异常退出的 worker 单元同样不残留。
 - worker 被 `kill -9`：该会话的整棵进程树由 systemd 随单元清理（前台方式下后台作业可能泄漏，服务方式下不再）。
-- 升级 = 原子替换二进制 + `systemctl --user restart limpet-server`。运行中的 worker 是独立进程，继续用旧二进制；新旧混跑由协议握手保证（003）。
-- 页面由服务直接托管构建产物，不依赖 vite。
+- 升级 = 重新执行安装脚本：构建新二进制 → 原子替换安装目录里的 `limpet-server` → `systemctl --user restart limpet-server`。运行中的 worker 是独立进程，继续用旧二进制；新旧混跑由协议握手保证（003）。
+- 页面由服务直接提供（内嵌），不依赖 vite。
+- 二进制记录自己的构建版本（提交号），`limpet-server version` 可查，启动日志里也有——安装目录里没有 git 信息，靠它知道线上跑的是哪一版。
 
 **会话环境**——服务方式下需要显式处理的一处差异
 
 - systemd 不继承 WSL 会话环境。实测在服务里：`LANG` 为空（Shell 的 locale 落到 POSIX，中文会出错）、`PATH` 只有系统目录；`systemd-run` 起的单元也不继承 server 的环境。
 - 契约：worker 把自己的环境交给 Shell（不变）。`systemd-run` 方式下由 server 把自己的环境显式转交给 worker 单元；前台方式照旧继承。
-- 服务单元文件给出 **WSL 会话基线**：UTF-8 的 `LANG`、`WSL_DISTRO_NAME`、WSLg 变量（`DISPLAY`、`WAYLAND_DISPLAY`、`PULSE_SERVER`、`WSL2_GUI_APPS_ENABLED`）、基础 `PATH`（系统目录在前，Windows 目录在后）。
+- 安装脚本生成单元文件时写入 **WSL 会话基线**，取自安装时所处会话的实际值：UTF-8 的 `LANG`、`WSL_DISTRO_NAME`、WSLg 变量（`DISPLAY`、`WAYLAND_DISPLAY`、`PULSE_SERVER`、`WSL2_GUI_APPS_ENABLED`）、基础 `PATH`（系统目录在前，Windows 目录在后）。装了新的 Windows 工具后重新执行一次安装脚本即可刷新。
 - 用户自己的 CLI（node、pnpm、codex、claude、cargo、go 等）的路径由用户 Shell 自己的配置文件提供——实测交互 zsh 在最小环境下能得到完整 PATH。
 - 附带效果：会话不再混入启动 server 的那个终端的环境变量（今天由 agent 终端拉起的 server，把 agent 的二十多个变量带进了每个会话）。
 
@@ -104,13 +111,14 @@
 
 - `systemd-run` 方式：server 启动时先验证能通过同一个 systemd 实例拉起单元，失败则拒绝启动并说明原因。
 - `direct` 方式：server 启动时若发现自己正运行在某个服务单元内，输出告警——这个组合下 worker 会随 server 的重启被终止。
+- **上线检查**：13000 是 Tunnel 后面的公网入口，Limpet 自身不做认证，靠 Access 挡在前面。启用服务前先确认该域名的未登录请求会被 Access 重定向；确认不了就不启用。
 
-## 需要评审确认的取舍
+## 评审结论（2026-11-23）
 
-1. 用户级服务 + `systemd-run`（依据见上）。
-2. 心跳取值 20 秒 / 60 秒。
-3. 会话环境基线写在单元文件里；其中 Windows 目录是安装时 PATH 的快照，新增 Windows 工具后要更新那一行。不需要在会话里直接敲 Windows 命令的话可以去掉。
-4. 部署布局：二进制与前端产物都留在仓库目录内（`<仓库>/bin/limpet-server`、`<仓库>/web/dist`），单元文件用 `%h` 指向仓库，不另设安装目录。
+1. 用户级服务 + `systemd-run` —— 确认。
+2. 心跳取值 20 秒 / 60 秒 —— 确认。
+3. 会话环境基线由单元文件给出，Windows 目录是安装时的 PATH 快照 —— 确认。安装脚本在安装时自动采集。
+4. 部署布局 —— 按用户要求修订：开发仓库只做开发；正式安装到独立目录 `/opt/limpet`；部署用复制，不用 git 拉取；单元文件从安装目录读取；端口复用 13000。配套新增两处：前端内嵌进二进制（让「只复制一个文件」成立）；`/opt/limpet` 由安装者创建一次后交给当前用户。
 
 ## 已知限制
 
@@ -125,6 +133,7 @@
 - 系统级服务方式；Windows 开机自启 WSL。
 - 录制配额与清理策略；测试数据目录隔离。
 - URL 路由（刷新后回到原会话）、重连期间保留旧画面、输入缓冲、登录失效后自动刷新。
+- 在安装目录里保留 git 检出。
 
 ## 验收标准
 
@@ -135,10 +144,13 @@
 5. server 重启：`systemctl --user restart limpet-server` 期间页面显示重连中，服务回来后自动接回原会话。
 6. 终态：Shell 内 `exit` → 徽标「会话已结束」，不重连；在列表里关闭会话后页面同样进入终态；worker 被 `kill -9` → 页面经核对后进入「会话已结束」。
 7. 真机（经 Tunnel）：空闲 ≥ 10 分钟不掉线；锁屏 ≥ 2 分钟回到页面自动接回；WiFi 与蜂窝切换后自动接回。
-8. 常驻：服务启用后，打开页面（不经 vite）可以创建并使用会话；`stop` 再 `start`，期间的会话仍可接入；`kill -9` server 进程后 ≤ 5 秒自动重启，会话保留。
+8. 常驻：服务启用后监听 `127.0.0.1:13000`，打开页面（不经 vite）可以创建并使用会话；`stop` 再 `start`，期间的会话仍可接入；`kill -9` server 进程后 ≤ 5 秒自动重启，会话保留。
 9. 隔离：`systemctl --user status limpet-server` 的控制组内没有 worker；worker 的控制组是 `limpet-worker-<uuid>.service`；`restart` 前后会话 Shell 的 PID 不变。
 10. 会话环境：服务方式下新建会话里 locale 是 UTF-8，中文输入显示正常；`node`、`pnpm`、`codex` 等用户 CLI 找得到；`explorer.exe .` 可用。
 11. 回收：关闭会话后 `systemctl --user list-units` 里没有对应的 `limpet-worker-*`；worker 被 `kill -9` 后它的后台作业（`sleep 60 &`）不残留。
 12. 升级：原子替换二进制并 restart 后，旧会话继续可用，新会话使用新 worker，新前端接入旧 worker 画面正确（003 验收 9 的升级部分）。
-13. 回归：全部脚本在前台与服务两种方式下都通过；`-race` 干净。
+13. 回归：全部脚本在前台（4040）与服务（13000）两种方式下都通过；`-race` 干净。
 14. 配置保护：`systemd-run` 方式在 systemd 不可用时拒绝启动并给出原因；`direct` 方式在服务单元内运行时输出告警。
+15. 安装目录自包含：`/opt/limpet` 里只有二进制与单元文件；`systemctl --user cat limpet-server` 的 `ExecStart` 指向安装目录；`~/.config/systemd/user/` 下的单元是指向安装目录的链接；两者都不引用开发仓库路径。
+16. 并行：服务（13000）运行期间，前台开发 server（4040）与 vite（4041）照常可用。
+17. 远程入口受保护：未登录访问 Tunnel 域名，页面与 `/api/term` 都被重定向到 Access 登录页（charter 验收 4 的后半句）。
