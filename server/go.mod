@@ -5,4 +5,5 @@ go 1.27.4
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/creack/pty v1.1.24
+	go.mitchellh.com/libghostty v0.0.0-20261123035439-5bbe1d0d0990
 )
