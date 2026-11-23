@@ -35,8 +35,10 @@ type session struct {
 	cmd *exec.Cmd
 	ptmx *os.File
 
-	grid   *libghostty.Terminal
-	gridMu sync.Mutex
+	grid   *libghostty.Terminal // 真实网格：吃全量原始字节（备用屏也进）
+	shadow *libghostty.Terminal // 影子网格：只吃主屏阶段字节（备用屏切换与内容不喂），供全屏程序运行中重接还原主屏
+	gridMu sync.Mutex // 同时保护 grid 与 shadow 的访问
+	altf   altFilter
 
 	// 录制：log 是纯原始字节（只追加）；meta 是事件行，偏移是 log 的文件偏移。
 	logPath, metaPath string
@@ -104,6 +106,15 @@ func startSession(m *manager, id, name string) (*session, error) {
 		}),
 	)
 	if err != nil {
+		s.closeRecording()
+		return nil, err
+	}
+	s.shadow, err = libghostty.NewTerminal(
+		libghostty.WithSize(gridCols, gridRows),
+		libghostty.WithMaxScrollbackLines(gridScrollback),
+	)
+	if err != nil {
+		s.grid.Close()
 		s.closeRecording()
 		return nil, err
 	}
@@ -179,21 +190,12 @@ func (s *session) handleOutput(batch []byte) {
 	// 回到 ground 为止（U0-8a 定案；已在 ground 时 VTWriteUntil 消耗 0 字节，
 	// 不能用它推进普通文本）。
 	s.gridMu.Lock()
-	rest := batch
-	for len(rest) > 0 {
-		if g, err := s.grid.VTGround(); err == nil && g {
-			s.grid.VTWrite(rest)
-			break
+	feedGround(s.grid, batch)
+	for _, sg := range s.altf.process(batch) {
+		if !sg.shadow {
+			continue
 		}
-		stop, err := s.grid.VTWriteUntil(rest, libghostty.TerminalBoundaryGround)
-		if err != nil {
-			break
-		}
-		if stop.Consumed == 0 {
-			s.grid.VTWrite(rest)
-			break
-		}
-		rest = rest[stop.Consumed:]
+		feedGround(s.shadow, sg.data)
 	}
 	s.gridMu.Unlock()
 	s.fedBytes.Store(start + int64(len(batch)))
@@ -250,6 +252,7 @@ func (s *session) resize(cols, rows uint16) error {
 	if err != nil {
 		return err
 	}
+	_ = s.shadow.Resize(cols, rows, 0, 0)
 	if s.ptmx != nil {
 		_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
 	}
@@ -271,17 +274,28 @@ func (s *session) rebuild() ([]byte, []byte, error) {
 	}
 	c.cutOffset = s.fedBytes.Load()
 
-	f, err := libghostty.NewFormatter(s.grid,
-		libghostty.WithFormatterFormat(libghostty.FormatterFormatVT),
-		libghostty.WithFormatterExtras(libghostty.FormatterExtrasAll),
-	)
+	screen, err := s.grid.ActiveScreen()
 	if err != nil {
 		return nil, nil, err
 	}
-	out, err := f.Format()
-	f.Close()
-	if err != nil {
-		return nil, nil, err
+	var out []byte
+	if screen == libghostty.ScreenAlternate {
+		// 备用屏激活：影子网格还原主屏（含其历史），再进入备用屏还原活动屏
+		//（U0 影子探针验证过的重放顺序）。
+		sh, err := formatVT(s.shadow)
+		if err != nil {
+			return nil, nil, err
+		}
+		rt, err := formatVT(s.grid)
+		if err != nil {
+			return nil, nil, err
+		}
+		out = append(append(sh, "\x1b[?1049h"...), rt...)
+	} else {
+		out, err = formatVT(s.grid)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	var cont []byte
@@ -332,6 +346,7 @@ func (s *session) finish(reason string) {
 		c.closeWith(1000, "session ended")
 	}
 	s.grid.Close()
+	s.shadow.Close()
 	s.closeRecording()
 	s.m.remove(s.id)
 	close(s.done)
@@ -374,4 +389,40 @@ func (s *session) recordMeta(kind string, offset int64, val string) error {
 		return err
 	}
 	return s.metaW.Flush()
+}
+
+// feedGround 把一批字节喂入一台网格：ground 时整批直写（快路径）；停在序列中间
+// 时用 VTWriteUntil 喂到回到 ground 为止（U0-8a 定案；已在 ground 时它消耗 0 字节，
+// 不能用它推进普通文本）。
+func feedGround(t *libghostty.Terminal, batch []byte) {
+	rest := batch
+	for len(rest) > 0 {
+		if g, err := t.VTGround(); err == nil && g {
+			t.VTWrite(rest)
+			return
+		}
+		stop, err := t.VTWriteUntil(rest, libghostty.TerminalBoundaryGround)
+		if err != nil {
+			return
+		}
+		if stop.Consumed == 0 {
+			t.VTWrite(rest)
+			return
+		}
+		rest = rest[stop.Consumed:]
+	}
+}
+
+// formatVT 用全量 extras 把一台网格的当前屏（含其滚动历史）序列化为 VT。
+func formatVT(t *libghostty.Terminal) ([]byte, error) {
+	f, err := libghostty.NewFormatter(t,
+		libghostty.WithFormatterFormat(libghostty.FormatterFormatVT),
+		libghostty.WithFormatterExtras(libghostty.FormatterExtrasAll),
+	)
+	if err != nil {
+		return nil, err
+	}
+	out, err := f.Format()
+	f.Close()
+	return out, err
 }
