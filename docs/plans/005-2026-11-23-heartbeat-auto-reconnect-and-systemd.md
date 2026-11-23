@@ -86,6 +86,8 @@
 
 ## 风险与备注
 
+- **正式服务未上线（2026-11-24）**：施工时它被直接启用并启动过，用户要求停掉。现在已停止并从 systemd 注销（不自启）；安装产物仍在 `/opt/limpet`（二进制与单元文件），正式数据目录 `~/.limpet` 是空的。重新上线须经用户明确指示，届时执行：`ln -sfn /opt/limpet/limpet-server.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now limpet-server`。
+
 - **操作纪律**：停 server 一律用普通 `kill` 或 `systemctl`。按进程树整棵清理的停止方式（包括 agent 工具的「停止后台任务」）会带走 worker——今天已因此结束过一个空闲会话。服务方式下 worker 的父进程是 systemd，这类工具也追不到它。
 - **上线检查**：13000 是公网入口。Limpet 自身不做认证，启用服务前先确认 Tunnel 域名在 Access 之后；确认不了就不启用，先报告。
 - 服务方式下 server 日志进 journal；worker 日志位置不变。
