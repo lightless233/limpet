@@ -27,6 +27,7 @@ type wsConn struct {
 	mu         sync.Mutex
 	closed     atomic.Bool
 	resizeSeen atomic.Bool // 客户端是否已发过 resize（v1 worker 兜底定时器用）
+	slow       atomic.Bool // 对端消费得慢（WS 写曾长时间阻塞）——worker 断开时据此按「太慢」而不是「异常」报
 }
 
 func (w *wsConn) write(ctx context.Context, typ websocket.MessageType, data []byte) error {
@@ -198,11 +199,17 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 		fc.close()
 	}()
 
-	// WS 写：有界超时——对端停止读取时在此暴露为超时 → 4001。
+	// WS 写：有界超时——对端停止读取时在此暴露为超时 → 4001。没超时但阻塞了很久，
+	// 说明对端一直在慢慢消费：记下来，之后 worker 断开时按 4001 报（见主循环）。
 	writeWS := func(typ websocket.MessageType, data []byte) error {
+		started := time.Now()
 		c2, cl := context.WithTimeout(ctx, 5*time.Second)
 		defer cl()
-		return w.write(c2, typ, data)
+		err := w.write(c2, typ, data)
+		if err == nil && time.Since(started) >= slowWrite {
+			w.slow.Store(true)
+		}
+		return err
 	}
 
 	// 最近一次听到对端的时刻（任何入站消息都算），心跳超时判定用。
@@ -292,9 +299,14 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 	for {
 		t, payload, err := fc.readFrame()
 		if err != nil {
-			// worker 连接断开：有 EXIT 帧在先的已按 1000 处理；走到这里说明
-			// 是异常断开（worker 崩溃/被杀）→ 1011。
-			w.close(websocket.StatusCode(1011), "worker connection lost")
+			// worker 连接断开：有 EXIT 帧在先的已按 1000 处理。对端一直在慢慢消费时，
+			// 这是 worker 丢弃了慢 viewer——它的 DETACH 送不到（此刻正阻塞写给对端）→ 4001；
+			// 其余情况才是异常断开（worker 崩溃/被杀）→ 1011。
+			if w.slow.Load() {
+				w.close(websocket.StatusCode(4001), "too slow")
+			} else {
+				w.close(websocket.StatusCode(1011), "worker connection lost")
+			}
 			break
 		}
 		switch t {

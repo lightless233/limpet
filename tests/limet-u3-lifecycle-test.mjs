@@ -48,10 +48,17 @@ await waitReady(st)
 st.ws.send(Buffer.from('sleep 555 &\r'))
 await sleep(300)
 st.ws.send(Buffer.from('sleep 556\r'))
-await sleep(600)
-const fgBefore = sh(`pgrep -f 'sleep 55[6]' | wc -l`).trim()
-const bgBefore = sh(`pgrep -f 'sleep 55[5]' | wc -l`).trim()
-has('关闭前两个作业都在运行', fgBefore >= 1 && bgBefore >= 1)
+// 等两个作业真的启动，而不是靠固定延时：Shell 初始化要一秒上下，不同环境下快慢不同
+//（服务方式下约 1.2s，此前的 900ms 固定延时时而不够）。
+let fgBefore = 0
+let bgBefore = 0
+const tUp = Date.now()
+while (Date.now() - tUp < 10000 && (fgBefore < 1 || bgBefore < 1)) {
+  await sleep(150)
+  fgBefore = Number(sh(`pgrep -f 'sleep 55[6]' | wc -l`).trim())
+  bgBefore = Number(sh(`pgrep -f 'sleep 55[5]' | wc -l`).trim())
+}
+has(`关闭前两个作业都在运行（等了 ${((Date.now() - tUp) / 1000).toFixed(1)}s）`, fgBefore >= 1 && bgBefore >= 1)
 
 const res = await fetch(`${BASE}/api/term/${id}/close`, { method: 'POST' })
 has('关闭请求成功', res.status === 200)
@@ -66,6 +73,11 @@ while (Date.now() - t0 < 12000) {
     break
   }
   await sleep(300)
+}
+if (!reaped) {
+  // pgrep -f 按命令行全文匹配：别的进程命令行里出现同样的字样也会被数进来（本项目踩过多次），
+  // 失败时把匹配到的进程打出来，便于分辨是真没回收还是误匹配。
+  console.log('  仍匹配到的进程:\n' + sh(`pgrep -af 'sleep 55[56]' | cut -c1-160`))
 }
 has('关闭后前台任务与后台作业全部结束（回收单位=会话）', reaped)
 const list = await (await fetch(`${BASE}/api/term`)).json()

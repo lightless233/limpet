@@ -38,6 +38,7 @@ const (
 	// 心跳（spec 005）：Cloudflare 在双向无数据 100s 后关闭 WebSocket，20s 周期留 5 倍余量；
 	// 60s 即容忍连续 3 个周期听不到对端。
 	pingInterval = 20 * time.Second
+	slowWrite    = 2 * time.Second // 单次 WS 写阻塞达到这个时长即记为「对端消费得慢」
 	pingTimeout  = 60 * time.Second
 )
 

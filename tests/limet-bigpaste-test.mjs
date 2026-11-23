@@ -40,8 +40,10 @@ await sleep(300)
 ws.send(enc.encode('\x04')) // Ctrl+D EOF
 await sleep(500)
 ws.send(enc.encode('wc -c < /tmp/limet-paste.bin; md5sum /tmp/limet-paste.bin\r'))
-for (let i = 0; i < 30 && !out.includes('limet-paste.bin'); i++) await sleep(200)
-await sleep(400)
+// 等校验结果真正输出（Shell 启动与 1.1MB 的消化都要时间），不靠固定延时。
+const t1 = Date.now()
+while (Date.now() - t1 < 20000 && !/[0-9a-f]{32}\s+\/tmp\/limet-paste\.bin/.test(out)) await sleep(100)
+await sleep(300)
 
 const m = out.match(/([0-9a-f]{32})\s+\/tmp\/limet-paste\.bin/)
 const wcMatch = out.match(/(\d+)\s*\n?\s*\/?tmp\/limet-paste\.bin/s)
@@ -50,4 +52,5 @@ console.log(`字节数: 期望 ${payloadBytes.length}`)
 console.log(`md5:    期望 ${expectedMd5}`)
 console.log(`md5:    实际 ${m ? m[1] : '未找到'}  → ${m && m[1] === expectedMd5 ? '✓ 一致' : '✗ 不一致'}`)
 ws.close()
+await fetch(`${BASE}/api/term/${id}/close`, { method: 'POST' })
 process.exit(m && m[1] === expectedMd5 ? 0 : 1)
