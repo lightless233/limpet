@@ -7,11 +7,19 @@
 
 ## 单元 0：spike（门槛单元，timebox 一天内）
 
-**问题**：spec 的回放机制留有三个未决问题，不定案 U2 无法开工。
+**问题**：重建链路的最后一环是浏览器端 `@wterm/ghostty` WASM 吃下 VT 序列之后的实际渲染与滚动缓冲。单测能读出网格和样式，证明不了这条链路。另有四件事只能靠实证定案。
 
-**改动**：最小 Go 程序验证三件事——① go-libghostty 绑定可用（喂字节、解析、无 panic）；② 网格/scrollback 读取的 API 形状（cell 级样式是否可读，还是仅纯文本提取）；③ 快照路径判定：libghostty snapshot encode 的产物能否被客户端 WASM（@wterm/ghostty）restore。
+**前置**：本机当前未安装 Zig、CMake 与 libghostty-vt。先安装 Zig（≥ 0.17.1）与 CMake，构建 libghostty-vt 静态库（`vt-1.0.1`）并让 pkg-config 可见；Go 绑定 `go.mitchellh.com/libghostty` 以当前伪版本 pin 入 `go.mod`。
 
-**产出**：机制决策记录，回填 spec「回放与画面重建」一节；若 ①② 不成立，fallback 选项（自写 C shim / 纯 Go VT parser）与降级影响一并报告用户后再继续。
+**改动**：最小 worker 原型（PTY + 网格 + 重建）对接**现有 H5 页面，不改前端**，依次验证：
+
+1. go-libghostty 绑定可用：喂字节、解析、无 panic。
+2. 官方 formatter 的 VT 输出与 extras 的实际行为——活动屏、样式、光标；worker 网格处于备用屏时，extras 是否发出与 client 流过滤冲突的模式序列。
+3. **滚动历史序列化**：经 `ScrollbackRows` / grid 遍历读出含样式的行并编码为 VT 序列。formatter 没有这项能力（只格式化 active screen，无 scrollback 选项），这一段自建，是链路中风险最高的一段。
+4. **真实浏览器三项**：彩色滚动历史、全屏画面（vim 中断线后重接）、换尺寸后继续操作。
+5. 切点对齐原型：在持续输出的会话上重接，重建帧与实时流衔接处无重复、无丢失；帧序保持 ready → 重建帧 → 实时流。
+
+**产出**：机制决策记录，回填 spec「回放与画面重建」。第 4 项不过则 U2 不得开工——替代路径（raw 尾部回放等）与降级影响先报告用户再继续；第 1–3 项不成立时同理，fallback（自写 C shim / 纯 Go VT parser）先报告再继续。
 
 ## 单元 1：worker 骨架（不依赖 libghostty）
 
@@ -21,15 +29,15 @@
 - 同一二进制新增 `worker <uuid>` 子命令：打开 `~/.limpet/workers/<uuid>.sock`（0700）、等 server 的启动指令（携带定案尺寸——首条尺寸/3s 兜底/query 兜底仍在 server WS 层，worker 不计时）后启动 PTY（`$SHELL`、交互模式、进程组、起始目录 `$HOME`、`TERM` 显式设置）、raw tee 录制到 `~/.limpet/history/<uuid>.log`、字节透传不缓冲。
 - socket 协议（内部私有，**带版本握手**——server 升级后必须兼容运行中的旧版本 worker，加法演进）：attach / input / resize / kill / exit 通知；单消费者，第二个消费者报 busy。
 - server 侧：会话表切换为 uuid → worker 句柄；`POST /api/term` 自 spawn worker；WS handler 桥接 socket；404/409/426/1008/1011/1000 语义逐项保持。
-- 回放暂用 raw 尾部（**已知 alt-screen 降级，vim/颜色验收挂起到 U2**）。
+- 回放暂用 raw 尾部（**已知 alt-screen 降级，vim/颜色验收挂起到 U2**）。切点对齐从本单元起就必须成立：尾部回放取到输出位置 X，实时流从 X 之后接，回放生成期间到达的输出先缓冲。
 
 **完成证据**：uuid 化的帧级回归脚本全绿（vim 接续与颜色滚动两项除外，它们在 U2 恢复）；1.1MB 中文粘贴 md5 保真；1008/ready 时序不变。
 
 ## 单元 2：画面重建（依赖 U0 结论）
 
-**改动**：按定案机制实现——快照 restore 路径（worker encode → 客户端 restore）或网格序列化路径（cell 级读取 → 「网格 → 转义序列」序列化器，onlcr/转义边界处理沿用 001 回放管线的经验）。同时落地：client 流 `smcup`/`rmcup` 过滤（worker 网格吃原始流）、scrollback 容量与回放深度对齐（10000 行 + 余量）、resize 触发网格重排与 PTY 同步。
+**改动**：按 U0 定案实现 VT 重建——滚动历史段（含样式的行 → VT 序列，自建）+ 活动屏段（官方 formatter 的 VT 输出 + 选定 extras），经现有二进制帧进入 wterm 的 `write` 入口，前端不改。落实切点对齐：重建期间缓冲 PTY 输出，重建帧发完后按序放行；帧序 ready → 重建帧 → 实时流。重接先按客户端首条尺寸重排网格与 PTY，再生成重建画面。同时落地：client 流 `smcup`/`rmcup` 过滤（worker 网格吃原始流）、scrollback 容量与回放深度对齐（10000 行 + 余量）。
 
-**完成证据**：vim 接续原样恢复（含跨 server 重启）；长输出重连直接滚动可见且含颜色；重接字节量符合所选机制的预期（快照 O(屏+尾) / 序列化与 capture 等价抽查比对）。
+**完成证据**：真实浏览器三项通过——彩色滚动历史、全屏画面（vim 中断线后重接，含跨 server 重启）、换尺寸后继续操作；切点对齐断言通过（带序号的输出流，重接后每行恰好出现一次）；帧序为 ready → 重建帧 → 实时流。
 
 ## 单元 3：生命周期加固
 
@@ -59,13 +67,15 @@
 
 ## 单元 6：验收整合
 
-**改动**：按 spec 验收 1–14 逐条执行；移动视口项以 DevTools 仿真自测，真机清单（换设备接续、按键栏、软键盘）留用户。
+**改动**：按 spec 验收 1–16 逐条执行；验收 3/4/15/16 以真实浏览器为准（现有 H5 + `@wterm/ghostty` 0.6.0），协议级脚本只作为它们的字节序补充；移动视口项以 DevTools 仿真自测，真机清单（换设备接续、按键栏、软键盘）留用户。
 
 **完成证据**：自动化全绿 + 真机清单；001 验收 1–12 的行为等价性逐条比对记录。
 
 ## 风险与备注
 
-- libghostty scrollback/reflow 子 API 未冻结：版本 pin + 升级纳入回归；spike 若证明绑定不可用，动工前必须回到用户做 fallback 决策。
+- libghostty 与 Go 绑定均需 pin 版本（库 ABI 自 1.0 稳定，绑定仍是无正式 tag 的伪版本）：升级纳入回归；spike 若证明绑定不可用，动工前必须回到用户做 fallback 决策。
+- 重建链路的最高风险项是滚动历史段的序列化——官方 formatter 只覆盖活动屏，这一段自建，且只有真实浏览器能证明它成立。U0 第 4 项是整条路线的门槛。
+- 本机工具链前置：Zig、CMake、libghostty-vt 均未安装，U0 开工第一步是搭起来；若 libghostty-vt 在本机构建受阻，先报告再决定，不绕路。
 - Shell 环境差异：tmux 注入的 `TERM`/环境消失，worker 显式设置——首屏行为是重点回归观察点（% 提示符一类问题若复现，优先查 `TERM` 与首屏重绘路径）。
 - 每会话一进程：worker 网格 scrollback 与回放深度对齐（~10k 行），内存低于 tmux 时代（50k 行）；进程数个人规模（几十）不构成问题。
 - 一致性窗口：worker 死亡到列表观测之间——「首次观测死亡」语义，与 002 注册表设计一致。
