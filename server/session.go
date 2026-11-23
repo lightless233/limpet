@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,20 +34,26 @@ type viewer struct {
 	queue     chan []byte
 	dims      viewerDims   // 申报的窗口尺寸（跟随输入者的晋升依据）
 	cutOffset atomic.Int64 // 重建覆盖到的流偏移；实时流从此之后接上
+	queued    atomic.Int64 // 队列里积压的字节数
 	closed    atomic.Bool
+	done      chan struct{} // 置位 closed 的同时关闭：通知输出泵收尾
+	// 关闭原因（仅在赢得 closed 置位的那次写入，输出泵在 done 之后读取）。code 为 0 = 不发 DETACH。
+	dropCode   int
+	dropReason string
 }
 
-// closeWith 丢弃 viewer（队列打满，慢消费者）：先发 DETACH(4001)，再关连接。
-// DETACH 的写入有 2s 兜底超时；即便发不出去，最终 close 保证 server 侧一定解脱
-// （server 的 WS 写同样有 5s 超时 → 4001 兜底）。
+// closeWith 丢弃 viewer（积压超限）。它只置位并通知输出泵——DETACH 与关闭连接都由泵来做：
+// 泵是这条连接在重建之后唯一的写者，可能正持着写锁阻塞在写上（最长 2s）；在这里等锁会把
+// PTY 读循环卡住，Shell 的输出随之停摆。
 func (v *viewer) closeWith(code int, reason string) {
 	if !v.closed.CompareAndSwap(false, true) {
 		return
 	}
-	// DETACH 尽力而为（300ms 预算；对端完全停读时写不进——EOF 兜底）。
-	// 浏览器路径的 4001 由 server 中继的 WS 写超时保证，与本帧无关。
-	_ = v.conn.writeFrameTimeout(ftDetach, mustJSON(detachMsg{Code: code, Reason: reason}), 300*time.Millisecond)
-	v.conn.close()
+	v.dropCode, v.dropReason = code, reason
+	if code != 0 {
+		log.Printf("viewer 被丢弃（%s，积压 %d 字节）", reason, v.queued.Load())
+	}
+	close(v.done)
 }
 
 // sessionPaths 是 worker 需要的文件系统位置。
@@ -61,7 +68,7 @@ type session struct {
 	createdAt time.Time
 	paths     sessionPaths
 
-	cmd *exec.Cmd
+	cmd  *exec.Cmd
 	ptmx *os.File
 
 	grid   *libghostty.Terminal // 真实网格：吃全量原始字节（备用屏也进）
@@ -98,8 +105,8 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		paths:     paths,
 		logPath:   filepath.Join(paths.histDir, id+".log"),
 		metaPath:  filepath.Join(paths.histDir, id+".meta"),
-		viewers: map[*viewer]viewerDims{},
-		done:    make(chan struct{}),
+		viewers:   map[*viewer]viewerDims{},
+		done:      make(chan struct{}),
 	}
 	s.curCols, s.curRows = gridCols, gridRows
 
@@ -246,9 +253,14 @@ func (s *session) handleOutput(batch []byte) {
 	}
 
 	// 广播：只送各 viewer 切点之后的字节（切点之前的已在各自重建画面里）。
+	// 积压按字节计（queueBytes），槽数只是碎块突发的余量：PTY 的一批可能只有几十字节
+	// （Shell 回显长行时逐段重绘），按块计会把几 KB 的积压误判成慢消费者。
 	s.viewersMu.Lock()
 	defer s.viewersMu.Unlock()
 	for v := range s.viewers {
+		if v.closed.Load() {
+			continue
+		}
 		cut := v.cutOffset.Load()
 		var tail []byte
 		switch {
@@ -259,12 +271,17 @@ func (s *session) handleOutput(batch []byte) {
 		default:
 			tail = nil
 		}
-		if len(tail) > 0 {
-			select {
-			case v.queue <- tail:
-			default:
-				v.closeWith(4001, "too slow")
-			}
+		if len(tail) == 0 {
+			continue
+		}
+		if v.queued.Add(int64(len(tail))) > queueBytes {
+			v.closeWith(4001, "too slow")
+			continue
+		}
+		select {
+		case v.queue <- tail:
+		default:
+			v.closeWith(4001, "too slow")
 		}
 	}
 }
@@ -348,11 +365,16 @@ func (s *session) rebuildFor(v *viewer) ([]byte, []byte, error) {
 	return out, cont, nil
 }
 
-// attached 是否存在接入中的 viewer。
+// attached 是否存在接入中的 viewer（已被丢弃、尚未摘除的不算）。
 func (s *session) attached() bool {
 	s.viewersMu.Lock()
 	defer s.viewersMu.Unlock()
-	return len(s.viewers) > 0
+	for v := range s.viewers {
+		if !v.closed.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 // shutdown 显式关闭：worker 是子进程收割者（subreaper），按会话进程树回收——
@@ -386,7 +408,10 @@ func (s *session) finish(reason string) {
 	s.viewers = map[*viewer]viewerDims{}
 	s.viewersMu.Unlock()
 	for _, v := range viewers {
-		_ = v.conn.writeFrame(ftExit, mustJSON(exitMsg{Reason: reason}))
+		if !v.closed.Load() {
+			_ = v.conn.writeFrameTimeout(ftExit, mustJSON(exitMsg{Reason: reason}), time.Second)
+		}
+		v.closeWith(0, "")
 		v.conn.close()
 	}
 	s.grid.Close()

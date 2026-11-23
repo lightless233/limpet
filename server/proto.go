@@ -28,7 +28,10 @@ const protocolVersion = 2
 const (
 	wsReadLimit = 1 << 20 // 大粘贴兜底；前端按 64KiB 主动切块
 	wsChunk     = 64 << 10
-	queueChunks = 256             // 每个 viewer 的实时流队列上限（背压：满则丢弃该 viewer）
+	// 每个 viewer 的实时流队列：槽数只是碎块突发的余量，背压按字节计——PTY 的一批可能只有
+	// 几十字节（Shell 回显长行时逐段重绘），按块计会把几 KB 的积压误判成慢消费者。
+	queueChunks = 1024
+	queueBytes  = 8 << 20
 	spawnWait   = 5 * time.Second // 等待 worker 就绪（socket 可探测）
 	frameBudget = 2 * time.Second // 单帧写入的兜底超时：任何慢消费者都不能钉住写锁
 	killGrace   = 3 * time.Second // 关闭回收的 TERM 宽限

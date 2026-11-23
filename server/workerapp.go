@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 func runWorker(uuid string, paths sessionPaths) error {
@@ -128,13 +129,14 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 	case "attach":
 		// 多视图：每条连接独立成为 viewer，互不排斥（spec 004 修订一）。
 		v := &viewer{
-			conn: fc,
+			conn:  fc,
 			queue: make(chan []byte, queueChunks),
+			done:  make(chan struct{}),
 			// 切点初值 = 无穷大：重建完成前一切字节只进重建画面、不进实时流，
 			// 否则接入到重建之间的输出会被「实时发一遍 + 重建再发一遍」
 			// （验收 15 实测抓到过整段双份）。
 		}
-		v.cutOffset.Store(1<<62) // 接近无穷大的安全初值（atomic.Int64 零值是 0）
+		v.cutOffset.Store(1 << 62) // 接近无穷大的安全初值（atomic.Int64 零值是 0）
 		s.viewersMu.Lock()
 		s.viewers[v] = viewerDims{}
 		s.viewersMu.Unlock()
@@ -152,6 +154,7 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 	defer func() {
 		s.removeViewer(v)
+		v.closeWith(0, "") // 让输出泵退出（不发 DETACH）
 		fc.close()
 	}()
 
@@ -179,21 +182,49 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 		}
 	}
 
-	// 输出泵：切点之后的实时流。写失败（含 2s 写超时 = server 端停止消费）→
-	// 补发 DETACH(4001) 再关连接：此时上一次写已超时返回、锁已空闲，DETACH 能
-	// 在兜底超时内送达。会话本身不受影响（PTY 读取与录制照常，spec 003 背压）。
+	// 输出泵：切点之后的实时流。它是这条连接在重建之后唯一的写者——丢弃 viewer 时的
+	// DETACH 与关闭也在这里做（见 closeWith）。
+	// 已经排队的块合并成一帧发出：下游按帧处理，逐块发的单块开销在碎块突发时跟不上
+	// PTY 读取，会把队列顶满。
 	go func() {
+		defer fc.close()
+		// 丢弃通知尽力而为（300ms 预算；对端完全停读时写不进——EOF 兜底）。
+		// 浏览器路径的 4001 由 server 中继的 WS 写超时保证，与本帧无关。
+		drop := func(code int, reason string) {
+			if code != 0 {
+				_ = fc.writeFrameTimeout(ftDetach, mustJSON(detachMsg{Code: code, Reason: reason}), 300*time.Millisecond)
+			}
+		}
+		buf := make([]byte, 0, wsChunk)
+		take := func(c []byte) {
+			buf = append(buf, c...)
+			v.queued.Add(-int64(len(c)))
+		}
 		for {
+			var chunk []byte
 			select {
-			case chunk := <-v.queue:
-				if err := fc.writeFrame(ftOutput, chunk); err != nil {
-					if v.closed.Load() {
-						return
-					}
-					_ = fc.writeFrame(ftDetach, mustJSON(detachMsg{Code: 4001, Reason: "too slow"}))
-					fc.close()
-					return
+			case chunk = <-v.queue:
+			case <-v.done:
+				drop(v.dropCode, v.dropReason)
+				return
+			}
+			buf = buf[:0]
+			take(chunk)
+		drain:
+			for len(buf) < wsChunk {
+				select {
+				case c := <-v.queue:
+					take(c)
+				default:
+					break drain
 				}
+			}
+			if err := fc.writeFrame(ftOutput, buf); err != nil {
+				// 写失败（含 2s 写超时 = server 端停止消费）：补发 DETACH(4001)——此时上一次写
+				// 已超时返回、锁已空闲。会话本身不受影响（PTY 读取与录制照常，spec 003 背压）。
+				v.closed.Store(true)
+				drop(4001, "too slow")
+				return
 			}
 		}
 	}()
