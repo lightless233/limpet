@@ -36,6 +36,8 @@
 
 ## 单元 3：worker 经 systemd-run 启动
 
+**结果（2026-11-23）**：完成——`LIMPET_WORKER_LAUNCH`（`direct` 默认 / `systemd-run`）。`systemd-run --user` 拉起 `limpet-worker-<uuid>.service`（`--collect`、exec 类型、`TimeoutStopSec=5`，日志仍落 `~/.limpet/workers/<uuid>.log`），server 把自己的环境显式转交给单元（剔除 systemd 给 server 单元专用的变量与 `LIMPET_*`）。启动保护：`systemd-run` 方式先做一次最小单元拉起验证，失败即拒绝启动；`direct` 方式在服务单元内运行时告警；未知取值报错退出。`limet-launch-test.mjs` 10 项断言全过（以服务同等的最小环境起临时实例）：worker 单元 active、控制组独立、父进程是 systemd 而非 server；LANG 与标记变量被转交、`LIMPET_*` 不进会话；关闭后单元消失；worker `kill -9` 后后台作业与单元即时清理。三种启动保护均已触发验证；前台方式回归正常。
+
 **问题**：server 运行在服务单元内时，直接 spawn 的 worker 留在同一控制组，server 单元停止或重启时被 systemd 一并清理。
 
 **改动**：
@@ -72,5 +74,6 @@
 - **操作纪律**：停 server 一律用普通 `kill` 或 `systemctl`。按进程树整棵清理的停止方式（包括 agent 工具的「停止后台任务」）会带走 worker——今天已因此结束过一个空闲会话。服务方式下 worker 的父进程是 systemd，这类工具也追不到它。
 - **上线检查**：13000 是公网入口。Limpet 自身不做认证，启用服务前先确认 Tunnel 域名在 Access 之后；确认不了就不启用，先报告。
 - 服务方式下 server 日志进 journal；worker 日志位置不变。
+- 前台方式下退出的 worker 会在 server 的进程表里留一个僵尸条目（server 从不 Wait 它们，原有行为）。只影响开发用的前台方式；服务方式下 worker 的父进程是 systemd，没有这个问题。
 - 心跳定时器与输出泵并发写同一条 WS，经现有写互斥串行；ping 写超时按慢消费者处理（4001）。
 - 测试每跑一轮新增约 250MB 录制（慢消费者测试各 30MB），不在本工作项范围；`~/.limpet/history` 今天已清空。

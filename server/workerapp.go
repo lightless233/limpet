@@ -3,9 +3,10 @@ package main
 // worker 子命令的入口：`limpet-server worker <uuid>`。
 //
 // worker 进程持有 PTY 与双网格，独立于 server 进程存活——server 被杀（含 Ctrl+C
-// 与 kill -9）时它成为孤儿继续运行，PTY 不随 server 关闭（spec 003 验收 9 的机制，
-// 与 systemd 无关）。worker 由 server 以 Setsid 启动，天然脱离 server 的进程组
-// 与会话；正式部署接 systemd-run 时只换这一条启动路径（spec「延后」小节）。
+// 与 kill -9）时它继续运行，PTY 不随 server 关闭（spec 003 验收 9 的机制，
+// 与 systemd 无关）。启动方式有两种（spec 005，见 launch.go）：前台开发时由 server
+// 以 Setsid 直接 spawn，天然脱离 server 的进程组与会话；服务部署时经 systemd-run
+// 进入自己的临时单元，不在 server 的控制组里——server 单元停止或重启时不被一并清理。
 //
 // 多视图（spec 004）：每条 attach 连接 = 一个 viewer，各自有界队列与切点；
 // PTY 输出广播给全部 viewer，输入来自任意 viewer。

@@ -1,13 +1,13 @@
-// Limpet server：自研会话宿主（spec 003/004）。单二进制两种角色：
+// Limpet server：自研会话宿主（spec 003/004/005）。单二进制两种角色：
 //
-//	limpet-server            —— server：路由 + 注册表 + worker 监督（前台运行）
+//	limpet-server               —— server：路由 + 注册表 + worker 监督。前台运行或作为
+//	                               systemd 用户服务运行，由 LIMPET_WORKER_LAUNCH 选择 worker 的启动方式
 //	limpet-server worker <uuid> —— worker：PTY 持有进程，自成会话，独立存活；
-//	                             多视图（spec 004）：PTY 输出广播给所有接入的渲染器
+//	                               多视图（spec 004）：PTY 输出广播给所有接入的渲染器
 //
-// server 停止（Ctrl+C / kill / 崩溃）绝不触碰 worker——它们孤儿化继续运行，
+// server 停止（Ctrl+C / kill / systemctl stop / 崩溃）绝不触碰 worker——它们继续运行，
 // 新 server 靠扫描 socket 目录 + 探测握手找回（spec 003「运行方式与生命周期边界」）。
 package main
-
 
 import (
 	"context"
@@ -36,11 +36,20 @@ func main() {
 		return
 	}
 
+	// worker 的启动方式要先核实：systemd-run 方式下拉不起单元就不启动（见 launch.go）。
+	launch, err := launchFromEnv(os.Getenv("LIMPET_WORKER_LAUNCH"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := checkLaunch(launch); err != nil {
+		log.Fatal(err)
+	}
+
 	addr := os.Getenv("LIMPET_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:4040"
 	}
-	m, err := newManager()
+	m, err := newManager(launch)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}
@@ -72,7 +81,7 @@ func main() {
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 
-	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们孤儿化继续跑）。
+	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们继续运行）。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {

@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -59,9 +58,10 @@ type manager struct {
 	regPath    string
 	registry   map[string]regEntry
 	exePath    string
+	launch     launchMode // worker 启动方式（spec 005，见 launch.go）
 }
 
-func newManager() (*manager, error) {
+func newManager(launch launchMode) (*manager, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
@@ -78,6 +78,7 @@ func newManager() (*manager, error) {
 		regPath:    filepath.Join(home, ".limpet", "sessions.json"),
 		registry:   map[string]regEntry{},
 		exePath:    exe,
+		launch:     launch,
 	}
 	for _, d := range []string{m.histDir, m.workersDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
@@ -231,17 +232,8 @@ func (m *manager) create(name string) (*workerHandle, error) {
 
 	sockPath := filepath.Join(m.workersDir, id+".sock")
 	logPath := filepath.Join(m.workersDir, id+".log")
-	lf, err := os.Create(logPath)
+	killHard, err := m.spawnWorker(id, logPath)
 	if err != nil {
-		return nil, err
-	}
-	defer lf.Close()
-
-	cmd := exec.Command(m.exePath, "worker", id)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // worker 自成会话：server 的 Ctrl+C 不可达
-	cmd.Stdout = lf
-	cmd.Stderr = lf
-	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("启动 worker 失败: %w", err)
 	}
 
@@ -251,7 +243,7 @@ func (m *manager) create(name string) (*workerHandle, error) {
 	deadline := time.Now().Add(spawnWait)
 	for {
 		if time.Now().After(deadline) {
-			_ = syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
+			killHard()
 			_ = os.Remove(sockPath)
 			return nil, fmt.Errorf("worker %s 未在 %v 内就绪", id, spawnWait)
 		}
@@ -272,6 +264,14 @@ func (m *manager) create(name string) (*workerHandle, error) {
 	m.mu.Unlock()
 	m.registryCreate(id, name, h.createdAt)
 	return h, nil
+}
+
+// spawnWorker 按配置的启动方式拉起 worker（见 launch.go）。
+func (m *manager) spawnWorker(id, logPath string) (killHard func(), err error) {
+	if m.launch == launchSystemdRun {
+		return spawnWorkerSystemdRun(m.exePath, id, logPath)
+	}
+	return spawnWorkerDirect(m.exePath, id, logPath)
 }
 
 // closeSession 显式关闭：令 worker 回收整棵会话进程树并退出（TERM → 兜底 KILL）。
