@@ -18,6 +18,9 @@
 | `limet-u3-lifecycle-test.mjs` | 关闭回收整棵进程树（前台+后台作业）；第二个接入升级前 409 | 保留 |
 | `limet-u3-recovery-test.mjs` | server 重启后的会话恢复断言（配合外部重启编排使用，见验收 9 三场景） | 保留 |
 | `cleanup.mjs` | 关闭全部会话并等 worker 进程退出（跑完套件后收尾） | 保留 |
+| `limet-multi-view-test.mjs` | 多视图（spec 004）：双 viewer 输入互通、慢 viewer 单独丢弃 4001、断开重连恰好一次 | 保留 |
+| `limet-u3-slow-consumer-test.mjs` | 慢消费者：30MB 负载 + 停读占空比，连接被关闭（4001 帧或 TCP 关闭）且会话/他人不受影响 | 保留 |
+| `limet-u3-lifecycle-test.mjs` 的第 2 节 | 多视图语义（spec 004）：第二个接入成功且画面同步（409 已废止） | 已按 004 修订 |
 
 以下脚本随 tmux 退役（它们的 oracle 是 tmux 或旧启动流），不再维护，
 需要时从 git 历史翻：tmux-test、prefix-test、handoff、stall、stall2、race、

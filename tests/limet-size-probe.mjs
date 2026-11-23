@@ -17,7 +17,7 @@ console.log('created:', id)
 const ws = new WebSocket(`${BASE.replace('http', 'ws')}/api/ws/term/${id}?cols=80&rows=30`)
 ws.binaryType = 'arraybuffer'
 let out = ''
-ws.onmessage = (e) => { if (typeof e.data !== 'string') out += dec.decode(e.data) }
+ws.onmessage = (e) => { if (typeof e.data !== 'string') out += (typeof e.data === 'string' ? '' : dec.decode(e.data)) }
 await new Promise((r) => { ws.onopen = r })
 ws.send(JSON.stringify({ type: 'resize', cols: 41, rows: 30 }))
 await sleep(2000) // 等 zsh 起完

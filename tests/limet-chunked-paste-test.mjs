@@ -11,7 +11,7 @@ ws.binaryType = 'arraybuffer'
 let out = ''
 let closed = false
 ws.onclose = () => { closed = true }
-ws.onmessage = (e) => { out += dec.decode(e.data) }
+ws.onmessage = (e) => { out += (typeof e.data === 'string' ? '' : dec.decode(e.data)) }
 await new Promise((r) => { ws.onopen = r })
 
 // 模拟大段粘贴：900KB 按 64KiB 分块，等价于前端 sendInput 行为

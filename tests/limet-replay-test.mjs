@@ -23,7 +23,7 @@ function attach(id, query = '') {
         try { if (JSON.parse(e.data).type === 'ready') state.readyAt = true } catch {}
         return
       }
-      state.out += dec.decode(e.data)
+      state.out += (typeof e.data === 'string' ? '' : dec.decode(e.data))
     }
     const h = {
       ws, state,

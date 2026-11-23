@@ -1,12 +1,13 @@
-// Limpet server：自研会话宿主（spec 003）。单二进制两种角色：
+// Limpet server：自研会话宿主（spec 003/004）。单二进制两种角色：
 //
 //	limpet-server            —— server：路由 + 注册表 + worker 监督（前台运行）
-//	limpet-server worker <uuid> —— worker：PTY 持有进程，自成会话，独立存活
+//	limpet-server worker <uuid> —— worker：PTY 持有进程，自成会话，独立存活；
+//	                             多视图（spec 004）：PTY 输出广播给所有接入的渲染器
 //
 // server 停止（Ctrl+C / kill / 崩溃）绝不触碰 worker——它们孤儿化继续运行，
 // 新 server 靠扫描 socket 目录 + 探测握手找回（spec 003「运行方式与生命周期边界」）。
-
 package main
+
 
 import (
 	"context"

@@ -1,12 +1,11 @@
 package main
 
-// worker 侧的会话：PTY、libghostty 网格（真实 + 影子）、录制与当前消费者。
+// worker 侧的会话：PTY、libghostty 双网格、录制与 N 个 viewer（多视图，spec 004）。
 // 本文件运行在 worker 进程里（`limpet-server worker <uuid>`），进程退出即会话终结。
 
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,28 +25,28 @@ const (
 	gridScrollback     = 10000 // 与重接深度对齐（spec 003）；更深的历史由录制承担
 	recFlushBytes      = 32 << 10
 	cwdSampleThrottle  = 200 * time.Millisecond
-	closeGrace         = 3 * time.Second
 )
 
-// consumer 是一次接入：独占位、有界的实时流队列与切点。输出帧经它发往
-// server（再由 server 转成 WS 二进制帧）。
-type consumer struct {
+// viewer 是一个接入的渲染器：连接、有界实时流队列、申报窗口尺寸与切点。
+type viewer struct {
 	conn      *frameConn
 	queue     chan []byte
+	dims      viewerDims   // 申报的窗口尺寸（跟随输入者的晋升依据）
 	cutOffset atomic.Int64 // 重建覆盖到的流偏移；实时流从此之后接上
 	closed    atomic.Bool
 }
 
-// closeWith 丢弃消费者（队列打满，慢消费者）：先发 DETACH 帧（server 据此向
-// 浏览器发 4001），再关 socket。时序：输出泵此刻可能阻塞在自己的 2s 写超时里
-// 持着写锁——本方法的 DETACH 写最多等 2s 拿到锁；DETACH 仅 40 字节，通常能进
-// 内核缓冲。最终必然 close，server 侧 EOF 以 1011 兜底（慢消费者主路径是 4001）。
-func (c *consumer) closeWith(code int, reason string) {
-	if !c.closed.CompareAndSwap(false, true) {
+// closeWith 丢弃 viewer（队列打满，慢消费者）：先发 DETACH(4001)，再关连接。
+// DETACH 的写入有 2s 兜底超时；即便发不出去，最终 close 保证 server 侧一定解脱
+// （server 的 WS 写同样有 5s 超时 → 4001 兜底）。
+func (v *viewer) closeWith(code int, reason string) {
+	if !v.closed.CompareAndSwap(false, true) {
 		return
 	}
-	_ = c.conn.writeFrame(ftDetach, mustJSON(detachMsg{Code: code, Reason: reason}))
-	_ = c.conn.close()
+	// DETACH 尽力而为（300ms 预算；对端完全停读时写不进——EOF 兜底）。
+	// 浏览器路径的 4001 由 server 中继的 WS 写超时保证，与本帧无关。
+	_ = v.conn.writeFrameTimeout(ftDetach, mustJSON(detachMsg{Code: code, Reason: reason}), 300*time.Millisecond)
+	v.conn.close()
 }
 
 // sessionPaths 是 worker 需要的文件系统位置。
@@ -56,7 +55,7 @@ type sessionPaths struct {
 	socketDir string
 }
 
-// session 是 worker 进程的全部状态：PTY、双网格、录制与当前消费者。
+// session 是 worker 进程的全部状态：PTY、双网格、录制与 viewer 集合。
 type session struct {
 	id        string
 	createdAt time.Time
@@ -67,8 +66,10 @@ type session struct {
 
 	grid   *libghostty.Terminal // 真实网格：吃全量原始字节（备用屏也进）
 	shadow *libghostty.Terminal // 影子网格：只吃主屏阶段字节，供全屏程序运行中重接还原主屏
-	gridMu sync.Mutex           // 同时保护 grid 与 shadow 的访问
+	gridMu sync.Mutex           // 同时保护 grid/shadow 的访问与 fedBytes 的更新
 	altf   altFilter
+
+	curCols, curRows uint16 // 网格当前尺寸（跟随输入者）
 
 	logPath, metaPath string
 	logF, metaF       *os.File
@@ -79,9 +80,10 @@ type session struct {
 	lastCwd           string
 	lastCwdAt         time.Time
 
-	fedBytes atomic.Int64 // 已喂入真实网格的字节数（读循环维护；写回回调读取）
+	fedBytes atomic.Int64 // 已喂入真实网格的字节数（读循环在网格临界区内维护）
 
-	consumer atomic.Pointer[consumer]
+	viewersMu sync.Mutex
+	viewers   map[*viewer]viewerDims // 全部接入中的 viewer 及其申报尺寸
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -96,10 +98,11 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		paths:     paths,
 		logPath:   filepath.Join(paths.histDir, id+".log"),
 		metaPath:  filepath.Join(paths.histDir, id+".meta"),
-		done:      make(chan struct{}),
+		viewers: map[*viewer]viewerDims{},
+		done:    make(chan struct{}),
 	}
+	s.curCols, s.curRows = gridCols, gridRows
 
-	// 录制文件先行：PTY 启动即开始，首条事件是偏移 0 的启动时刻与初始尺寸。
 	lf, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
@@ -115,9 +118,9 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 	_ = s.recordMeta("T", 0, fmt.Sprint(s.createdAt.UnixMilli()))
 	_ = s.recordMeta("S", 0, fmt.Sprintf("%dx%d", gridCols, gridRows))
 
-	// 网格。写回回调：应答路由（spec 003「终端查询由谁应答」）——查询在切点之前
-	// （不会进入实时流）时由 worker 写入 PTY；在切点之后交由浏览器应答，网格的
-	// 应答丢弃。无消费者时切点视为无穷大，全部代答。
+	// 网格。写回回调：查询应答路由（spec 003/004）——多视图下程序查询随字节流
+	// 到达所有 viewer，v1 已知限制是应答可能重复；worker 只在「没有任何 viewer
+	// 持有实时流」时代答（全离线，程序不因无人接入而卡等）。
 	s.grid, err = libghostty.NewTerminal(
 		libghostty.WithSize(gridCols, gridRows),
 		libghostty.WithMaxScrollbackLines(gridScrollback),
@@ -174,15 +177,23 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 // onQueryReply 见 startSession 中的注释。回调在 gridMu 临界区内（VTWrite 期间）同步执行，
 // 直接写 PTY 是允许的（不得触碰网格）。
 func (s *session) onQueryReply(data []byte) {
-	c := s.consumer.Load()
-	// 判断依据是这条查询会不会进入实时流（spec 003）：切点之后的输出已交给
-	// 浏览器，由浏览器应答；切点之前的由 worker 写入 PTY。fedBytes 在回调时刻
-	// 是当前批次的起始偏移。
-	live := c != nil && s.fedBytes.Load() >= c.cutOffset.Load()
-	if live {
-		return
+	if s.hasLiveViewer() {
+		return // 有 viewer 在看实时流：查询已随流转发，由浏览器应答
 	}
 	_, _ = s.ptmx.Write(data)
+}
+
+// hasLiveViewer 是否存在已拿到实时流切点的 viewer。
+func (s *session) hasLiveViewer() bool {
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	fed := s.fedBytes.Load()
+	for v := range s.viewers {
+		if v.cutOffset.Load() <= fed {
+			return true
+		}
+	}
+	return false
 }
 
 // readLoop：PTY 的持续读取是会话独立运行的前提，任何外部通道都不得阻塞它。
@@ -200,16 +211,14 @@ func (s *session) readLoop() {
 	s.finish("shell-exit")
 }
 
-// handleOutput：喂双网格 → 录制 → 交给当前消费者（有界队列，满了断开本次接入）。
+// handleOutput：喂双网格 → 录制 → 广播给所有 viewer（各自有界队列，满则仅丢弃该 viewer）。
 func (s *session) handleOutput(batch []byte) {
-	var start int64
-
 	// 真实网格吃全量；影子网格只吃主屏段（过滤器切分）。
 	// fedBytes 必须在临界区内更新：重建的切点取自它，若在解锁后写，
 	// 重建可能读到旧值——刚喂入的字节「在重建画面里 + 又被实时流重发」
 	// （验收 15 实测抓到过：5 行重复）。
 	s.gridMu.Lock()
-	start = s.fedBytes.Load()
+	start := s.fedBytes.Load()
 	feedGround(s.grid, batch)
 	for _, sg := range s.altf.process(batch) {
 		if !sg.shadow {
@@ -236,10 +245,11 @@ func (s *session) handleOutput(batch []byte) {
 		s.logBytes += int64(len(batch))
 	}
 
-	// 消费者：只送切点之后的字节（切点之前的已在重建画面里）。有界队列，
-	// 满则断开本次接入（4001）——会话不受影响（spec 003 背压）。
-	if c := s.consumer.Load(); c != nil {
-		cut := c.cutOffset.Load()
+	// 广播：只送各 viewer 切点之后的字节（切点之前的已在各自重建画面里）。
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	for v := range s.viewers {
+		cut := v.cutOffset.Load()
 		var tail []byte
 		switch {
 		case start >= cut:
@@ -251,9 +261,9 @@ func (s *session) handleOutput(batch []byte) {
 		}
 		if len(tail) > 0 {
 			select {
-			case c.queue <- tail:
+			case v.queue <- tail:
 			default:
-				c.closeWith(4001, "too slow")
+				v.closeWith(4001, "too slow")
 			}
 		}
 	}
@@ -277,11 +287,12 @@ func (s *session) sampleCwd() {
 	_ = s.recordMeta("C", s.logBytes, cwd)
 }
 
-// resize 应用接入方的尺寸：PTY 与双网格同源。
+// resize 应用尺寸：PTY 与双网格同源（尺寸跟随输入者，spec 004）。
 func (s *session) resize(cols, rows uint16) {
 	s.gridMu.Lock()
 	_ = s.grid.Resize(cols, rows, 0, 0)
 	_ = s.shadow.Resize(cols, rows, 0, 0)
+	s.curCols, s.curRows = cols, rows
 	s.gridMu.Unlock()
 	if s.ptmx != nil {
 		_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
@@ -291,17 +302,20 @@ func (s *session) resize(cols, rows uint16) {
 	}
 }
 
-// rebuild 在当前切点生成重建画面（U0 定案）。备用屏激活时用影子网格还原主屏，
-// 再进入备用屏还原活动屏（顺序经影子探针验证）。返回 (画面, 未完成序列前缀, 错误)。
-func (s *session) rebuild() ([]byte, []byte, error) {
+// currentDims 返回网格当前尺寸（调用方多在 gridMu 临界区内）。
+func (s *session) currentDims() (uint16, uint16) {
+	s.gridMu.Lock()
+	defer s.gridMu.Unlock()
+	return s.curCols, s.curRows
+}
+
+// rebuildFor 在当前切点为指定 viewer 生成重建画面（U0 定案）。备用屏激活时用
+// 影子网格还原主屏，再进入备用屏还原活动屏。返回 (画面, 未完成序列前缀, 错误)。
+func (s *session) rebuildFor(v *viewer) ([]byte, []byte, error) {
 	s.gridMu.Lock()
 	defer s.gridMu.Unlock()
 
-	c := s.consumer.Load()
-	if c == nil {
-		return nil, nil, errors.New("无消费者")
-	}
-	c.cutOffset.Store(s.fedBytes.Load())
+	v.cutOffset.Store(s.fedBytes.Load())
 
 	screen, err := s.grid.ActiveScreen()
 	if err != nil {
@@ -334,9 +348,11 @@ func (s *session) rebuild() ([]byte, []byte, error) {
 	return out, cont, nil
 }
 
-// attached 当前是否有消费者。
+// attached 是否存在接入中的 viewer。
 func (s *session) attached() bool {
-	return s.consumer.Load() != nil
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	return len(s.viewers) > 0
 }
 
 // shutdown 显式关闭：worker 是子进程收割者（subreaper），按会话进程树回收——
@@ -354,17 +370,24 @@ func (s *session) shutdown(reason string) {
 	<-s.done
 }
 
-// finish 会话死亡的统一收尾（读循环出口）。通知消费者（1000）、移除 socket 文件、
-// 关闭资源。进程退出由 worker 主函数在 done 上等待后完成。
+// finish 会话死亡的统一收尾（读循环出口）。通知全部 viewer（1000）、移除 socket
+// 文件、关闭资源。进程退出由 worker 主函数在 done 上等待后完成。
 func (s *session) finish(reason string) {
 	s.closeOnce.Do(func() {
 		if s.cmd != nil && s.cmd.Process != nil {
 			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
 		}
 	})
-	if c := s.consumer.Swap(nil); c != nil {
-		_ = c.conn.writeFrame(ftExit, mustJSON(exitMsg{Reason: reason}))
-		c.conn.close()
+	s.viewersMu.Lock()
+	viewers := make([]*viewer, 0, len(s.viewers))
+	for v := range s.viewers {
+		viewers = append(viewers, v)
+	}
+	s.viewers = map[*viewer]viewerDims{}
+	s.viewersMu.Unlock()
+	for _, v := range viewers {
+		_ = v.conn.writeFrame(ftExit, mustJSON(exitMsg{Reason: reason}))
+		v.conn.close()
 	}
 	s.grid.Close()
 	s.shadow.Close()
@@ -411,6 +434,13 @@ func (s *session) recordMeta(kind string, offset int64, val string) error {
 	return s.metaW.Flush()
 }
 
+// removeViewer 从集合移除一个 viewer。
+func (s *session) removeViewer(v *viewer) {
+	s.viewersMu.Lock()
+	delete(s.viewers, v)
+	s.viewersMu.Unlock()
+}
+
 // ---- 进程树回收 ----
 
 // setSubreaper 把 worker 设为子进程收割者：孤儿化的后代（后台作业在 Shell 死后
@@ -437,7 +467,7 @@ func reapTree(base int) {
 	_ = syscall.Kill(-base, syscall.SIGTERM)
 	// 树路径：脱离进程组的后台作业
 	kill(tree, syscall.SIGTERM)
-	time.Sleep(closeGrace)
+	time.Sleep(killGrace)
 	tree = descendants(base)
 	_ = syscall.Kill(-base, syscall.SIGKILL)
 	kill(tree, syscall.SIGKILL)

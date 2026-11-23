@@ -23,7 +23,7 @@ let closed = false
 ws.onclose = () => { closed = true }
 ws.onmessage = (e) => {
   if (typeof e.data === 'string') return // ready 帧
-  out += dec.decode(e.data)
+  out += (typeof e.data === 'string' ? '' : dec.decode(e.data))
 }
 await new Promise((r) => { ws.onopen = r })
 ws.send(JSON.stringify({ type: 'resize', cols: 120, rows: 40 }))

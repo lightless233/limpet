@@ -12,7 +12,7 @@ let closed = false
 let closeAt = 0
 const t0 = performance.now()
 ws.onclose = () => { closed = true; closeAt = Math.round(performance.now() - t0) }
-ws.onmessage = (e) => { out += dec.decode(e.data) }
+ws.onmessage = (e) => { out += (typeof e.data === 'string' ? '' : dec.decode(e.data)) }
 await new Promise((r) => { ws.onopen = r })
 
 ws.send(enc.encode('exit\r'))

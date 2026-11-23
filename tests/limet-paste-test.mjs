@@ -10,7 +10,7 @@ ws.binaryType = 'arraybuffer'
 let out = ''
 let closed = false
 ws.onclose = () => { closed = true }
-ws.onmessage = (e) => { out += dec.decode(e.data) }
+ws.onmessage = (e) => { out += (typeof e.data === 'string' ? '' : dec.decode(e.data)) }
 await new Promise((r) => { ws.onopen = r })
 
 // 单条 60006 字节消息（echo 一长串 A），超过 32768 上限

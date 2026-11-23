@@ -24,7 +24,7 @@ function attach(id, query = '') {
         try { if (JSON.parse(e.data).type === 'ready') state.readyAt = Math.round(performance.now() - t0) } catch {}
         return
       }
-      state.out += dec.decode(e.data)
+      state.out += (typeof e.data === 'string' ? '' : dec.decode(e.data))
       if (state.firstBinaryAt === null) state.firstBinaryAt = Math.round(performance.now() - t0)
     }
     ws.onclose = (e) => { state.closed = true; state.closeCode = e.code }

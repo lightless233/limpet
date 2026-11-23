@@ -1,9 +1,13 @@
 package main
 
-// worker socket 的私有帧协议（spec 003：worker 与 server 同二进制同版本一起升级；
-// 版本握手用于兼容「升级后仍在运行的旧 worker」——加法演进，不破坏性变更）。
+// worker socket 的私有帧协议（spec 003/004）。
 //
 // 帧格式：[type:1][len:4 BE][payload]。握手帧是连接上的第一帧，双方各发一帧。
+//
+// 版本（spec 004）：protocolVersion 是 server/新 worker 使用的版本（2）。
+// ftResize 在 v2 中语义为「窗口尺寸申报」——不直接触发 resize；网格尺寸跟随
+// 输入者（输入批次触发晋升）。server 按握手应答里 worker 自报的版本适配：
+// 对 v1 旧 worker 维持旧语义（首帧 resize 触发其重建、申报照发即尺寸变更）。
 
 import (
 	"encoding/binary"
@@ -17,15 +21,17 @@ import (
 	"time"
 )
 
-// protocolVersion 是 socket 协议版本。字节序列不兼容时必须递增。
-const protocolVersion = 1
+// protocolVersion 是 server 与新 worker 使用的协议版本。worker 握手对 ≤ 本版本
+// 的请求向下兼容；旧 worker 只认自己的版本，由 server 端回退适配。
+const protocolVersion = 2
 
 const (
 	wsReadLimit = 1 << 20 // 大粘贴兜底；前端按 64KiB 主动切块
 	wsChunk     = 64 << 10
-	queueChunks = 256              // 实时流队列上限（背压：满则断开本次接入）
-	initTimeout = 3 * time.Second // 首条尺寸的兜底时限（沿用 001 语义）
-	spawnWait   = 5 * time.Second // 等待 worker 就绪（socket 可探测）
+	queueChunks = 256              // 每个 viewer 的实时流队列上限（背压：满则丢弃该 viewer）
+	spawnWait   = 5 * time.Second  // 等待 worker 就绪（socket 可探测）
+	frameBudget = 2 * time.Second  // 单帧写入的兜底超时：任何慢消费者都不能钉住写锁
+	killGrace   = 3 * time.Second  // 关闭回收的 TERM 宽限
 )
 
 // jsonUnmarshal 语义化包装，统一错误来源。
@@ -36,7 +42,7 @@ type frameType byte
 const (
 	ftOutput       frameType = 0x01 // PTY 输出字节（worker → server）
 	ftInput        frameType = 0x02 // 终端输入字节（server → worker）
-	ftResize       frameType = 0x03 // resize 控制 JSON（server → worker）
+	ftResize       frameType = 0x03 // v2：窗口尺寸申报（server → worker）；v1：尺寸变更
 	ftExit         frameType = 0x04 // 会话结束通知（worker → server）
 	ftReady        frameType = 0x05 // 重建完成、实时流开始（worker → server）
 	ftDetach       frameType = 0x06 // 消费者被丢弃（慢），带 WS 关闭码（worker → server）
@@ -44,7 +50,7 @@ const (
 	ftHandshakeAck frameType = 0x11 // 握手应答（worker → server）
 )
 
-// handshakeReq 是连接首帧。op：probe（探测，不占位）/ attach（占独占位）/ kill（回收会话）。
+// handshakeReq 是连接首帧。op：probe（探测，不占位）/ attach（成为 viewer）/ kill（回收会话）。
 type handshakeReq struct {
 	Op    string `json:"op"`
 	Proto int    `json:"proto"`
@@ -52,7 +58,7 @@ type handshakeReq struct {
 }
 
 // handshakeAck 是握手应答。UUID/PID 用于 server 核对身份（worker 自报 uuid 必须与
-// socket 文件名一致，spec 验收 18）；Busy 表示独占位已被占用。
+// socket 文件名一致，spec 验收 18）；Busy 表示存在接入中的 viewer。
 type handshakeAck struct {
 	Op     string `json:"op"`
 	OK     bool   `json:"ok"`
@@ -64,16 +70,10 @@ type handshakeAck struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// resizeMsg 是 ftResize 的载荷。
+// resizeMsg 是 ftResize 的载荷。v2 语义：窗口尺寸申报。
 type resizeMsg struct {
 	Cols uint16 `json:"cols"`
 	Rows uint16 `json:"rows"`
-}
-
-// detachMsg 是 ftDetach 的载荷，Code 是期望的 WS 关闭码（如 4001）。
-type detachMsg struct {
-	Code   int    `json:"code"`
-	Reason string `json:"reason"`
 }
 
 // exitMsg 是 ftExit 的载荷。
@@ -81,50 +81,10 @@ type exitMsg struct {
 	Reason string `json:"reason"`
 }
 
-var errShortFrame = errors.New("帧不完整")
-
-// frameConn 是 net.Conn 上的帧封装：写入互斥、只关一次。读写可并发（写经互斥，
-// 读由单一 goroutine 持有连接）。
-type frameConn struct {
-	c      net.Conn
-	mu     sync.Mutex
-	closed atomic.Bool
-}
-
-func newFrameConn(c net.Conn) *frameConn {
-	return &frameConn{c: c}
-}
-
-func (fc *frameConn) writeFrame(t frameType, payload []byte) error {
-	if fc.closed.Load() {
-		return errors.New("连接已关闭")
-	}
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-	// 写超时 2s：对端（server 停止读取）时解锁等待者，避免持锁互等。
-	// 慢消费者的判定在 server 侧（WS 写超时 → 4001）。
-	_ = fc.c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	head := [5]byte{byte(t)}
-	binary.BigEndian.PutUint32(head[1:], uint32(len(payload)))
-	if _, err := fc.c.Write(head[:]); err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	_, err := fc.c.Write(payload)
-	return err
-}
-
-func (fc *frameConn) readFrame() (frameType, []byte, error) {
-	return readFrame(fc.c)
-}
-
-func (fc *frameConn) close() error {
-	if !fc.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	return fc.c.Close()
+// detachMsg 是 ftDetach 的载荷，Code 是期望的 WS 关闭码（如 4001）。
+type detachMsg struct {
+	Code   int    `json:"code"`
+	Reason string `json:"reason"`
 }
 
 // writeFrame 在 w 上写一帧。同一连接同一时刻只允许一个写者（调用方保证）。
@@ -166,3 +126,75 @@ func writeJSONFrame(w io.Writer, t frameType, v any) error {
 	}
 	return writeFrame(w, t, b)
 }
+
+// frameConn 是 net.Conn 上的帧封装：写入互斥（每帧 2s 兜底超时——任何慢消费者
+// 都不能钉住写锁，spec 004 背压）、只关一次。读写可并发。
+type frameConn struct {
+	c      net.Conn
+	mu     sync.Mutex
+	closed atomic.Bool
+}
+
+func newFrameConn(c net.Conn) *frameConn {
+	return &frameConn{c: c}
+}
+
+func (fc *frameConn) writeFrame(t frameType, payload []byte) error {
+	if fc.closed.Load() {
+		return errors.New("连接已关闭")
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	_ = fc.c.SetWriteDeadline(time.Now().Add(frameBudget))
+	head := [5]byte{byte(t)}
+	binary.BigEndian.PutUint32(head[1:], uint32(len(payload)))
+	if _, err := fc.c.Write(head[:]); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	_, err := fc.c.Write(payload)
+	return err
+}
+
+// writeFrameTimeout 带写超时的帧写入（用于向可能停滞的对端发通知：尽力而为，
+// 超时即失败，由调用方决定后续——通常直接关闭连接）。
+func (fc *frameConn) writeFrameTimeout(t frameType, payload []byte, budget time.Duration) error {
+	if fc.closed.Load() {
+		return errors.New("连接已关闭")
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	_ = fc.c.SetWriteDeadline(time.Now().Add(budget))
+	head := [5]byte{byte(t)}
+	binary.BigEndian.PutUint32(head[1:], uint32(len(payload)))
+	if _, err := fc.c.Write(head[:]); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	_, err := fc.c.Write(payload)
+	return err
+}
+
+func (fc *frameConn) readFrame() (frameType, []byte, error) {
+	return readFrame(fc.c)
+}
+
+func (fc *frameConn) close() error {
+	if !fc.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	_ = fc.c.SetWriteDeadline(time.Time{})
+	return fc.c.Close()
+}
+
+// viewerDims 是一个 viewer 申报的窗口尺寸。
+type viewerDims struct {
+	Cols uint16
+	Rows uint16
+}
+
+func (d viewerDims) valid() bool { return d.Cols >= 2 && d.Cols <= 500 && d.Rows >= 2 && d.Rows <= 200 }

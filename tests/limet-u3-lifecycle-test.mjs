@@ -25,7 +25,7 @@ function attach(id) {
         } catch {}
         return
       }
-      st.text += dec.decode(e.data)
+      st.text += (typeof e.data === 'string' ? '' : dec.decode(e.data))
     }
     ws.onopen = () => resolve(st)
     ws.onerror = () => reject(new Error('ws error'))
@@ -71,21 +71,16 @@ has('关闭后前台任务与后台作业全部结束（回收单位=会话）',
 const list = await (await fetch(`${BASE}/api/term`)).json()
 has('列表中该会话已移除', !list.some((s) => s.id === id))
 
-// ---- 2. 第二个接入在升级前 409 ----
+// ---- 2. 多视图：第二个接入成功，两路画面同步（spec 004 修订一，409 废止）----
 const { id: id2 } = await (await fetch(`${BASE}/api/term`, { method: 'POST' })).json()
 const st2 = await attach(id2)
 await waitReady(st2)
-// 用原始 upgrade 请求看 HTTP 状态码（WS 客户端看不到升级前的 HTTP 响应）
-const code = parseInt(
-  execSync(
-    `curl -s -o /dev/null -w '%{http_code}' -m 3 -H 'Connection: Upgrade' -H 'Upgrade: websocket' ` +
-      `-H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' ` +
-      `http://127.0.0.1:4040/api/ws/term/${id2}`,
-    { encoding: 'utf8' },
-  ).trim(),
-  10,
-)
-has('同会话第二个接入：升级前 HTTP 409', code === 409)
+st2.ws.send(Buffer.from('echo 多视图标记-乙\r'))
+await sleep(1000)
+has('第二个接入成功且看到自己的输出', st2.text.includes('多视图标记-乙'))
+has('第一个接入不受第二个影响', !st.closed)
+st2.ws.send(Buffer.from('exit\r'))
+await sleep(600)
 
 // 清理
 st2.ws.send(Buffer.from('exit\r'))

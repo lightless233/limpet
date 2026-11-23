@@ -7,6 +7,8 @@
 
 ## 单元 1：worker 广播枢纽
 
+**结果（2026-11-23）**：完成——viewer 集合 + per-viewer 队列/切点/申报尺寸、输入晋升（尺寸相同跳过）、接入即重建；全部旧单槽代码删除。
+
 **问题**：worker 的消费者是单槽（CAS + 409），同一会话第二个接入被拒。
 
 **改动**：
@@ -21,6 +23,8 @@
 
 ## 单元 2：版本适配（升级窗口）
 
+**结果（2026-11-23）**：完成——worker protocolVersion=2，握手对 ≤2 向下兼容；server 的 probe/kill/attach 带 2→1 版本回退（升级窗口内的旧 worker 实测可适配）。
+
 **问题**：ftResize 语义变更后，升级窗口内的旧 worker（v1：resize 即尺寸、重建等 resize）与新 server 混跑。
 
 **改动**：握手应答已带 worker 版本——server 按版本分派：
@@ -32,6 +36,8 @@
 
 ## 单元 3：server bridge 多中继
 
+**结果（2026-11-23）**：完成——busy 预检与 409 删除，同一会话多条 WS 中继并存，探测 Busy 正确反映接入数。
+
 **问题**：bridge 的 busy 预检与 409、handle 的单 relay 假设。
 
 **改动**：删除 busy 预检与 409 分支；同一会话的多条 WS 各自独立中继（每条一条 socket 连接）；list 的 `attached` = viewer 数 > 0（来自探测应答的 Busy）；h.busy 每次探测后更新。
@@ -39,6 +45,8 @@
 **完成证据**：两个 WS 同时中继无串扰；探测 Busy 正确反映接入数。
 
 ## 单元 4：验收与脚本
+
+**结果（2026-11-23）**：完成——limet-multi-view-test.mjs 12 项断言全过（双 viewer 输入互通、慢 viewer 单独 4001、断开重连恰好一次），u3-lifecycle 切多视图语义，全套 11 脚本回归绿。
 
 **改动**：
 - 新脚本 `limet-multi-view-test.mjs`：双 WS 同会话（均 ready / 输入互通 / 尺寸跟随输入者）/ 慢 viewer 4001 隔离 / 重连恰好一次。

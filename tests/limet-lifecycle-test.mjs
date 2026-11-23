@@ -24,7 +24,7 @@ function attach(id, query = '') {
         try { if (JSON.parse(e.data).type === 'ready') ready = true } catch {}
         return
       }
-      out += dec.decode(e.data)
+      out += (typeof e.data === 'string' ? '' : dec.decode(e.data))
     }
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: 'resize', cols: 68, rows: 30 }))

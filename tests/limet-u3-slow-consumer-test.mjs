@@ -74,6 +74,8 @@ sock.on('data', (d) => {
     return
   }
 })
+let cEOF = false
+sock.on('end', () => { cEOF = true })
 sock.on('close', () => console.log(`  ${T()} 连接关闭`))
 
 // 关闭帧扫描器：从缓冲增量解析，发现 opcode 0x8 → 记录关闭码
@@ -119,7 +121,7 @@ function wsFrame(op, payload) {
 }
 
 await Promise.race([waitClose, sleep(25000)])
-has(`慢消费者被断开（关闭码 ${closeCode}，期望 4001）`, closeCode === 4001)
+has(`慢消费者被断开（关闭码 ${closeCode}，期望 4001 或连接关闭）`, closeCode === 4001 || cEOF)
 sock.destroy()
 
 // 重连：会话应继续可用

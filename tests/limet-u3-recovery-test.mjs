@@ -35,7 +35,7 @@ ws.onmessage = (e) => {
     } catch {}
     return
   }
-  text += dec.decode(e.data)
+  text += (typeof e.data === 'string' ? '' : dec.decode(e.data))
 }
 await new Promise((r) => (ws.onopen = r))
 const t0 = Date.now()

@@ -3,14 +3,16 @@ package main
 // worker 子命令的入口：`limpet-server worker <uuid>`。
 //
 // worker 进程持有 PTY 与双网格，独立于 server 进程存活——server 被杀（含 Ctrl+C
-// 与 kill -9）时它成为孤儿继续运行，PTY 不随 server 关闭（这就是 spec 003 验收 9
-// 的机制，与 systemd 无关）。worker 由 server 以 Setsid 启动，天然脱离 server 的
-// 进程组与会话；正式部署接 systemd-run 时只换这一条启动路径（spec「延后」小节）。
+// 与 kill -9）时它成为孤儿继续运行，PTY 不随 server 关闭（spec 003 验收 9 的机制，
+// 与 systemd 无关）。worker 由 server 以 Setsid 启动，天然脱离 server 的进程组
+// 与会话；正式部署接 systemd-run 时只换这一条启动路径（spec「延后」小节）。
+//
+// 多视图（spec 004）：每条 attach 连接 = 一个 viewer，各自有界队列与切点；
+// PTY 输出广播给全部 viewer，输入来自任意 viewer。
 
 import (
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -57,7 +59,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 
 	log.Printf("worker %s 就绪 (pid %d, socket %s)", uuid, os.Getpid(), sockPath)
 
-	// accept 循环：探测/kill 连接各自短生命周期处理；attach 连接占独占位。
+	// accept 循环：探测/kill 连接各自短生命周期处理；attach 连接成为 viewer。
 	go func() {
 		for {
 			c, err := l.Accept()
@@ -79,16 +81,20 @@ func runWorker(uuid string, paths sessionPaths) error {
 // handleWorkerConn 处理一条到 worker 的连接：握手分流 probe / kill / attach。
 func (s *session) handleWorkerConn(fc *frameConn) {
 	defer fc.close()
+	log.Printf("[调试] conn 已接受")
 
 	t, payload, err := fc.readFrame()
 	if err != nil || t != ftHandshake {
+		log.Printf("[调试] 握手读取失败/类型异常: err=%v t=%v", err, t)
 		return
 	}
+	log.Printf("[调试] 握手已读: %s", payload[:min(len(payload), 90)])
 	var req handshakeReq
 	if err := jsonUnmarshal(payload, &req); err != nil {
 		return
 	}
-	if req.Proto != protocolVersion {
+	// 版本协商：worker 对 ≤ 自身版本的请求向下兼容；超出则拒绝并自报版本。
+	if req.Proto > protocolVersion {
 		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
 			Op: req.Op, OK: false, Proto: protocolVersion, UUID: s.id,
 			Reason: fmt.Sprintf("协议版本不兼容: 请求 %d，worker %d", req.Proto, protocolVersion),
@@ -119,45 +125,68 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 		s.shutdown("closed")
 
 	case "attach":
-		c := &consumer{conn: fc, queue: make(chan []byte, queueChunks)}
-		// 切点初值 = 无穷大：重建完成前一切字节只进重建画面、不进实时流，
-		// 否则接入到首条尺寸之间的输出会被「实时发一遍 + 重建再发一遍」
-		// （验收 15 实测抓到：行 51-55 / 64-93 双份）。
-		c.cutOffset.Store(math.MaxInt64)
-		if !s.consumer.CompareAndSwap(nil, c) {
-			_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-				Op: "attach", OK: false, Proto: protocolVersion, UUID: s.id, Busy: true,
-				Reason: "会话已有接入",
-			}))
-			return
+		// 多视图：每条连接独立成为 viewer，互不排斥（spec 004 修订一）。
+		v := &viewer{
+			conn: fc,
+			queue: make(chan []byte, queueChunks),
+			// 切点初值 = 无穷大：重建完成前一切字节只进重建画面、不进实时流，
+			// 否则接入到重建之间的输出会被「实时发一遍 + 重建再发一遍」
+			// （验收 15 实测抓到过整段双份）。
 		}
+		v.cutOffset.Store(1<<62) // 接近无穷大的安全初值（atomic.Int64 零值是 0）
+		s.viewersMu.Lock()
+		s.viewers[v] = viewerDims{}
+		s.viewersMu.Unlock()
+		log.Printf("[调试] attach ack 已写，进入 serveViewerConn")
 		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
 			Op: "attach", OK: true, Proto: protocolVersion, UUID: s.id, PID: os.Getpid(),
 		}))
-		s.serveAttachConn(fc, c)
+		log.Printf("[调试] serveViewerConn 开始（重建+读循环）")
+		s.serveViewerConn(fc, v)
 	}
 }
 
-// serveAttachConn 服务一条 attach 连接：首帧 resize 触发尺寸调整与重建，
-// 之后输入直写 PTY、resize 直调、输出帧与实时队列发往 server。
-func (s *session) serveAttachConn(fc *frameConn, c *consumer) {
-	rebuilt := false
+// serveViewerConn 服务一个 viewer：接入即重建（按网格当前尺寸，不等尺寸——
+// spec 004 修订三），此后窗口申报存档、输入晋升尺寸并直写 PTY、实时流广播。
+func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 	defer func() {
-		s.consumer.CompareAndSwap(c, nil)
+		s.removeViewer(v)
 		fc.close()
 	}()
 
-	// 输出泵：把实时队列的帧发往 server（重建帧写完之后才启动，顺序由
-	// 「先直写重建、后开泵」保证）。
-	// 写失败（含 2s 写超时 = server 端停止消费）→ 补发 DETACH(4001) 再关连接：
-	// 此时上一次写已超时返回、锁已空闲，DETACH 能在 2s 内送达。
-	// 会话本身不受影响（PTY 读取与录制照常，spec 003 背压）。
+	// 接入即重建。
+	out, cont, err := s.rebuildFor(v)
+	if err != nil {
+		// 重建失败：断开连接（server 侧映射为 WS 1011 + 原因）。
+		fc.close()
+		return
+	}
+	// ready 先于任何输出帧（spec 003 帧协议）。
+	if err := fc.writeFrame(ftReady, nil); err != nil {
+		return
+	}
+	for i := 0; i < len(out); i += wsChunk {
+		end := min(i+wsChunk, len(out))
+		if err := fc.writeFrame(ftOutput, out[i:end]); err != nil {
+			return
+		}
+	}
+	if len(cont) > 0 {
+		// 切点落在序列中间：未完成序列的字节作为实时流前缀（U0-8a 兜底）。
+		if err := fc.writeFrame(ftOutput, cont); err != nil {
+			return
+		}
+	}
+
+	// 输出泵：切点之后的实时流。写失败（含 2s 写超时 = server 端停止消费）→
+	// 补发 DETACH(4001) 再关连接：此时上一次写已超时返回、锁已空闲，DETACH 能
+	// 在兜底超时内送达。会话本身不受影响（PTY 读取与录制照常，spec 003 背压）。
 	go func() {
 		for {
 			select {
-			case chunk := <-c.queue:
+			case chunk := <-v.queue:
 				if err := fc.writeFrame(ftOutput, chunk); err != nil {
-					if c.closed.Load() {
+					if v.closed.Load() {
 						return
 					}
 					_ = fc.writeFrame(ftDetach, mustJSON(detachMsg{Code: 4001, Reason: "too slow"}))
@@ -175,43 +204,32 @@ func (s *session) serveAttachConn(fc *frameConn, c *consumer) {
 		}
 		switch t {
 		case ftResize:
+			// v2 语义：窗口尺寸申报，不触发 resize。
 			var rm resizeMsg
-			if err := jsonUnmarshal(payload, &rm); err != nil ||
-				rm.Cols < 2 || rm.Cols > 500 || rm.Rows < 2 || rm.Rows > 200 {
+			dims := viewerDims{Cols: rm.Cols, Rows: rm.Rows}
+			if err := jsonUnmarshal(payload, &rm); err == nil {
+				dims = viewerDims{Cols: rm.Cols, Rows: rm.Rows}
+			}
+			if !dims.valid() {
 				continue
 			}
-			if !rebuilt {
-				rebuilt = true
-				s.resize(rm.Cols, rm.Rows)
-				out, cont, err := s.rebuild()
-				if err != nil {
-					// 重建失败：断开连接（server 侧映射为 WS 1011 + 原因）。
-					fc.close()
-					return
-				}
-				// ready 先于任何输出帧（spec 003 帧协议）。
-				if err := fc.writeFrame(ftReady, nil); err != nil {
-					return
-				}
-				for i := 0; i < len(out); i += wsChunk {
-					end := min(i+wsChunk, len(out))
-					if err := fc.writeFrame(ftOutput, out[i:end]); err != nil {
-						return
-					}
-				}
-				if len(cont) > 0 {
-					// 切点落在序列中间：未完成序列的字节作为实时流前缀（U0-8a 兜底）。
-					if err := fc.writeFrame(ftOutput, cont); err != nil {
-						return
-					}
-				}
-			} else {
-				s.resize(rm.Cols, rm.Rows)
-			}
+			s.viewersMu.Lock()
+			s.viewers[v] = dims
+			s.viewersMu.Unlock()
+			v.dims = dims
 		case ftInput:
-			if s.ptmx != nil && len(payload) > 0 {
-				_, _ = s.ptmx.Write(payload)
+			if s.ptmx == nil || len(payload) == 0 {
+				continue
 			}
+			// 尺寸跟随输入者（spec 004 修订二）：打字者的窗口尺寸成为网格尺寸。
+			// 每批输入至多一次调整；尺寸相同则跳过（无 resize 风暴）。
+			if v.dims.valid() {
+				curCols, curRows := s.currentDims()
+				if v.dims.Cols != curCols || v.dims.Rows != curRows {
+					s.resize(v.dims.Cols, v.dims.Rows)
+				}
+			}
+			_, _ = s.ptmx.Write(payload)
 		default:
 			// 未知帧忽略（加法演进的前向兼容）。
 		}

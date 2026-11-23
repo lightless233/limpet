@@ -38,7 +38,7 @@ func readBody(r *http.Request) ([]byte, error) {
 }
 
 // handleCreate POST /api/term。创建即启动 Shell（80×24）并开始录制，worker 就绪后
-// 才返回；失败 → 500，不留半死会话（spec 003）。
+// 才返回；失败 → 500，不留半死会话（spec 003）。非法名称 400；与活会话重名 409。
 func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`

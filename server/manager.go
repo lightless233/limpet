@@ -3,6 +3,7 @@ package main
 // server 侧的会话管理：worker 进程的启停、恢复扫描、注册表与列表。
 // server 自身不持有任何 PTY/网格——worker 进程才是 PTY 持有者（spec 003），
 // server 死亡时 worker 孤儿化继续运行，新 server 靠扫描 + 探测握手找回。
+// 多视图（spec 004）：一个 worker 可带 N 个 viewer。
 
 import (
 	"crypto/rand"
@@ -16,7 +17,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -41,7 +41,7 @@ type workerHandle struct {
 	socketPath string
 	logPath    string
 	pid        int
-	busy       atomic.Bool // 接入中（server 侧跟踪；权威判定在 worker 的握手）
+	proto      int // worker 自报的协议版本（升级窗口内可能是 1）
 }
 
 type regEntry struct {
@@ -155,7 +155,7 @@ func (m *manager) recoverWorkers() {
 		}
 		uuid := strings.TrimSuffix(name, ".sock")
 		path := filepath.Join(m.workersDir, name)
-		ack, err := probeWorker(path, uuid)
+		ack, proto, err := probeWorker(path, uuid)
 		if err != nil {
 			// stale：进程已死。清理 socket；注册表首次观测登记死亡。
 			_ = os.Remove(path)
@@ -180,12 +180,12 @@ func (m *manager) recoverWorkers() {
 		h := &workerHandle{
 			uuid: uuid, name: nm, createdAt: created,
 			socketPath: path, logPath: filepath.Join(m.workersDir, uuid+".log"),
-			pid: ack.PID,
+			pid: ack.PID, proto: proto,
 		}
 		m.mu.Lock()
 		m.sessions[uuid] = h
 		m.mu.Unlock()
-		fmt.Printf("[recover] 会话恢复: %s（%s，pid %d）\n", uuid, nm, ack.PID)
+		fmt.Printf("[recover] 会话恢复: %s（%s，pid %d，协议 v%d）\n", uuid, nm, ack.PID, proto)
 	}
 	// 注册表里既无 socket 又未恢复的 → 首次观测死亡（kill-server/WSL 重启场景）。
 	m.mu.Lock()
@@ -247,6 +247,7 @@ func (m *manager) create(name string) (*workerHandle, error) {
 
 	// 等就绪：socket 可探测且自报 uuid 一致（间隔 50ms，上限 spawnWait）。
 	var ack handshakeAck
+	workerProto := protocolVersion
 	deadline := time.Now().Add(spawnWait)
 	for {
 		if time.Now().After(deadline) {
@@ -255,16 +256,16 @@ func (m *manager) create(name string) (*workerHandle, error) {
 			return nil, fmt.Errorf("worker %s 未在 %v 内就绪", id, spawnWait)
 		}
 		time.Sleep(50 * time.Millisecond)
-		a, err := probeWorker(sockPath, id)
+		a, proto, err := probeWorker(sockPath, id)
 		if err == nil && a.OK && a.UUID == id {
-			ack = a
+			ack, workerProto = a, proto
 			break
 		}
 	}
 
 	h := &workerHandle{
 		uuid: id, name: name, createdAt: time.Now(),
-		socketPath: sockPath, logPath: logPath, pid: ack.PID,
+		socketPath: sockPath, logPath: logPath, pid: ack.PID, proto: workerProto,
 	}
 	m.mu.Lock()
 	m.sessions[id] = h
@@ -284,10 +285,10 @@ func (m *manager) closeSession(id string) bool {
 		return false
 	}
 
-	ack, err := killWorker(h.socketPath, id)
+	ack, _, err := killWorker(h.socketPath, id)
 	if err == nil && ack.OK {
 		// 等 socket 消失（worker 完成回收并退出）。
-		deadline := time.Now().Add(closeGrace + 2*time.Second)
+		deadline := time.Now().Add(killGrace + 2*time.Second)
 		for time.Now().Before(deadline) {
 			if _, err := os.Stat(h.socketPath); err != nil {
 				break
@@ -331,13 +332,13 @@ func (m *manager) list() []map[string]any {
 
 	out := make([]map[string]any, 0, len(handles))
 	for _, h := range handles {
-		ack, err := probeWorker(h.socketPath, h.uuid)
+		ack, proto, err := probeWorker(h.socketPath, h.uuid)
 		if err != nil {
 			m.dropStale(h.uuid, h)
 			continue
 		}
 		h.pid = ack.PID
-		h.busy.Store(ack.Busy)
+		h.proto = proto
 		out = append(out, map[string]any{
 			"id":       h.uuid,
 			"name":     h.name,
