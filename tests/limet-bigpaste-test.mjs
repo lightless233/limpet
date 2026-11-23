@@ -1,10 +1,10 @@
 // 验收：ready 后粘贴 ~1.1MB 中文 → PTY 落盘 → 字节数 + md5 对账。
 // 输入按 64KiB 分块（前端契约），含换行避免 canonical 模式 4096 行限。
+const { BASE } = await import('./env.mjs')
 import crypto from 'node:crypto'
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const BASE = 'http://127.0.0.1:4040'
 const CHUNK = 64 * 1024
 
 // ~1.1MB UTF-8 中文，每行 ~80 字符

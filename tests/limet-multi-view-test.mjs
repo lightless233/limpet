@@ -3,7 +3,7 @@
 // 2. 任一 viewer 输入 → 所有 viewer 画面同步。
 // 3. 高吞吐下慢 viewer 被单独丢弃（4001），其余不受影响。
 // 4. viewer 断开重连 → 重建 + 实时尾巴恰好一次。
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
+const { BASE, WS, LIMPET_HOME } = await import('./env.mjs')
 import { connect as netConnect } from 'node:net'
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -15,7 +15,7 @@ const has = (n, ok, d) => {
 
 function attach(id) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:4040/api/ws/term/${id}?cols=100&rows=30`)
+    const ws = new WebSocket(`${WS}/api/ws/term/${id}?cols=100&rows=30`)
     ws.binaryType = 'arraybuffer'
     const st = { ready: false, text: '', ws, closedCode: 0 }
     ws.onmessage = (e) => {
@@ -71,7 +71,7 @@ has('B 的输入出现在 B', b.text.includes('乙输入-标记'))
 has('B 的输入同步到 A', a.text.includes('乙输入-标记'))
 
 // ---- 3. 高吞吐下慢 viewer 单独丢弃（C 用原始 socket 以便暂停读取）----
-const cRaw = netConnect(process.env.HOME + '/.limpet/workers/' + id + '.sock')
+const cRaw = netConnect(LIMPET_HOME + '/workers/' + id + '.sock')
 let cClosed = 0
 let cEOF = false
 let cUp = false

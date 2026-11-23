@@ -3,10 +3,10 @@
 //   sendControl(o)→ 文本帧（控制 JSON）
 // A. ready 帧先于任何终端输出；B. 首条 resize 决定启动尺寸（URL 旧值不生效）；
 // C. 超时兜底（query 尺寸）；D. 预启动输入缓冲；E. 大粘贴；F. exit 关闭。
+const { BASE } = await import('./env.mjs')
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const BASE = 'http://127.0.0.1:4040'
 
 async function create() {
   const res = await fetch(`${BASE}/api/term`, { method: 'POST' })

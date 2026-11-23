@@ -2,8 +2,8 @@
 // 1. 显式关闭回收整棵会话进程树：前台任务与后台作业各一个（脱离 Shell 进程组的
 //    后台作业是关键项——bash/zsh 都给后台作业单开进程组）。
 // 2. 同会话第二个接入在 WS 升级之前得到 HTTP 409。
+const { BASE, WS } = await import('./env.mjs')
 import { execSync } from 'node:child_process'
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let pass = true
@@ -15,7 +15,7 @@ const sh = (c) => execSync(c, { stdio: ['ignore', 'pipe', 'ignore'] }).toString(
 
 function attach(id) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:4040/api/ws/term/${id}?cols=100&rows=30`)
+    const ws = new WebSocket(`${WS}/api/ws/term/${id}?cols=100&rows=30`)
     ws.binaryType = 'arraybuffer'
     const st = { ready: false, text: '', ws }
     ws.onmessage = (e) => {

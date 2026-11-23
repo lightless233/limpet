@@ -1,9 +1,9 @@
 // 聚焦复现：resize 后 pane 尺寸是否跟随客户端。
+const { BASE } = await import('./env.mjs')
 import { execSync } from 'node:child_process'
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const BASE = 'http://127.0.0.1:4040'
 
 try { execSync('tmux -L limpet kill-server 2>/dev/null') } catch {}
 

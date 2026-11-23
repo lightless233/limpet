@@ -5,8 +5,7 @@
 //   3. worker 日志仍落在 ~/.limpet/workers/<uuid>.log。
 //   4. 关闭会话后单元消失（--collect）。
 //   5. worker 被 kill -9 后，它的后台作业与 Shell 由 systemd 随单元清理，单元不残留。
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
-const WS = BASE.replace(/^http/, 'ws')
+const { BASE, WS, LIMPET_HOME } = await import('./env.mjs')
 const { execFileSync, spawnSync } = await import('node:child_process')
 const { existsSync, readFileSync } = await import('node:fs')
 const { homedir } = await import('node:os')
@@ -101,7 +100,7 @@ if (process.env.LAUNCH_PROBE_MARKER) {
 has('LIMPET_* 配置项不进会话', envOut.includes('LAUNCH=<unset>'), JSON.stringify(envOut.slice(-160)))
 
 console.log('3. 日志')
-const wlog = join(homedir(), '.limpet', 'workers', `${id}.log`)
+const wlog = join(LIMPET_HOME, 'workers', `${id}.log`)
 has('worker 日志落在 ~/.limpet/workers/<uuid>.log', existsSync(wlog) && readFileSync(wlog, 'utf8').includes('就绪'))
 
 console.log('4. 关闭后单元消失')

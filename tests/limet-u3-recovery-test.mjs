@@ -1,8 +1,8 @@
 // U3 重启恢复验证（spec 003 验收 9/10/18）：给定重启前创建的会话 id，断言——
 // 列表恢复（含名字）→ 接入 ready → 重启前的标记在重建画面里 → 重启后输出可用。
 // 用法：node tests/limet-u3-recovery-test.mjs <session-id>
+const { BASE, WS } = await import('./env.mjs')
 import { execSync } from 'node:child_process'
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const id = process.argv[2]
@@ -24,7 +24,7 @@ has('列表恢复该会话', !!entry)
 has('名字保持（注册表）', entry?.name === 'u3-survive')
 
 // 2. 接入：ready → 重建画面含重启前标记
-const ws = new WebSocket(`ws://127.0.0.1:4040/api/ws/term/${id}?cols=100&rows=30`)
+const ws = new WebSocket(`${WS}/api/ws/term/${id}?cols=100&rows=30`)
 ws.binaryType = 'arraybuffer'
 let ready = false
 let text = ''

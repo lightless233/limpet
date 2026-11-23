@@ -1,14 +1,26 @@
 # 回归脚本
 
-协议级测试脚本（Node ≥ 22，直接 `node <脚本>` 运行，默认 BASE=`http://127.0.0.1:4040`，
-可用环境变量 `BASE` 覆盖）。它们是「做完了吗」的裁判：新架构（spec 003）帧协议不变，
-这些脚本就是重写后的回归基线。
+协议级测试脚本（Node ≥ 22，直接 `node <脚本>` 运行）。它们是「做完了吗」的裁判：新架构
+（spec 003）帧协议不变，这些脚本就是重写后的回归基线。
+
+公共环境在 `env.mjs` 里，都可用环境变量覆盖：
+
+- `BASE`：被测 server 的地址，默认 `http://127.0.0.1:4040`。
+- `LIMPET_HOME`：被测 server 的数据目录，**必须与它启动时用的一致**（socket 与录制都在这里）。
+  测试请对着用 `LIMPET_HOME=~/.limpet-dev` 启动的开发 server 跑，不要对着正式服务的数据目录：
+
+  ```sh
+  LIMPET_HOME=~/.limpet-dev limpet-server &          # 开发 server，4040
+  LIMPET_HOME=~/.limpet-dev node tests/limet-xxx-test.mjs
+  ```
+
+跑完用 `node tests/cleanup.mjs` 收尾（关闭全部会话并等 worker 退出）。
 
 | 脚本 | 验证什么 | 新架构下的状态 |
 |---|---|---|
 | `limet-proto-test.mjs` | ready 先于输出、ready 前输入 1008、尺寸消息时序 | 保留，权威 |
 | `limet-bigpaste-test.mjs` | 1.1MB 中文大粘贴，端到端 md5 一致 | 保留，权威 |
-| `limet-chunked-paste-test.mjs` | 64KiB 切块的粘贴 | 保留，权威 |
+| `limet-chunked-paste-test.mjs` | 900KB 按 64KiB 切块粘贴：连接不断、输出完整送达、Ctrl+C 后 Shell 仍可操作（碎块突发的慢消费者误判回归点） | 保留，权威 |
 | `limet-paste-test.mjs` | 一般粘贴回显 | 保留 |
 | `limet-exit-test.mjs` | Shell 内 exit → 会话结束、连接关闭（1000） | 保留 |
 | `limet-lifecycle-test.mjs` | 创建/列表/关闭的语义 | 保留（会话 id 变为 uuid） |

@@ -4,8 +4,7 @@
 //    的 viewer 都不受影响（输入同样算听到对端）。
 // 3. 全部 viewer 退出后，列表里该会话的「已接入」解除——4002 的连接确实从 worker 摘除。
 // 4. ping/pong 不进 worker：终端输出里不出现 pong 字样。
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
-const WS = BASE.replace(/^http/, 'ws')
+const { BASE, WS } = await import('./env.mjs')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let pass = true
 const has = (n, ok, d) => {

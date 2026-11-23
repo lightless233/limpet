@@ -1,9 +1,9 @@
 // U5 验证：detach 前产生大量历史（200 行，屏幕只有 ~30 行），
 // 重连后接收流应包含滚出屏幕的早期历史行（line-5 / line-20）。
+const { BASE } = await import('./env.mjs')
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const BASE = 'http://127.0.0.1:4040'
 
 async function create(name) {
   const res = await fetch(`${BASE}/api/term`, {

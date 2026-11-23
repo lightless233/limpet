@@ -19,7 +19,6 @@
 import { execSync, spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createServer, connect } from 'node:net'
-import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -28,6 +27,8 @@ const BASE = `http://127.0.0.1:${PORT}`
 const ORIGIN = `http://127.0.0.1:${PORT + 2}` // 经中继访问
 const SERVER_BIN = process.env.SERVER_BIN || '/tmp/limpet-new-server'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const { LIMPET_HOME } = await import('./env.mjs') // 数据目录，随环境传给脚本起的 server
+const { homedir } = await import('node:os')
 const SHOTS = process.env.SHOTS // 截图目录（可选）
 const shot = (pg, name) => (SHOTS ? pg.screenshot({ path: join(SHOTS, name) }) : Promise.resolve())
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -170,7 +171,7 @@ async function typeLine(text) {
 }
 // 录制是每批输出即落盘的原始字节：命令行回显一次、执行结果一次。
 async function recordedCount(id, marker, want, timeout = 6000) {
-  const log = join(homedir(), '.limpet', 'history', `${id}.log`)
+  const log = join(LIMPET_HOME, 'history', `${id}.log`)
   const t0 = Date.now()
   for (;;) {
     const n = existsSync(log) ? (readFileSync(log).toString('latin1').match(new RegExp(marker, 'g')) || []).length : 0

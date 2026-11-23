@@ -1,11 +1,12 @@
 // 大段粘贴复现：单条 >32KiB 输入消息 → 旧后端应断连并杀 Shell。
+const { BASE, WS } = await import('./env.mjs')
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-const res = await fetch('http://127.0.0.1:4040/api/term', { method: 'POST' })
+const res = await fetch(`${BASE}/api/term`, { method: 'POST' })
 const { id } = await res.json()
-const ws = new WebSocket(`ws://127.0.0.1:4040/api/ws/term/${id}`)
+const ws = new WebSocket(`${WS}/api/ws/term/${id}`)
 ws.binaryType = 'arraybuffer'
 let out = ''
 let closed = false

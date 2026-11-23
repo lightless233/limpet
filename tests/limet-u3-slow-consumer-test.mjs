@@ -1,8 +1,8 @@
 // U3 慢消费者验收（spec 003 验收 22）：会话持续大量输出时，接入方停止读取——
 // PTY 读取与录制不拖住；队列打满后该接入被断开（关闭码 4001）；重新接入后
 // 画面正确、会话继续可用。
+const { BASE, WS } = await import('./env.mjs')
 import { connect } from 'node:net'
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let pass = true
 const has = (n, ok, d) => {
@@ -26,7 +26,7 @@ const { id } = await (await fetch(`${BASE}/api/term`, {
 console.log('创建:', id)
 
 // 原始 WS：握手 → resize → 启动持续输出 → 暂停读取（停止消费）
-const sock = net_connect(4040)
+const sock = net_connect(Number(new URL(BASE).port))
 const t0 = Date.now()
 let upgradeOk = false
 let closeCode = 0
@@ -34,7 +34,7 @@ let sentLoop = false
 const T = (s) => `[${String(Date.now() - t0).padStart(5)}ms]`
 sock.on('connect', () => {
   sock.write(
-    `GET /api/ws/term/${id}?cols=100&rows=30 HTTP/1.1\r\nHost: 127.0.0.1:4040\r\n` +
+    `GET /api/ws/term/${id}?cols=100&rows=30 HTTP/1.1\r\nHost: ${new URL(BASE).host}\r\n` +
     `Upgrade: websocket\r\nConnection: Upgrade\r\n` +
     `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
   )
@@ -125,7 +125,7 @@ has(`慢消费者被断开（关闭码 ${closeCode}，期望 4001 或连接关�
 sock.destroy()
 
 // 重连：会话应继续可用
-const ws = new WebSocket(`ws://127.0.0.1:4040/api/ws/term/${id}?cols=80&rows=24`)
+const ws = new WebSocket(`${WS}/api/ws/term/${id}?cols=80&rows=24`)
 ws.binaryType = 'arraybuffer'
 let ready = false
 let ok = false

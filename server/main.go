@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -19,16 +20,37 @@ import (
 	"syscall"
 )
 
+// version 是构建时写入的版本（提交号），见 deploy/install.sh；开发构建为 dev。
+var version = "dev"
+
+// limpetHome 是数据根目录（会话 socket、录制、注册表）。默认 ~/.limpet，正式服务用它；
+// 开发与测试用 LIMPET_HOME 指向别的目录——两个 server 不能共用一个注册表：注册表由 server
+// 单写者在内存里持有，互相覆盖会丢掉对方登记的会话名。
+func limpetHome() (string, error) {
+	if h := os.Getenv("LIMPET_HOME"); h != "" {
+		return h, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".limpet"), nil
+}
+
 func main() {
 	args := os.Args[1:]
+	if len(args) >= 1 && args[0] == "version" {
+		fmt.Println(version)
+		return
+	}
 	if len(args) >= 2 && args[0] == "worker" {
-		home, err := os.UserHomeDir()
+		base, err := limpetHome()
 		if err != nil {
 			log.Fatal(err)
 		}
 		paths := sessionPaths{
-			histDir:   filepath.Join(home, ".limpet", "history"),
-			socketDir: filepath.Join(home, ".limpet", "workers"),
+			histDir:   filepath.Join(base, "history"),
+			socketDir: filepath.Join(base, "workers"),
 		}
 		if err := runWorker(args[1], paths); err != nil {
 			log.Fatal(err)
@@ -66,17 +88,9 @@ func main() {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "接口不存在"})
 	})
 
-	// web/dist 存在时托管前端产物；开发期前端走 vite(4041) 代理，不受影响。
-	if st, err := os.Stat("web/dist/index.html"); err == nil && !st.IsDir() {
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" {
-				if _, err := os.Stat("web/dist" + r.URL.Path); err != nil {
-					http.ServeFile(w, r, "web/dist/index.html")
-					return
-				}
-			}
-			http.ServeFile(w, r, "web/dist"+r.URL.Path)
-		})
+	// 前端页面：发布二进制内嵌；开发构建退回磁盘上的 web/dist；都没有则只有 API。
+	if pages := pageHandler(); pages != nil {
+		mux.Handle("/", pages)
 	}
 
 	srv := &http.Server{Addr: addr, Handler: mux}
@@ -90,7 +104,7 @@ func main() {
 		_ = srv.Close()
 	}()
 
-	log.Printf("limpet-server 监听 %s", addr)
+	log.Printf("limpet-server %s 监听 %s", version, addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

@@ -3,8 +3,8 @@
 // 影子主屏内容与备用屏内容，且顺序正确（主屏段在切换序列之前）；
 // 随后退出备用屏，会话应继续可用。备用屏标记用 UTF-8 八进制转义构造，
 // 避免输入行回显里出现字面标记干扰断言。
+const { BASE, WS } = await import('./env.mjs')
 import { execSync } from 'node:child_process'
-const BASE = process.env.BASE || 'http://127.0.0.1:4040'
 const dec = new TextDecoder()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const ALT = '\u5907\u7528\u5c4f\u6807\u8bb0' // 备用屏标记
@@ -12,7 +12,7 @@ const OCT = '\\345\\244\\207\\347\\224\\250\\345\\261\\217\\346\\240\\207\\350\\
 
 function attach(id, query) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:4040/api/ws/term/${id}${query}`)
+    const ws = new WebSocket(`${WS}/api/ws/term/${id}${query}`)
     ws.binaryType = 'arraybuffer'
     const st = { ready: false, chunks: [], text: () => st.chunks.map((c) => dec.decode(c)).join('') }
     ws.onmessage = (e) => {

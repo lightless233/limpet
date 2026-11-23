@@ -1,4 +1,4 @@
-module limpet/server
+module limpet
 
 go 1.27.4
 

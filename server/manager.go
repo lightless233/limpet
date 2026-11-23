@@ -52,7 +52,6 @@ type regEntry struct {
 type manager struct {
 	mu         sync.Mutex
 	sessions   map[string]*workerHandle
-	home       string
 	histDir    string
 	workersDir string // socket 与 worker 日志的所在目录（0700）
 	regPath    string
@@ -62,7 +61,7 @@ type manager struct {
 }
 
 func newManager(launch launchMode) (*manager, error) {
-	home, err := os.UserHomeDir()
+	base, err := limpetHome()
 	if err != nil {
 		return nil, err
 	}
@@ -72,10 +71,9 @@ func newManager(launch launchMode) (*manager, error) {
 	}
 	m := &manager{
 		sessions:   map[string]*workerHandle{},
-		home:       home,
-		histDir:    filepath.Join(home, ".limpet", "history"),
-		workersDir: filepath.Join(home, ".limpet", "workers"),
-		regPath:    filepath.Join(home, ".limpet", "sessions.json"),
+		histDir:    filepath.Join(base, "history"),
+		workersDir: filepath.Join(base, "workers"),
+		regPath:    filepath.Join(base, "sessions.json"),
 		registry:   map[string]regEntry{},
 		exePath:    exe,
 		launch:     launch,

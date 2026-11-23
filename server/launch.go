@@ -131,12 +131,12 @@ var systemdUnitEnv = map[string]bool{
 
 // workerEnv 是转交给 worker 单元的环境：server 自己的环境，去掉不该带进会话的两类——
 // systemd 给 server 单元专用的变量，和 LIMPET_* 配置项（worker 用不上，却会出现在
-// 用户的会话 Shell 里）。
+// 用户的会话 Shell 里）。LIMPET_HOME 是例外：它就是 worker 要用的数据目录。
 func workerEnv() []string {
 	var out []string
 	for _, kv := range os.Environ() {
 		k, _, _ := strings.Cut(kv, "=")
-		if systemdUnitEnv[k] || strings.HasPrefix(k, "LIMPET_") {
+		if systemdUnitEnv[k] || (strings.HasPrefix(k, "LIMPET_") && k != "LIMPET_HOME") {
 			continue
 		}
 		out = append(out, kv)
