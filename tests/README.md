@@ -20,6 +20,7 @@
 | `cleanup.mjs` | 关闭全部会话并等 worker 进程退出（跑完套件后收尾） | 保留 |
 | `limet-multi-view-test.mjs` | 多视图（spec 004）：双 viewer 输入互通、慢 viewer 单独丢弃 4001、断开重连恰好一次 | 保留 |
 | `limet-u3-slow-consumer-test.mjs` | 慢消费者：30MB 负载 + 停读占空比，连接被关闭（4001 帧或 TCP 关闭）且会话/他人不受影响 | 保留 |
+| `limet-heartbeat-test.mjs` | 心跳（spec 005）：ping 间隔 20s；只读不应答的客户端约 60s 收 4002，应答者与只输入者不受影响。约 70 秒 | 保留 |
 | `limet-u3-lifecycle-test.mjs` 的第 2 节 | 多视图语义（spec 004）：第二个接入成功且画面同步（409 已废止） | 已按 004 修订 |
 
 以下脚本随 tmux 退役（它们的 oracle 是 tmux 或旧启动流），不再维护，

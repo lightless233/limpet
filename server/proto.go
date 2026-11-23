@@ -28,10 +28,14 @@ const protocolVersion = 2
 const (
 	wsReadLimit = 1 << 20 // 大粘贴兜底；前端按 64KiB 主动切块
 	wsChunk     = 64 << 10
-	queueChunks = 256              // 每个 viewer 的实时流队列上限（背压：满则丢弃该 viewer）
-	spawnWait   = 5 * time.Second  // 等待 worker 就绪（socket 可探测）
-	frameBudget = 2 * time.Second  // 单帧写入的兜底超时：任何慢消费者都不能钉住写锁
-	killGrace   = 3 * time.Second  // 关闭回收的 TERM 宽限
+	queueChunks = 256             // 每个 viewer 的实时流队列上限（背压：满则丢弃该 viewer）
+	spawnWait   = 5 * time.Second // 等待 worker 就绪（socket 可探测）
+	frameBudget = 2 * time.Second // 单帧写入的兜底超时：任何慢消费者都不能钉住写锁
+	killGrace   = 3 * time.Second // 关闭回收的 TERM 宽限
+	// 心跳（spec 005）：Cloudflare 在双向无数据 100s 后关闭 WebSocket，20s 周期留 5 倍余量；
+	// 60s 即容忍连续 3 个周期听不到对端。
+	pingInterval = 20 * time.Second
+	pingTimeout  = 60 * time.Second
 )
 
 // jsonUnmarshal 语义化包装，统一错误来源。

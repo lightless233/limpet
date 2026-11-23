@@ -185,6 +185,9 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 // socket → WS：OUTPUT → 二进制帧；READY → 文本帧 `{"type":"ready"}`；EXIT →
 // 关闭码 1000；DETACH → 关闭码取载荷（4001=慢消费者）。
 // WS 写均有 5s 有界超时：对端停止消费 → 关闭码 4001（spec 003 背压）。
+//
+// 心跳（spec 005）：每 pingInterval 发文本帧 `{"type":"ping"}`；连续 pingTimeout 没有收到
+// 对端的任何消息（pong、输入、尺寸申报都算）→ 关闭码 4002。ping/pong 在此终结，不进 worker。
 func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -202,6 +205,10 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 		return w.write(c2, typ, data)
 	}
 
+	// 最近一次听到对端的时刻（任何入站消息都算），心跳超时判定用。
+	var lastHeard atomic.Int64
+	lastHeard.Store(time.Now().UnixNano())
+
 	// WS 读侧。
 	go func() {
 		defer cancel()
@@ -210,6 +217,7 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 			if err != nil {
 				return
 			}
+			lastHeard.Store(time.Now().UnixNano())
 			if mt == websocket.MessageText {
 				var ctl struct {
 					Type string `json:"type"`
@@ -229,6 +237,33 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 			}
 			if len(data) > 0 {
 				if err := fc.writeFrame(ftInput, data); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// 心跳：保活 + 判对端失联。无声死亡的连接（手机锁屏/切网）靠它收敛，
+	// 不必等输出积压或 TCP 超时才发现。
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, lastHeard.Load())) >= pingTimeout {
+					w.close(websocket.StatusCode(4002), "heartbeat timeout")
+					cancel()
+					return
+				}
+				if err := writeWS(websocket.MessageText, []byte(`{"type":"ping"}`)); err != nil {
+					// 与输出写超时同样处理：对端停止消费 → 4001；其余原因连接已死，读侧会退出。
+					if errors.Is(err, context.DeadlineExceeded) {
+						w.close(websocket.StatusCode(4001), "too slow")
+						cancel()
+					}
 					return
 				}
 			}
