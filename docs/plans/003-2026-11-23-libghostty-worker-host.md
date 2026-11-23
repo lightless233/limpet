@@ -18,8 +18,8 @@
 **问题**：会话宿主是外部 tmux 进程，寻址与生命周期耦合是全部竞态的根源。
 
 **改动**：
-- 同一二进制新增 `worker <uuid>` 子命令：打开 `~/.limpet/workers/<uuid>.sock`（0700）、等首条尺寸启动 PTY（shell 进程组、`TERM` 显式设置、3s/query 兜底）、raw tee 录制到 `~/.limpet/history/<uuid>.log`、字节透传不缓冲。
-- socket 协议（内部私有，同版本绑定）：attach / input / resize / kill / exit 通知；单消费者，第二个消费者报 busy。
+- 同一二进制新增 `worker <uuid>` 子命令：打开 `~/.limpet/workers/<uuid>.sock`（0700）、等 server 的启动指令（携带定案尺寸——首条尺寸/3s 兜底/query 兜底仍在 server WS 层，worker 不计时）后启动 PTY（`$SHELL`、交互模式、进程组、起始目录 `$HOME`、`TERM` 显式设置）、raw tee 录制到 `~/.limpet/history/<uuid>.log`、字节透传不缓冲。
+- socket 协议（内部私有，**带版本握手**——server 升级后必须兼容运行中的旧版本 worker，加法演进）：attach / input / resize / kill / exit 通知；单消费者，第二个消费者报 busy。
 - server 侧：会话表切换为 uuid → worker 句柄；`POST /api/term` 自 spawn worker；WS handler 桥接 socket；404/409/426/1008/1011/1000 语义逐项保持。
 - 回放暂用 raw 尾部（**已知 alt-screen 降级，vim/颜色验收挂起到 U2**）。
 
@@ -27,14 +27,14 @@
 
 ## 单元 2：画面重建（依赖 U0 结论）
 
-**改动**：按定案机制实现——快照 restore 路径（worker encode → 客户端 restore）或网格序列化路径（cell 级读取 → 「网格 → 转义序列」序列化器，onlcr/转义边界处理沿用 001 回放管线的经验）。同时落地：client 流 `smcup`/`rmcup` 过滤（worker 网格吃原始流）、scrollback 容量 ≥ 50000 行、resize 触发网格重排与 PTY 同步。
+**改动**：按定案机制实现——快照 restore 路径（worker encode → 客户端 restore）或网格序列化路径（cell 级读取 → 「网格 → 转义序列」序列化器，onlcr/转义边界处理沿用 001 回放管线的经验）。同时落地：client 流 `smcup`/`rmcup` 过滤（worker 网格吃原始流）、scrollback 容量与回放深度对齐（10000 行 + 余量）、resize 触发网格重排与 PTY 同步。
 
 **完成证据**：vim 接续原样恢复（含跨 server 重启）；长输出重连直接滚动可见且含颜色；重接字节量符合所选机制的预期（快照 O(屏+尾) / 序列化与 capture 等价抽查比对）。
 
 ## 单元 3：生命周期加固
 
 **改动**：
-- server 启动扫描 `~/.limpet/workers/`：stale socket（进程已死）清理，活 worker 懒连接恢复。
+- server 启动扫描 `~/.limpet/workers/`：stale socket（进程已死）清理，活 worker 懒连接恢复；升级场景（新二进制 server × 旧版本 worker）的协议版本握手验证。
 - close 路径：TERM → 兜底 KILL 的进程组终止升级、socket 移除、僵尸回收。
 - exit 路径：shell 退出 → 消费者收 1000、socket 清理、注册表 `endedAt` 首次观测登记。
 
@@ -44,7 +44,7 @@
 
 **改动**：
 - `~/.limpet/sessions.json`：原子写、单写者互斥；创建登记、死亡登记、改名更新。
-- API 全面 uuid 化：创建返回体、列表 `{id, name, created, attached}`、`rename`（只改注册表 name，id/地址不变）、`close`；名称唯一性按注册表（409），校验规则沿用。
+- API 全面 uuid 化：创建返回体、列表 `{id, name, created, attached}`、`rename`（只改注册表 name，id/地址不变）、`close`；名称唯一性按注册表（409 保留——产品选择，重名已无技术必要性），校验规则沿用。
 - 前端：列表字段、WS URL、close/rename 调用点全部切 uuid；行为零变化。
 
 **完成证据**：改名后 id 与接入地址不变；重名 409；同名再建 uuid 不同；前端全流程（DevTools 375）无回归。
@@ -67,6 +67,6 @@
 
 - libghostty scrollback/reflow 子 API 未冻结：版本 pin + 升级纳入回归；spike 若证明绑定不可用，动工前必须回到用户做 fallback 决策。
 - Shell 环境差异：tmux 注入的 `TERM`/环境消失，worker 显式设置——首屏行为是重点回归观察点（% 提示符一类问题若复现，优先查 `TERM` 与首屏重绘路径）。
-- 每会话一进程：内存量级 ≈ tmux 持 50k 行同级；进程数个人规模（几十）不构成问题。
+- 每会话一进程：worker 网格 scrollback 与回放深度对齐（~10k 行），内存低于 tmux 时代（50k 行）；进程数个人规模（几十）不构成问题。
 - 一致性窗口：worker 死亡到列表观测之间——「首次观测死亡」语义，与 002 注册表设计一致。
 - 过渡期风险：U1 完成、U2 未完成时 vim/颜色保真暂缺——不部署、不切主线流量，U2 完成前 tmux 宿主保持可用（切换点 = U5）。
