@@ -21,6 +21,7 @@
 | `limet-multi-view-test.mjs` | 多视图（spec 004）：双 viewer 输入互通、慢 viewer 单独丢弃 4001、断开重连恰好一次 | 保留 |
 | `limet-u3-slow-consumer-test.mjs` | 慢消费者：30MB 负载 + 停读占空比，连接被关闭（4001 帧或 TCP 关闭）且会话/他人不受影响 | 保留 |
 | `limet-heartbeat-test.mjs` | 心跳（spec 005）：ping 间隔 20s；只读不应答的客户端约 60s 收 4002，应答者与只输入者不受影响。约 70 秒 | 保留 |
+| `limet-reconnect-browser-test.mjs` | 前端自动重连（spec 005），用 Playwright 驱动真实 Chromium：server 重启 / 连接切断 / 登录失效 / 无声失联后自动接回，三种结束路径进入「会话已结束」。约 2 分钟；需要本机有 Playwright + Chromium，且 4040 与 4042 空闲（脚本自己起 server） | 保留 |
 | `limet-u3-lifecycle-test.mjs` 的第 2 节 | 多视图语义（spec 004）：第二个接入成功且画面同步（409 已废止） | 已按 004 修订 |
 
 以下脚本随 tmux 退役（它们的 oracle 是 tmux 或旧启动流），不再维护，
