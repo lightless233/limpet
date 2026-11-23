@@ -24,6 +24,10 @@ func main() {
 		err = runFormatter()
 	case "fmthistory":
 		err = probeFormatterHistory()
+	case "altscreen":
+		err = probeAltScreen()
+	case "shadow":
+		err = probeShadow()
 	default:
 		err = fmt.Errorf("未知子命令 %q", os.Args[1])
 	}
