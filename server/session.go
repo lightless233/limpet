@@ -38,13 +38,16 @@ type consumer struct {
 	closed    atomic.Bool
 }
 
-// closeWith 通知消费者被丢弃（慢），code 是期望的 WS 关闭码。
+// closeWith 丢弃消费者（队列打满，慢消费者）：先发 DETACH 帧（server 据此向
+// 浏览器发 4001），再关 socket。时序：输出泵此刻可能阻塞在自己的 2s 写超时里
+// 持着写锁——本方法的 DETACH 写最多等 2s 拿到锁；DETACH 仅 40 字节，通常能进
+// 内核缓冲。最终必然 close，server 侧 EOF 以 1011 兜底（慢消费者主路径是 4001）。
 func (c *consumer) closeWith(code int, reason string) {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
 	_ = c.conn.writeFrame(ftDetach, mustJSON(detachMsg{Code: code, Reason: reason}))
-	c.conn.close()
+	_ = c.conn.close()
 }
 
 // sessionPaths 是 worker 需要的文件系统位置。
@@ -159,7 +162,6 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		return nil, fmt.Errorf("启动 Shell 失败: %w", err)
 	}
 	s.cmd, s.ptmx = cmd, ptmx
-	s.recordMeta("S", s.logBytes, fmt.Sprintf("%dx%d", gridCols, gridRows))
 	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", cmd.Process.Pid)); err == nil {
 		s.lastCwd = cwd
 		s.recordMeta("C", s.logBytes, cwd)
@@ -200,10 +202,14 @@ func (s *session) readLoop() {
 
 // handleOutput：喂双网格 → 录制 → 交给当前消费者（有界队列，满了断开本次接入）。
 func (s *session) handleOutput(batch []byte) {
-	start := s.fedBytes.Load()
+	var start int64
 
 	// 真实网格吃全量；影子网格只吃主屏段（过滤器切分）。
+	// fedBytes 必须在临界区内更新：重建的切点取自它，若在解锁后写，
+	// 重建可能读到旧值——刚喂入的字节「在重建画面里 + 又被实时流重发」
+	// （验收 15 实测抓到过：5 行重复）。
 	s.gridMu.Lock()
+	start = s.fedBytes.Load()
 	feedGround(s.grid, batch)
 	for _, sg := range s.altf.process(batch) {
 		if !sg.shadow {
@@ -211,8 +217,8 @@ func (s *session) handleOutput(batch []byte) {
 		}
 		feedGround(s.shadow, sg.data)
 	}
-	s.gridMu.Unlock()
 	s.fedBytes.Store(start + int64(len(batch)))
+	s.gridMu.Unlock()
 
 	// 录制：纯原始字节 + 事件（时间、目录）。写失败降级为缺口标记，不拖住读取。
 	if !s.recBroken {

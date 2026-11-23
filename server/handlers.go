@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -49,9 +50,17 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	name := strings.TrimSpace(body.Name)
+	if name != "" && !nameValid(name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "名称不合法：不能包含 : 或 .，长度不超过 100 字符"})
+		return
+	}
 
 	h, err := m.create(name)
 	if err != nil {
+		if errors.Is(err, errDuplicate) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}

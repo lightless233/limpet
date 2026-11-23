@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 )
 
+
 // wsConn 给 coder/websocket 加写入互斥与只关一次。
 type wsConn struct {
 	c      *websocket.Conn
@@ -174,8 +175,9 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // relay 把 WS 与 worker socket 双向中继。socket → WS 的翻译：
-// OUTPUT → 二进制帧；READY → 文本帧 `{"type":"ready"}`；EXIT → 关闭码 1000；
-// DETACH → 关闭码取载荷（4001）。WS → socket：二进制 → INPUT；文本（resize）→ RESIZE。
+// OUTPUT → 二进制帧；READY → 文本帧 `{"type":"ready"}`；EXIT → 关闭码 1000。
+// WS → socket：二进制 → INPUT；文本（resize）→ RESIZE。
+// 慢消费者判定在 server：WS 写超时 5s → 关闭码 4001，worker 的 socket 随之关闭。
 func relay(w *wsConn, fc *frameConn, fbCols, fbRows uint16) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -198,6 +200,13 @@ func relay(w *wsConn, fc *frameConn, fbCols, fbRows uint16) {
 		<-ctx.Done()
 		fc.close()
 	}()
+
+	// WS 写：有界超时——对端停止读取时在此暴露为超时，而不是无限阻塞。
+	writeWS := func(typ websocket.MessageType, data []byte) error {
+		c2, cl := context.WithTimeout(ctx, 5*time.Second)
+		defer cl()
+		return w.write(c2, typ, data)
+	}
 
 	// WS 读侧。
 	go func() {
@@ -239,19 +248,18 @@ func relay(w *wsConn, fc *frameConn, fbCols, fbRows uint16) {
 		}
 		switch t {
 		case ftReady:
-			if err := w.write(ctx, websocket.MessageText, []byte(`{"type":"ready"}`)); err != nil {
+			if err := writeWS(websocket.MessageText, []byte(`{"type":"ready"}`)); err != nil {
 				cancel()
 				return
 			}
 		case ftOutput:
-			if err := w.write(ctx, websocket.MessageBinary, payload); err != nil {
+			if err := writeWS(websocket.MessageBinary, payload); err != nil {
+				// 写超时（对端未消费）→ 4001；其他（对端断开/取消）→ 静默退出。
+				if errors.Is(err, context.DeadlineExceeded) {
+					w.close(websocket.StatusCode(4001), "too slow")
+				}
 				return
 			}
-		case ftExit:
-			var em exitMsg
-			_ = jsonUnmarshal(payload, &em)
-			w.close(websocket.StatusCode(1000), "session ended")
-			return
 		case ftDetach:
 			var dm detachMsg
 			_ = jsonUnmarshal(payload, &dm)
@@ -260,6 +268,11 @@ func relay(w *wsConn, fc *frameConn, fbCols, fbRows uint16) {
 				code = 4001
 			}
 			w.close(code, dm.Reason)
+			return
+		case ftExit:
+			var em exitMsg
+			_ = jsonUnmarshal(payload, &em)
+			w.close(websocket.StatusCode(1000), "session ended")
 			return
 		}
 	}

@@ -70,14 +70,14 @@ type resizeMsg struct {
 	Rows uint16 `json:"rows"`
 }
 
-// exitMsg 是 ftExit 的载荷。
-type exitMsg struct {
-	Reason string `json:"reason"`
-}
-
 // detachMsg 是 ftDetach 的载荷，Code 是期望的 WS 关闭码（如 4001）。
 type detachMsg struct {
 	Code   int    `json:"code"`
+	Reason string `json:"reason"`
+}
+
+// exitMsg 是 ftExit 的载荷。
+type exitMsg struct {
 	Reason string `json:"reason"`
 }
 
@@ -101,6 +101,9 @@ func (fc *frameConn) writeFrame(t frameType, payload []byte) error {
 	}
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
+	// 写超时 2s：对端（server 停止读取）时解锁等待者，避免持锁互等。
+	// 慢消费者的判定在 server 侧（WS 写超时 → 4001）。
+	_ = fc.c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	head := [5]byte{byte(t)}
 	binary.BigEndian.PutUint32(head[1:], uint32(len(payload)))
 	if _, err := fc.c.Write(head[:]); err != nil {

@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -119,6 +120,10 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 
 	case "attach":
 		c := &consumer{conn: fc, queue: make(chan []byte, queueChunks)}
+		// 切点初值 = 无穷大：重建完成前一切字节只进重建画面、不进实时流，
+		// 否则接入到首条尺寸之间的输出会被「实时发一遍 + 重建再发一遍」
+		// （验收 15 实测抓到：行 51-55 / 64-93 双份）。
+		c.cutOffset.Store(math.MaxInt64)
 		if !s.consumer.CompareAndSwap(nil, c) {
 			_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
 				Op: "attach", OK: false, Proto: protocolVersion, UUID: s.id, Busy: true,
@@ -143,12 +148,20 @@ func (s *session) serveAttachConn(fc *frameConn, c *consumer) {
 	}()
 
 	// 输出泵：把实时队列的帧发往 server（重建帧写完之后才启动，顺序由
-	// 「先直写重建、后开泵」保证）。写失败（含 4001 丢弃触发的关闭）即退出。
+	// 「先直写重建、后开泵」保证）。
+	// 写失败（含 2s 写超时 = server 端停止消费）→ 补发 DETACH(4001) 再关连接：
+	// 此时上一次写已超时返回、锁已空闲，DETACH 能在 2s 内送达。
+	// 会话本身不受影响（PTY 读取与录制照常，spec 003 背压）。
 	go func() {
 		for {
 			select {
 			case chunk := <-c.queue:
 				if err := fc.writeFrame(ftOutput, chunk); err != nil {
+					if c.closed.Load() {
+						return
+					}
+					_ = fc.writeFrame(ftDetach, mustJSON(detachMsg{Code: 4001, Reason: "too slow"}))
+					fc.close()
 					return
 				}
 			}
@@ -172,7 +185,8 @@ func (s *session) serveAttachConn(fc *frameConn, c *consumer) {
 				s.resize(rm.Cols, rm.Rows)
 				out, cont, err := s.rebuild()
 				if err != nil {
-					_ = fc.writeFrame(ftDetach, mustJSON(detachMsg{Code: 1011, Reason: "rebuild failed: " + err.Error()}))
+					// 重建失败：断开连接（server 侧映射为 WS 1011 + 原因）。
+					fc.close()
 					return
 				}
 				// ready 先于任何输出帧（spec 003 帧协议）。

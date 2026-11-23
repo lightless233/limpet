@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 终端视图：wterm(ghostty core) ↔ WebSocket ↔ Go(tmux 客户端 PTY)。
+// 终端视图：wterm(ghostty core) ↔ WebSocket ↔ Go(worker PTY)。
 // 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready）。
 // 接入由调用方给定的会话 ID 直接进行（会话已在列表中创建）。
 import { nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
@@ -7,7 +7,7 @@ import { Terminal, type WTerm } from '@wterm/vue'
 import { GhosttyCore } from '@wterm/ghostty'
 import '@wterm/vue/css'
 
-const props = defineProps<{ sessionId: string }>()
+const props = defineProps<{ sessionId: string; sessionName: string }>()
 const emit = defineEmits<{ back: [] }>()
 
 const term = useTemplateRef('term')
@@ -27,10 +27,10 @@ let ws: WebSocket | null = null
 // Terminal 组件挂载后长期存活，@ready 在其生命周期内只触发一次；
 // ready 只置位一次、绝不随 connect() 重置，否则重连后输出会永远排队。
 let termReady = false
-// ready 之前到达的输出先排队，避免丢首屏（tmux 重绘）。
+// ready 之前到达的输出先排队（重建帧 + 实时流都在 ready 之后）。
 const pending: Uint8Array[] = []
 // autoResize 的首次回调早于 WS 握手完成，必须把尺寸存下来，
-// 在 onopen 时补发，否则 tmux 客户端永远停在初始 80x24。
+// 在 onopen 时补发，否则 worker 永远停在初始 80x24。
 let lastSize: { cols: number; rows: number } | null = null
 
 onMounted(connect)
@@ -68,7 +68,7 @@ async function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   ws = new WebSocket(`${proto}//${location.host}/api/ws/term/${encodeURIComponent(props.sessionId)}`)
   ws.binaryType = 'arraybuffer'
-  // onopen 不等于可用：后端要等首条尺寸消息才启动 tmux 客户端。
+  // onopen 不等于可用：后端要等首条尺寸消息（或 3s 兜底）才完成重建。
   // 发送当前尺寸触发启动，收到 ready 帧后才显示「已连接」并开放输入。
   ws.onopen = () => {
     sendResize()
@@ -218,7 +218,7 @@ const statusText = {
       >
         ←
       </button>
-      <span class="truncate font-semibold tracking-tight">{{ sessionId }}</span>
+      <span class="truncate font-semibold tracking-tight">{{ sessionName }}</span>
       <span
         class="shrink-0 rounded-full px-2 py-0.5 text-xs"
         :class="{

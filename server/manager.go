@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,6 +23,9 @@ import (
 
 // uuidRe 稳定 ID：8 字节随机 hex。
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// errDuplicate 表示与活会话重名（HTTP 409）。
+var errDuplicate = errors.New("同名会话已存在")
 
 func newID() string {
 	b := make([]byte, 8)
@@ -215,7 +219,7 @@ func (m *manager) create(name string) (*workerHandle, error) {
 		for _, s := range m.sessions {
 			if s.name == name {
 				m.mu.Unlock()
-				return nil, fmt.Errorf("同名会话已存在")
+				return nil, errDuplicate
 			}
 		}
 		m.mu.Unlock()

@@ -1,15 +1,17 @@
 <script setup lang="ts">
 // 会话列表（移动端即首页）：新建（可命名）/ 接入 / 重命名 / 关闭。
-// 数据实时来自后端（tmux 是事实来源），增删改后刷新。
+// 数据实时来自后端（worker 进程是事实来源），增删改后刷新。
+// 显示一律用 name（显示名）；id（uuid）只用于寻址，不出现在界面上。
 import { nextTick, onMounted, ref, watch } from 'vue'
 
 interface SessionItem {
   id: string
+  name: string
   created: string
   attached: boolean
 }
 
-const emit = defineEmits<{ open: [id: string] }>()
+const emit = defineEmits<{ open: [id: string, name: string] }>()
 
 const sessions = ref<SessionItem[]>([])
 const loading = ref(true)
@@ -71,7 +73,7 @@ async function submitSheet() {
 const closeError = ref('')
 
 async function closeSession(s: SessionItem) {
-  if (!confirm(`关闭会话「${s.id}」？其中的 Shell 将被终止。`)) return
+  if (!confirm(`关闭会话「${s.name}」？其中的 Shell 将被终止。`)) return
   closeError.value = ''
   try {
     const res = await fetch(`/api/term/${encodeURIComponent(s.id)}/close`, { method: 'POST' })
@@ -120,7 +122,7 @@ function fmtTime(iso: string) {
           <div class="flex items-center gap-1 rounded-lg border border-neutral-800 bg-neutral-900/60 p-1">
             <button
               class="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-3 text-left active:bg-neutral-800"
-              @click="emit('open', s.id)"
+              @click="emit('open', s.id, s.name)"
             >
               <span
                 class="h-2 w-2 shrink-0 rounded-full"
@@ -128,14 +130,14 @@ function fmtTime(iso: string) {
                 :title="s.attached ? '使用中' : '空闲'"
               ></span>
               <span class="min-w-0">
-                <span class="block truncate font-medium">{{ s.id }}</span>
+                <span class="block truncate font-medium">{{ s.name }}</span>
                 <span class="block text-xs text-neutral-500">{{ fmtTime(s.created) }}</span>
               </span>
             </button>
             <button
               class="h-11 w-11 shrink-0 rounded-md text-neutral-400 active:bg-neutral-800 hover:text-neutral-200"
               title="重命名"
-              @click.stop="sheet = { mode: 'rename', id: s.id, name: s.id }; sheetError = ''"
+              @click.stop="sheet = { mode: 'rename', id: s.id, name: s.name }; sheetError = ''"
             >
               ✎
             </button>
