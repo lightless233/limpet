@@ -583,14 +583,22 @@ func handleTermWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 统一清理：标记关闭 → 停兜底 → 取消捕获 → 发关闭帧 →
-	// 回收本连接的客户端资源（若已启动）→ 末尾集中释放接入占用。
-	// 只触碰本连接的 connState：此刻共享字段上可能是后来接入的新连接，
-	// 旧清理绝不能断开它。条目永不在此删除：会话常驻，断开只是 detach。
+	// 等待启动临界区结束 → 回收本连接的客户端资源（若已启动）→
+	// 末尾集中释放接入占用。只触碰本连接的 connState：此刻共享字段
+	// 上可能是后来接入的新连接，旧清理绝不能断开它。条目永不在此
+	// 删除：会话常驻，断开只是 detach。
 	endConnection()
 
+	// spawnMu 必不可少：启动协程通过最后一次 closing 检查后、把 PTY
+	// 发布进 connState 前有一段窗口（capture 之后的 fork/exec），没有
+	// 这把锁清理会读到空资源提前释放占用，随后启动完成留下无主客户端。
+	// 锁序保证清理要么阻止启动（启动协程锁内复查 closing 失败），
+	// 要么拿到刚启动的客户端并将其收掉。
+	spawnMu.Lock()
 	st.mu.Lock()
 	cmd, ptmx := st.cmd, st.ptmx
 	st.mu.Unlock()
+	spawnMu.Unlock()
 
 	if ptmx != nil {
 		_ = cmd.Process.Kill()
