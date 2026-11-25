@@ -76,6 +76,24 @@ func main() {
 		log.Fatalf("初始化失败: %v", err)
 	}
 
+	srv := &http.Server{Addr: addr, Handler: m.handler()}
+
+	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们继续运行）。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		log.Printf("server 停止（worker 不受影响）")
+		_ = srv.Close()
+	}()
+
+	log.Printf("limpet-server %s 监听 %s", version, addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+}
+
+func (m *manager) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/term", m.handleCreate)
 	mux.HandleFunc("GET /api/term", m.handleList)
@@ -93,19 +111,5 @@ func main() {
 		mux.Handle("/", pages)
 	}
 
-	srv := &http.Server{Addr: addr, Handler: http.NewCrossOriginProtection().Handler(mux)}
-
-	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们继续运行）。
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go func() {
-		<-ctx.Done()
-		log.Printf("server 停止（worker 不受影响）")
-		_ = srv.Close()
-	}()
-
-	log.Printf("limpet-server %s 监听 %s", version, addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
-	}
+	return http.NewCrossOriginProtection().Handler(mux)
 }

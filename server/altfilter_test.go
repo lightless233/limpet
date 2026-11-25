@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"go.mitchellh.com/libghostty"
 )
 
 // filterCase 单条用例：多批输入 + 期望影子流 + 不得泄漏进影子流的内容 + 最终 inAlt。
@@ -78,6 +80,37 @@ func TestAltFilter(t *testing.T) {
 			wantInAlt: true,
 		},
 		{
+			name:    "参数 470 与 147 均不匹配备用屏模式",
+			batches: []string{"x\x1b[?25;470h\x1b[?147;25ly"},
+			wantPri: "x\x1b[?25;470h\x1b[?147;25ly",
+		},
+		{
+			name:    "组合 DECSET 和 DECRST 保留其余模式",
+			batches: []string{"x\x1b[?2004;1049hALT\x1b[?25;1049ly"},
+			wantPri: "x\x1b[?2004h\x1b[?25ly",
+		},
+		{
+			name:    "ESC 跨批中止 CSI 后开始新序列",
+			batches: []string{"x\x1b[?25", SW_IN + "ALT" + SW_OUT + "y"},
+			wantPri: "xy",
+		},
+		{
+			name:    "RIS 复位备用屏与影子主屏",
+			batches: []string{"x" + SW_IN + "ALT\x1b", "cy"},
+			wantPri: "x\x1bcy",
+		},
+		{
+			name:      "DECSTR 保持活动备用屏",
+			batches:   []string{"x\x1b[!p" + SW_IN + "ALT\x1b[!pALT2"},
+			wantPri:   "x\x1b[!p",
+			wantInAlt: true,
+		},
+		{
+			name:    "非 OSC 字符串内 BEL 不终止，ESC 可开始新的 CSI",
+			batches: []string{"x\x1bPqABC\aDEF\x1b", "[?1049hALT" + SW_OUT + "y"},
+			wantPri: "x\x1bPqABC\aDEF\x1b\\y",
+		},
+		{
 			name:    "普通 CSI（清屏/SGR）归影子",
 			batches: []string{"\x1b[2J\x1b[H\x1b[31m红\x1b[0m"},
 			wantPri: "\x1b[2J\x1b[H\x1b[31m红\x1b[0m",
@@ -114,5 +147,44 @@ func TestAltFilter(t *testing.T) {
 				t.Fatalf("inAlt = %v, 期望 %v", f.inAlt, tc.wantInAlt)
 			}
 		})
+	}
+}
+
+func TestAltFilterMatchesGhosttyReset(t *testing.T) {
+	grid, err := libghostty.NewTerminal(libghostty.WithSize(gridCols, gridRows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer grid.Close()
+
+	var f altFilter
+	for _, tc := range []struct {
+		data string
+		alt  bool
+	}{
+		{"\x1b[?1049h", true},
+		{"\x1b[!p", true},
+		{"\x1bc", false},
+	} {
+		grid.VTWrite([]byte(tc.data))
+		f.process([]byte(tc.data))
+		screen, err := grid.ActiveScreen()
+		if err != nil || (screen == libghostty.ScreenAlternate) != tc.alt || f.inAlt != tc.alt {
+			t.Fatalf("写入 %q 后 screen=%v, inAlt=%v, err=%v", tc.data, screen, f.inAlt, err)
+		}
+	}
+}
+
+func TestAltFilterBELOnlyTerminatesOSC(t *testing.T) {
+	for _, introducer := range []byte{']', 'P', '_', '^', 'X'} {
+		f := altFilter{}
+		f.process([]byte{0x1b, introducer, 'x', 0x07})
+		if (f.state == stGround) != (introducer == ']') {
+			t.Errorf("字符串 ESC %c 收到 BEL 后 state=%d", introducer, f.state)
+		}
+		f.process([]byte{0x1b, '\\'})
+		if f.state != stGround {
+			t.Errorf("字符串 ESC %c 收到 ST 后 state=%d", introducer, f.state)
+		}
 	}
 }
