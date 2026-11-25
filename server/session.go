@@ -4,13 +4,14 @@ package main
 // 本文件运行在 worker 进程里（`limpet-server worker <uuid>`），进程退出即会话终结。
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,8 +25,7 @@ import (
 const (
 	gridCols, gridRows = 80, 24
 	gridScrollback     = 10000 // 与重接深度对齐（spec 003）；更深的历史由录制承担
-	recFlushBytes      = 32 << 10
-	cwdSampleThrottle  = 200 * time.Millisecond
+	queryQueueSize     = 64
 )
 
 // viewer 是一个接入的渲染器：连接、有界实时流队列、申报窗口尺寸与切点。
@@ -66,7 +66,6 @@ type sessionPaths struct {
 type session struct {
 	id        string
 	createdAt time.Time
-	paths     sessionPaths
 
 	cmd  *exec.Cmd
 	ptmx *os.File
@@ -78,14 +77,9 @@ type session struct {
 
 	curCols, curRows uint16 // 网格当前尺寸（跟随输入者）
 
-	logPath, metaPath string
-	logF, metaF       *os.File
-	logW              *bufio.Writer
-	metaW             *bufio.Writer
-	logBytes          int64 // 已写入 log 的字节数（= 事件偏移的共同坐标）
-	recBroken         bool
-	lastCwd           string
-	lastCwdAt         time.Time
+	rec        *recording
+	queryQueue chan []byte
+	inputMu    sync.Mutex
 
 	fedBytes atomic.Int64 // 已喂入真实网格的字节数（读循环在网格临界区内维护）
 
@@ -100,30 +94,30 @@ type session struct {
 func startSession(paths sessionPaths, id string) (*session, error) {
 	home, _ := os.UserHomeDir()
 	s := &session{
-		id:        id,
-		createdAt: time.Now(),
-		paths:     paths,
-		logPath:   filepath.Join(paths.histDir, id+".log"),
-		metaPath:  filepath.Join(paths.histDir, id+".meta"),
-		viewers:   map[*viewer]viewerDims{},
-		done:      make(chan struct{}),
+		id:         id,
+		createdAt:  time.Now(),
+		queryQueue: make(chan []byte, queryQueueSize),
+		viewers:    map[*viewer]viewerDims{},
+		done:       make(chan struct{}),
 	}
 	s.curCols, s.curRows = gridCols, gridRows
 
-	lf, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	lf, err := os.OpenFile(filepath.Join(paths.histDir, id+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	mf, err := os.OpenFile(s.metaPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	mf, err := os.OpenFile(filepath.Join(paths.histDir, id+".meta"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		lf.Close()
 		return nil, err
 	}
-	s.logF, s.metaF = lf, mf
-	s.logW = bufio.NewWriterSize(lf, recFlushBytes)
-	s.metaW = bufio.NewWriterSize(mf, 4096)
-	_ = s.recordMeta("T", 0, fmt.Sprint(s.createdAt.UnixMilli()))
-	_ = s.recordMeta("S", 0, fmt.Sprintf("%dx%d", gridCols, gridRows))
+	started := false
+	defer func() {
+		if !started {
+			lf.Close()
+			mf.Close()
+		}
+	}()
 
 	// 网格。写回回调：查询应答路由（spec 003/004）——多视图下程序查询随字节流
 	// 到达所有 viewer，v1 已知限制是应答可能重复；worker 只在「没有任何 viewer
@@ -137,7 +131,6 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		}),
 	)
 	if err != nil {
-		s.closeRecording()
 		return nil, err
 	}
 	s.shadow, err = libghostty.NewTerminal(
@@ -146,17 +139,16 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 	)
 	if err != nil {
 		s.grid.Close()
-		s.closeRecording()
 		return nil, err
 	}
 
 	// Shell：$SHELL 优先，交互模式，起始目录 $HOME，TERM 显式设置（不信任默认环境）。
-	// pty.Start 强制 Setsid+Setctty：Shell 自成会话与进程组，随 worker 存活；
+	// pty.StartWithSize 强制 Setsid+Setctty：Shell 自成会话与进程组，随 worker 存活；
 	// 不能预设 Setpgid：creack/pty 合并而非替换 SysProcAttr，子进程先成组长再
 	// setsid 会 EPERM（实测踩过）。
 	shell := os.Getenv("SHELL")
 	if shell == "" {
-		shell = "/bin/bash"
+		shell = loginShell()
 	}
 	cmd := exec.Command(shell, "-i")
 	cmd.Dir = home
@@ -164,30 +156,61 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: gridCols, Rows: gridRows})
 	if err != nil {
 		s.grid.Close()
 		s.shadow.Close()
-		s.closeRecording()
 		return nil, fmt.Errorf("启动 Shell 失败: %w", err)
 	}
 	s.cmd, s.ptmx = cmd, ptmx
-	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", cmd.Process.Pid)); err == nil {
-		s.lastCwd = cwd
-		s.recordMeta("C", s.logBytes, cwd)
+	cwdPath := fmt.Sprintf("/proc/%d/cwd", cmd.Process.Pid)
+	s.rec = &recording{
+		queue:     make(chan recordingEvent, recordingQueueSize),
+		done:      make(chan struct{}),
+		finalDims: viewerDims{Cols: gridCols, Rows: gridRows},
 	}
-
+	started = true
+	go s.rec.write(lf, mf, s.createdAt, home, cwdPath)
+	go s.writeQueryReplies()
 	go s.readLoop()
 	return s, nil
 }
 
-// onQueryReply 见 startSession 中的注释。回调在 gridMu 临界区内（VTWrite 期间）同步执行，
-// 直接写 PTY 是允许的（不得触碰网格）。
+func loginShell() string {
+	passwd, err := os.ReadFile("/etc/passwd")
+	if err == nil {
+		uid := strconv.Itoa(os.Getuid())
+		for _, line := range strings.Split(string(passwd), "\n") {
+			fields := strings.Split(line, ":")
+			if len(fields) == 7 && fields[2] == uid && fields[6] != "" {
+				return fields[6]
+			}
+		}
+	}
+	return "/bin/bash"
+}
+
+// 查询回调在 VTWrite 期间同步执行，不能等待 PTY 的写入或输入锁。
 func (s *session) onQueryReply(data []byte) {
 	if s.hasLiveViewer() {
 		return // 有 viewer 在看实时流：查询已随流转发，由浏览器应答
 	}
-	_, _ = s.ptmx.Write(data)
+	// 回调数据由 libghostty 提供，离开回调前拷贝。
+	select {
+	case s.queryQueue <- append([]byte(nil), data...):
+	default:
+	}
+}
+
+func (s *session) writeQueryReplies() {
+	for reply := range s.queryQueue {
+		s.inputMu.Lock()
+		_, err := s.ptmx.Write(reply)
+		s.inputMu.Unlock()
+		if err != nil {
+			return
+		}
+	}
 }
 
 // hasLiveViewer 是否存在已拿到实时流切点的 viewer。
@@ -196,7 +219,7 @@ func (s *session) hasLiveViewer() bool {
 	defer s.viewersMu.Unlock()
 	fed := s.fedBytes.Load()
 	for v := range s.viewers {
-		if v.cutOffset.Load() <= fed {
+		if !v.closed.Load() && v.cutOffset.Load() <= fed {
 			return true
 		}
 	}
@@ -220,11 +243,16 @@ func (s *session) readLoop() {
 
 // handleOutput：喂双网格 → 录制 → 广播给所有 viewer（各自有界队列，满则仅丢弃该 viewer）。
 func (s *session) handleOutput(batch []byte) {
+	at := time.Now().UnixMilli()
 	// 真实网格吃全量；影子网格只吃主屏段（过滤器切分）。
 	// fedBytes 必须在临界区内更新：重建的切点取自它，若在解锁后写，
 	// 重建可能读到旧值——刚喂入的字节「在重建画面里 + 又被实时流重发」
 	// （验收 15 实测抓到过：5 行重复）。
 	s.gridMu.Lock()
+	if s.grid == nil {
+		s.gridMu.Unlock()
+		return
+	}
 	start := s.fedBytes.Load()
 	feedGround(s.grid, batch)
 	for _, sg := range s.altf.process(batch) {
@@ -234,23 +262,8 @@ func (s *session) handleOutput(batch []byte) {
 		feedGround(s.shadow, sg.data)
 	}
 	s.fedBytes.Store(start + int64(len(batch)))
+	s.rec.enqueue(viewerDims{Cols: s.curCols, Rows: s.curRows}, batch, at)
 	s.gridMu.Unlock()
-
-	// 录制：纯原始字节 + 事件（时间、目录）。写失败降级为缺口标记，不拖住读取。
-	if !s.recBroken {
-		if _, err := s.logW.Write(batch); err == nil {
-			s.logBytes += int64(len(batch))
-			_ = s.recordMeta("T", s.logBytes-int64(len(batch)), fmt.Sprint(time.Now().UnixMilli()))
-			s.sampleCwd()
-			if err := s.logW.Flush(); err != nil {
-				s.breakRecording()
-			}
-		} else {
-			s.breakRecording()
-		}
-	} else {
-		s.logBytes += int64(len(batch))
-	}
 
 	// 广播：只送各 viewer 切点之后的字节（切点之前的已在各自重建画面里）。
 	// 积压按字节计（queueBytes），槽数只是碎块突发的余量：PTY 的一批可能只有几十字节
@@ -286,43 +299,30 @@ func (s *session) handleOutput(batch []byte) {
 	}
 }
 
-// sampleCwd 采样 Shell 工作目录：/proc/<pid>/cwd，不依赖 shell 集成。
-// 目录变化没有内核通知，靠「切目录必产生提示符输出」在每批输出后采样（节流）。
-func (s *session) sampleCwd() {
-	if s.cmd == nil || s.cmd.Process == nil {
-		return
-	}
-	if time.Since(s.lastCwdAt) < cwdSampleThrottle {
-		return
-	}
-	s.lastCwdAt = time.Now()
-	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", s.cmd.Process.Pid))
-	if err != nil || cwd == s.lastCwd {
-		return
-	}
-	s.lastCwd = cwd
-	_ = s.recordMeta("C", s.logBytes, cwd)
-}
-
-// resize 应用尺寸：PTY 与双网格同源（尺寸跟随输入者，spec 004）。
+// resize 串行应用 PTY 和双网格尺寸。调用方持 inputMu 时，晋升与对应输入不会被其他 viewer 打断。
 func (s *session) resize(cols, rows uint16) {
 	s.gridMu.Lock()
+	defer s.gridMu.Unlock()
+	if s.grid == nil || (s.curCols == cols && s.curRows == rows) {
+		return
+	}
+	if err := pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows}); err != nil {
+		log.Printf("设置 PTY 尺寸失败: %v", err)
+		return
+	}
 	_ = s.grid.Resize(cols, rows, 0, 0)
 	_ = s.shadow.Resize(cols, rows, 0, 0)
 	s.curCols, s.curRows = cols, rows
-	s.gridMu.Unlock()
-	if s.ptmx != nil {
-		_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
-	}
-	if !s.recBroken {
-		s.recordMeta("S", s.logBytes, fmt.Sprintf("%dx%d", cols, rows))
-	}
+	s.rec.enqueue(viewerDims{Cols: cols, Rows: rows}, nil, 0)
 }
 
-// currentDims 返回网格当前尺寸（调用方多在 gridMu 临界区内）。
+// currentDims 返回网格当前尺寸；会话结束后返回零值。
 func (s *session) currentDims() (uint16, uint16) {
 	s.gridMu.Lock()
 	defer s.gridMu.Unlock()
+	if s.grid == nil {
+		return 0, 0
+	}
 	return s.curCols, s.curRows
 }
 
@@ -331,6 +331,9 @@ func (s *session) currentDims() (uint16, uint16) {
 func (s *session) rebuildFor(v *viewer) ([]byte, []byte, error) {
 	s.gridMu.Lock()
 	defer s.gridMu.Unlock()
+	if s.grid == nil {
+		return nil, nil, errors.New("会话已结束")
+	}
 
 	v.cutOffset.Store(s.fedBytes.Load())
 
@@ -377,86 +380,54 @@ func (s *session) attached() bool {
 	return false
 }
 
-// shutdown 显式关闭：worker 是子进程收割者（subreaper），按会话进程树回收——
-// 带作业控制的 Shell 给每个后台作业单开进程组，只杀 Shell 组杀不到它们
-// （bash/zsh 均实测复现）。TERM → 兜底 KILL，随后移除 socket、结束进程。
-func (s *session) shutdown(reason string) {
-	s.closeOnce.Do(func() {
-		if s.cmd != nil && s.cmd.Process != nil {
-			reapTree(s.cmd.Process.Pid)
-		}
-		if s.ptmx != nil {
-			_ = s.ptmx.Close()
-		}
-	})
+// shutdown 显式关闭：回收会话进程树、关闭 PTY 并等待读循环收尾。
+func (s *session) shutdown() {
+	s.reap()
 	<-s.done
 }
 
-// finish 会话死亡的统一收尾（读循环出口）。通知全部 viewer（1000）、移除 socket
-// 文件、关闭资源。进程退出由 worker 主函数在 done 上等待后完成。
-func (s *session) finish(reason string) {
+func (s *session) reap() {
 	s.closeOnce.Do(func() {
-		if s.cmd != nil && s.cmd.Process != nil {
-			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
-		}
+		reapTree(s.cmd.Process.Pid)
+		s.gridMu.Lock()
+		_ = s.ptmx.Close()
+		s.gridMu.Unlock()
 	})
+}
+
+// finish 由 PTY 读循环调用。先关闭网格与队列，再回收进程并通知 viewer。
+func (s *session) finish(reason string) {
+	s.gridMu.Lock()
+	s.grid.Close()
+	s.shadow.Close()
+	s.grid, s.shadow = nil, nil
+	close(s.rec.queue)
+	close(s.queryQueue)
+	s.gridMu.Unlock()
+
+	s.reap()
+
 	s.viewersMu.Lock()
 	viewers := make([]*viewer, 0, len(s.viewers))
 	for v := range s.viewers {
 		viewers = append(viewers, v)
 	}
-	s.viewers = map[*viewer]viewerDims{}
+	clear(s.viewers)
 	s.viewersMu.Unlock()
+
+	var notifications sync.WaitGroup
 	for _, v := range viewers {
-		if !v.closed.Load() {
-			_ = v.conn.writeFrameTimeout(ftExit, mustJSON(exitMsg{Reason: reason}), time.Second)
-		}
-		v.closeWith(0, "")
-		v.conn.close()
+		notifications.Go(func() {
+			if !v.closed.Load() {
+				_ = v.conn.writeFrameTimeout(ftExit, mustJSON(exitMsg{Reason: reason}), exitWriteBudget)
+			}
+			v.closeWith(0, "")
+			v.conn.close()
+		})
 	}
-	s.grid.Close()
-	s.shadow.Close()
-	s.closeRecording()
+	notifications.Wait()
+	<-s.rec.done
 	close(s.done)
-}
-
-func (s *session) closeRecording() {
-	if s.logW != nil {
-		_ = s.logW.Flush()
-	}
-	if s.metaW != nil {
-		_ = s.metaW.Flush()
-	}
-	if s.logF != nil {
-		_ = s.logF.Close()
-		s.logF = nil
-	}
-	if s.metaF != nil {
-		_ = s.metaF.Close()
-		s.metaF = nil
-	}
-}
-
-// breakRecording 写不动：标记缺口，之后不再尝试录制，绝不拖住 PTY 读取。
-func (s *session) breakRecording() {
-	if s.recBroken {
-		return
-	}
-	s.recBroken = true
-	_ = s.recordMeta("G", s.logBytes, "")
-}
-
-// recordMeta 追加一条事件（偏移是 log 的文件偏移）。meta 写失败静默——
-// 它只服务将来的历史浏览，不影响会话。
-func (s *session) recordMeta(kind string, offset int64, val string) error {
-	if s.metaW == nil {
-		return nil
-	}
-	line := fmt.Sprintf("%s\t%d\t%s\n", kind, offset, val)
-	if _, err := s.metaW.WriteString(line); err != nil {
-		return err
-	}
-	return s.metaW.Flush()
 }
 
 // removeViewer 从集合移除一个 viewer。
@@ -479,31 +450,53 @@ func setSubreaper() error {
 	return nil
 }
 
-// reapTree 以 base（Shell）为根回收整棵后代进程树：先对 Shell 进程组 TERM
-// （快速路径），再对树中脱离了进程组的作业逐个 TERM，宽限后 KILL，最后收割僵尸。
+const (
+	reapPoll      = 50 * time.Millisecond
+	reapAfterKill = 500 * time.Millisecond
+)
+
+// Shell 退出时，过继的作业归 worker。进程组是快速路径，worker 后代才是回收范围。
 func reapTree(base int) {
-	kill := func(pids []int, sig syscall.Signal) {
-		for _, p := range pids {
-			_ = syscall.Kill(p, sig)
+	root := os.Getpid()
+	signalTree := func(sig syscall.Signal) {
+		tree := descendants(root)
+		// Shell 可能已被回收，仅在会话后代仍属于原进程组时给该组发信号。
+		for _, pid := range tree {
+			if group, err := syscall.Getpgid(pid); err == nil && group == base {
+				_ = syscall.Kill(-base, sig)
+				break
+			}
+		}
+		for _, pid := range tree {
+			_ = syscall.Kill(pid, sig)
 		}
 	}
-	tree := descendants(base)
-	// 快速路径：Shell 进程组整组 TERM
-	_ = syscall.Kill(-base, syscall.SIGTERM)
-	// 树路径：脱离进程组的后台作业
-	kill(tree, syscall.SIGTERM)
-	time.Sleep(killGrace)
-	tree = descendants(base)
-	_ = syscall.Kill(-base, syscall.SIGKILL)
-	kill(tree, syscall.SIGKILL)
-	// 收割僵尸（worker 是 subreaper，这些孩子归它）
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		var ws syscall.WaitStatus
-		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
-		if pid <= 0 || err != nil {
-			break
+	wait := func(deadline time.Time, killing bool) bool {
+		for time.Now().Before(deadline) {
+			pid, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
+			switch {
+			case errors.Is(err, syscall.ECHILD):
+				return true
+			case errors.Is(err, syscall.EINTR), pid > 0:
+				continue
+			case err != nil:
+				log.Printf("回收会话子进程失败: %v", err)
+			case killing:
+				// 继续覆盖等待期间过继到 worker 的后代。
+				signalTree(syscall.SIGKILL)
+			}
+			time.Sleep(reapPoll)
 		}
+		return false
+	}
+
+	signalTree(syscall.SIGTERM)
+	if wait(time.Now().Add(killGrace), false) {
+		return
+	}
+	signalTree(syscall.SIGKILL)
+	if !wait(time.Now().Add(reapAfterKill), true) {
+		log.Printf("会话子进程未能在 SIGKILL 后 %v 内全部回收", reapAfterKill)
 	}
 }
 

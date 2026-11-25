@@ -30,11 +30,12 @@ const (
 	wsChunk     = 64 << 10
 	// 每个 viewer 的实时流队列：槽数只是碎块突发的余量，背压按字节计——PTY 的一批可能只有
 	// 几十字节（Shell 回显长行时逐段重绘），按块计会把几 KB 的积压误判成慢消费者。
-	queueChunks = 1024
-	queueBytes  = 8 << 20
-	spawnWait   = 5 * time.Second // 等待 worker 就绪（socket 可探测）
-	frameBudget = 2 * time.Second // 单帧写入的兜底超时：任何慢消费者都不能钉住写锁
-	killGrace   = 3 * time.Second // 关闭回收的 TERM 宽限
+	queueChunks     = 1024
+	queueBytes      = 8 << 20
+	spawnWait       = 5 * time.Second // 等待 worker 就绪（socket 可探测）
+	frameBudget     = 2 * time.Second // 单帧写入的兜底超时：任何慢消费者都不能钉住写锁
+	killGrace       = 3 * time.Second // 关闭回收的 TERM 宽限
+	exitWriteBudget = time.Second     // 向 viewer 发送会话结束通知
 	// 心跳（spec 005）：Cloudflare 在双向无数据 100s 后关闭 WebSocket，20s 周期留 5 倍余量；
 	// 60s 即容忍连续 3 个周期听不到对端。
 	pingInterval = 20 * time.Second

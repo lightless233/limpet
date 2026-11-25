@@ -28,7 +28,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 	}
 	// 子进程收割者：Shell 死后脱离进程组的后台作业收养到 worker，显式关闭时按树回收。
 	if err := setSubreaper(); err != nil {
-		log.Printf("setSubreaper 失败（回收将只覆盖进程组）: %v", err)
+		log.Printf("setSubreaper 失败（已孤儿化的任务可能无法回收）: %v", err)
 	}
 	if err := os.MkdirAll(paths.socketDir, 0o700); err != nil {
 		return err
@@ -46,7 +46,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 	_ = os.Remove(sockPath) // 同名 socket 残留只可能是 stale（worker 只在新建时被 spawn）
 	l, err := net.Listen("unix", sockPath)
 	if err != nil {
-		s.finish("listen-failed")
+		s.shutdown()
 		return err
 	}
 	_ = os.Chmod(sockPath, 0o600)
@@ -56,7 +56,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 	signal.Notify(sig, syscall.SIGTERM)
 	go func() {
 		<-sig
-		s.shutdown("closed")
+		s.shutdown()
 	}()
 
 	log.Printf("worker %s 就绪 (pid %d, socket %s)", uuid, os.Getpid(), sockPath)
@@ -124,7 +124,7 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 			Op: "kill", OK: true, Proto: protocolVersion, UUID: s.id, PID: os.Getpid(),
 		}))
 		// 回收整棵会话进程树（subreaper），然后收尾退出（done 关闭 → 主函数清理）。
-		s.shutdown("closed")
+		s.shutdown()
 
 	case "attach":
 		// 多视图：每条连接独立成为 viewer，互不排斥（spec 004 修订一）。
@@ -250,18 +250,20 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 			s.viewersMu.Unlock()
 			v.dims = dims
 		case ftInput:
-			if s.ptmx == nil || len(payload) == 0 {
+			if len(payload) == 0 {
 				continue
 			}
-			// 尺寸跟随输入者（spec 004 修订二）：打字者的窗口尺寸成为网格尺寸。
-			// 每批输入至多一次调整；尺寸相同则跳过（无 resize 风暴）。
+			// 将尺寸晋升和该批输入一起串行化，查询应答也使用同一个写锁。
+			s.inputMu.Lock()
 			if v.dims.valid() {
-				curCols, curRows := s.currentDims()
-				if v.dims.Cols != curCols || v.dims.Rows != curRows {
-					s.resize(v.dims.Cols, v.dims.Rows)
-				}
+				s.resize(v.dims.Cols, v.dims.Rows)
 			}
-			_, _ = s.ptmx.Write(payload)
+			_, err := s.ptmx.Write(payload)
+			s.inputMu.Unlock()
+			if err != nil {
+				return
+			}
+
 		default:
 			// 未知帧忽略（加法演进的前向兼容）。
 		}
