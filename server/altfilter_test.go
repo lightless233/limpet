@@ -71,9 +71,9 @@ func TestAltFilter(t *testing.T) {
 			wantInAlt: false,
 		},
 		{
-			name:      "组合参数 1049;25 识别为切换",
+			name:      "组合参数 1049;25 保留光标模式",
 			batches:   []string{"p\x1b[?1049;25h在备用屏"},
-			wantPri:   "p",
+			wantPri:   "p\x1b[?25h",
 			ban:       []string{"在备用屏"},
 			wantInAlt: true,
 		},
