@@ -79,7 +79,7 @@ let cBuf = Buffer.alloc(0)
 let eof = false
 const t0 = Date.now()
 cRaw.on('connect', () => {
-  const hs = Buffer.from(JSON.stringify({ op: 'attach', proto: 2, uuid: id }))
+  const hs = Buffer.from(JSON.stringify({ op: 'attach', uuid: id }))
   const head = Buffer.alloc(5)
   head[0] = 0x10
   head.writeUInt32BE(hs.length, 1)

@@ -33,7 +33,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 	if err := os.MkdirAll(paths.socketDir, 0o700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(paths.histDir, 0o755); err != nil {
+	if err := os.MkdirAll(paths.histDir, 0o700); err != nil {
 		return err
 	}
 
@@ -83,30 +83,19 @@ func runWorker(uuid string, paths sessionPaths) error {
 // handleWorkerConn 处理一条到 worker 的连接：握手分流 probe / kill / attach。
 func (s *session) handleWorkerConn(fc *frameConn) {
 	defer fc.close()
-	log.Printf("[调试] conn 已接受")
 
 	t, payload, err := fc.readFrame()
 	if err != nil || t != ftHandshake {
-		log.Printf("[调试] 握手读取失败/类型异常: err=%v t=%v", err, t)
 		return
 	}
-	log.Printf("[调试] 握手已读: %s", payload[:min(len(payload), 90)])
 	var req handshakeReq
 	if err := jsonUnmarshal(payload, &req); err != nil {
-		return
-	}
-	// 版本协商：worker 对 ≤ 自身版本的请求向下兼容；超出则拒绝并自报版本。
-	if req.Proto > protocolVersion {
-		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: req.Op, OK: false, Proto: protocolVersion, UUID: s.id,
-			Reason: fmt.Sprintf("协议版本不兼容: 请求 %d，worker %d", req.Proto, protocolVersion),
-		}))
 		return
 	}
 	// 身份核对（spec 验收 18）：请求的 uuid 必须与 worker 自报一致。
 	if req.UUID != s.id {
 		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: req.Op, OK: false, Proto: protocolVersion, UUID: s.id,
+			Op: req.Op, OK: false, UUID: s.id,
 			Reason: fmt.Sprintf("uuid 不符: 请求 %q，worker %q", req.UUID, s.id),
 		}))
 		return
@@ -115,13 +104,13 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 	switch req.Op {
 	case "probe":
 		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: "probe", OK: true, Proto: protocolVersion, UUID: s.id,
+			Op: "probe", OK: true, UUID: s.id,
 			PID: os.Getpid(), Busy: s.attached(), Alive: true,
 		}))
 
 	case "kill":
 		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: "kill", OK: true, Proto: protocolVersion, UUID: s.id, PID: os.Getpid(),
+			Op: "kill", OK: true, UUID: s.id, PID: os.Getpid(),
 		}))
 		// 回收整棵会话进程树（subreaper），然后收尾退出（done 关闭 → 主函数清理）。
 		s.shutdown()
@@ -138,14 +127,20 @@ func (s *session) handleWorkerConn(fc *frameConn) {
 		}
 		v.cutOffset.Store(1 << 62) // 接近无穷大的安全初值（atomic.Int64 零值是 0）
 		s.viewersMu.Lock()
-		s.viewers[v] = viewerDims{}
+		s.viewers[v] = struct{}{}
 		s.viewersMu.Unlock()
-		log.Printf("[调试] attach ack 已写，进入 serveViewerConn")
-		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: "attach", OK: true, Proto: protocolVersion, UUID: s.id, PID: os.Getpid(),
-		}))
-		log.Printf("[调试] serveViewerConn 开始（重建+读循环）")
+		if err := fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
+			Op: "attach", OK: true, UUID: s.id, PID: os.Getpid(),
+		})); err != nil {
+			s.removeViewer(v)
+			return
+		}
 		s.serveViewerConn(fc, v)
+
+	default:
+		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
+			Op: req.Op, UUID: s.id, Reason: "未知 worker 操作",
+		}))
 	}
 }
 
@@ -188,24 +183,28 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 	// PTY 读取，会把队列顶满。
 	go func() {
 		defer fc.close()
-		// 丢弃通知尽力而为（300ms 预算；对端完全停读时写不进——EOF 兜底）。
-		// 浏览器路径的 4001 由 server 中继的 WS 写超时保证，与本帧无关。
-		drop := func(code int, reason string) {
-			if code != 0 {
-				_ = fc.writeFrameTimeout(ftDetach, mustJSON(detachMsg{Code: code, Reason: reason}), 300*time.Millisecond)
+		// 先尽力通知被丢弃的原因，再关闭 socket。
+		defer func() {
+			<-v.done
+			if v.dropCode != 0 {
+				_ = fc.writeFrameTimeout(ftDetach, mustJSON(detachMsg{Code: v.dropCode, Reason: v.dropReason}), 300*time.Millisecond)
 			}
-		}
+		}()
 		buf := make([]byte, 0, wsChunk)
 		take := func(c []byte) {
 			buf = append(buf, c...)
 			v.queued.Add(-int64(len(c)))
 		}
 		for {
+			select {
+			case <-v.done:
+				return
+			default:
+			}
 			var chunk []byte
 			select {
 			case chunk = <-v.queue:
 			case <-v.done:
-				drop(v.dropCode, v.dropReason)
 				return
 			}
 			buf = buf[:0]
@@ -219,11 +218,12 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 					break drain
 				}
 			}
+			if v.closed.Load() {
+				return
+			}
 			if err := fc.writeFrame(ftOutput, buf); err != nil {
-				// 写失败（含 2s 写超时 = server 端停止消费）：补发 DETACH(4001)——此时上一次写
-				// 已超时返回、锁已空闲。会话本身不受影响（PTY 读取与录制照常，spec 003 背压）。
-				v.closed.Store(true)
-				drop(4001, "too slow")
+				// 写失败只终止这条 viewer 连接。
+				v.closeWith(4001, "too slow")
 				return
 			}
 		}
@@ -236,19 +236,14 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 		}
 		switch t {
 		case ftResize:
-			// v2 语义：窗口尺寸申报，不触发 resize。
 			var rm resizeMsg
-			dims := viewerDims{Cols: rm.Cols, Rows: rm.Rows}
-			if err := jsonUnmarshal(payload, &rm); err == nil {
-				dims = viewerDims{Cols: rm.Cols, Rows: rm.Rows}
-			}
-			if !dims.valid() {
+			if jsonUnmarshal(payload, &rm) != nil {
 				continue
 			}
-			s.viewersMu.Lock()
-			s.viewers[v] = dims
-			s.viewersMu.Unlock()
-			v.dims = dims
+			dims := viewerDims{Cols: rm.Cols, Rows: rm.Rows}
+			if dims.valid() {
+				v.dims = dims
+			}
 		case ftInput:
 			if len(payload) == 0 {
 				continue

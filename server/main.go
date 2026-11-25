@@ -93,7 +93,7 @@ func main() {
 		mux.Handle("/", pages)
 	}
 
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: http.NewCrossOriginProtection().Handler(mux)}
 
 	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们继续运行）。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

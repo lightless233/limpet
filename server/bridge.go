@@ -4,142 +4,99 @@ package main
 //
 // 接入握手发生在 WS 升级之前（spec 003）：不存在 404、握手失败 500，都是 HTTP
 // 响应，连接不升级；**没有 409**——多视图下每条连接都成为独立 viewer。
-// server 按握手应答里 worker 自报的协议版本适配语义（spec 004 单元 2）：
-//   v2 worker：resize 帧 = 窗口尺寸申报（worker 内部做输入晋升）；
-//   v1 worker（升级窗口）：首帧 resize 触发其重建（合成），后续照发（旧语义）。
 
 import (
 	"context"
 	"errors"
 	"net"
 	"net/http"
-	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
-// wsConn 给 coder/websocket 加写入互斥与只关一次。
+// wsConn 只让一个中继协程发关闭帧，读写与关闭由 websocket.Conn 协调。
 type wsConn struct {
 	c          *websocket.Conn
-	mu         sync.Mutex
 	closed     atomic.Bool
-	resizeSeen atomic.Bool // 客户端是否已发过 resize（v1 worker 兜底定时器用）
-	slow       atomic.Bool // 对端消费得慢（WS 写曾长时间阻塞）——worker 断开时据此按「太慢」而不是「异常」报
+	lastSlowAt atomic.Int64
 }
 
-func (w *wsConn) write(ctx context.Context, typ websocket.MessageType, data []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.c.Write(ctx, typ, data)
-}
-
-// close 发关闭帧；之后的写入直接失败，读侧随之退出。
 func (w *wsConn) close(code websocket.StatusCode, reason string) {
-	if !w.closed.CompareAndSwap(false, true) {
-		return
+	if w.closed.CompareAndSwap(false, true) {
+		_ = w.c.Close(code, reason)
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	_ = w.c.Close(code, reason)
 }
 
-// probeWorker 探测一台 worker：拨号 → 握手 → 断开。不占任何位。
-// 版本适配：先以 server 支持的最高版本握手；worker 自报更低版本且拒绝时，
-// 以 worker 版本重试一次（升级窗口内的旧 worker）。
-func probeWorker(path string, uuid string) (handshakeAck, int, error) {
-	return workerOp(path, uuid, "probe", 2*time.Second, nil)
+// probeWorker 探测一台 worker，不占 viewer。
+func probeWorker(path, uuid string) (handshakeAck, error) {
+	return workerOp(path, uuid, "probe", 2*time.Second)
 }
 
-// killWorker 令 worker 回收会话并退出。返回前不等待回收完成（worker 回复 ok 后
-// 自行按树 TERM → 兜底 KILL、移除 socket、退出）。
-func killWorker(path string, uuid string) (handshakeAck, int, error) {
-	return workerOp(path, uuid, "kill", 5*time.Second, nil)
+// killWorker 请求回收会话，worker 应答后自行回收与清理 socket。
+func killWorker(path, uuid string) (handshakeAck, error) {
+	return workerOp(path, uuid, "kill", 5*time.Second)
 }
 
-// attachWorker 在 worker 上登记一个 viewer（多视图：不做独占判定）。
-func attachWorker(path string, uuid string, proto int) (*frameConn, handshakeAck, int, error) {
+// attachWorker 建立 viewer 连接，握手完成之后才开始中继。
+func attachWorker(path, uuid string) (*frameConn, handshakeAck, error) {
+	return openWorker(path, uuid, "attach", 2*time.Second)
+}
+
+func workerOp(path, uuid, op string, readBudget time.Duration) (handshakeAck, error) {
+	fc, ack, err := openWorker(path, uuid, op, readBudget)
+	if err == nil {
+		_ = fc.close()
+	}
+	return ack, err
+}
+
+func openWorker(path, uuid, op string, readBudget time.Duration) (_ *frameConn, ack handshakeAck, err error) {
 	conn, err := net.DialTimeout("unix", path, 2*time.Second)
 	if err != nil {
-		return nil, handshakeAck{}, 0, err
+		return nil, ack, err
 	}
-	fc := newFrameConn(conn)
-	_ = fc.writeFrame(ftHandshake, mustJSON(handshakeReq{Op: "attach", Proto: proto, UUID: uuid}))
-	t, payload, err := fc.readFrame()
-	if err != nil {
-		fc.close()
-		return nil, handshakeAck{}, 0, err
-	}
-	if t != ftHandshakeAck {
-		fc.close()
-		return nil, handshakeAck{}, 0, errors.New("握手应答类型异常")
-	}
-	var ack handshakeAck
-	if err := jsonUnmarshal(payload, &ack); err != nil {
-		fc.close()
-		return nil, handshakeAck{}, 0, err
-	}
-	return fc, ack, ack.Proto, nil
-}
-
-// workerOp 通用操作（probe/kill）：带版本回退（server 最高版本 → worker 自报版本）。
-func workerOp(path string, uuid string, op string, readBudget time.Duration, _ any) (handshakeAck, int, error) {
-	conn, err := net.DialTimeout("unix", path, 2*time.Second)
-	if err != nil {
-		return handshakeAck{}, 0, err
-	}
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(readBudget))
-	fc := newFrameConn(conn)
-	_ = fc.writeFrame(ftHandshake, mustJSON(handshakeReq{Op: op, Proto: protocolVersion, UUID: uuid}))
-	t, payload, err := fc.readFrame()
-	if err != nil {
-		return handshakeAck{}, 0, err
-	}
-	if t != ftHandshakeAck {
-		return handshakeAck{}, 0, errors.New("握手应答类型异常")
-	}
-	var ack handshakeAck
-	if err := jsonUnmarshal(payload, &ack); err != nil {
-		return handshakeAck{}, 0, err
-	}
-	if ack.OK {
-		return ack, protocolVersion, nil
-	}
-	// 版本不符：以 worker 自报版本重试一次（旧 worker）。
-	if ack.Proto > 0 && ack.Proto != protocolVersion {
-		_ = conn.SetReadDeadline(time.Now().Add(readBudget))
-		_ = fc.writeFrame(ftHandshake, mustJSON(handshakeReq{Op: op, Proto: ack.Proto, UUID: uuid}))
-		t, payload, err = fc.readFrame()
+	defer func() {
 		if err != nil {
-			return handshakeAck{}, 0, err
+			_ = conn.Close()
 		}
-		if t != ftHandshakeAck {
-			return handshakeAck{}, 0, errors.New("握手应答类型异常")
-		}
-		if err := jsonUnmarshal(payload, &ack); err != nil {
-			return handshakeAck{}, 0, err
-		}
-		return ack, ack.Proto, nil
+	}()
+
+	fc := newFrameConn(conn)
+	if err := fc.writeFrame(ftHandshake, mustJSON(handshakeReq{Op: op, UUID: uuid})); err != nil {
+		return nil, ack, err
 	}
-	return ack, protocolVersion, nil
+	if err := conn.SetReadDeadline(time.Now().Add(readBudget)); err != nil {
+		return nil, ack, err
+	}
+	t, payload, err := fc.readFrame()
+	if err != nil {
+		return nil, ack, err
+	}
+	if t != ftHandshakeAck {
+		return nil, ack, errors.New("握手应答类型异常")
+	}
+	if err := jsonUnmarshal(payload, &ack); err != nil {
+		return nil, ack, err
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, ack, err
+	}
+	return fc, ack, nil
 }
 
 // handleWS GET /api/ws/term/{id}。多视图：不做独占判定（spec 004 修订一）。
 func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	m.mu.Lock()
-	h := m.byIDLocked(id)
-	m.mu.Unlock()
+	h := m.get(id)
 	if h == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
 		return
 	}
 
-	// 与 worker 握手（成为 viewer）——成功之后才升级 WS。版本适配见单元 2。
-	fc, ack, workerProto, err := attachWorker(h.socketPath, id, protocolVersion)
+	// 与 worker 握手成功后才升级 WS。
+	fc, ack, err := attachWorker(h.socketPath, id)
 	if err != nil {
 		if staleSocket(err) {
 			m.dropStale(id, h)
@@ -147,6 +104,11 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "worker 握手失败"})
 		}
+		return
+	}
+	defer fc.close()
+	if ack.Op != "attach" || ack.UUID != id {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "worker 握手操作或身份与请求不符"})
 		return
 	}
 	if !ack.OK {
@@ -157,34 +119,18 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": reason})
 		return
 	}
-	if ack.UUID != id {
-		// 身份不符（spec 验收 18）：不删除、不终止，如实报错。
-		fc.close()
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "worker 身份与请求不符"})
-		return
-	}
 
-	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// 开发期经 vite 代理接入，Origin 与 Host 不一致是常态；单用户工具，跳过校验。
-		InsecureSkipVerify: true,
-	})
-	if err != nil { // Accept 已自行写 HTTP 错误响应；关闭 socket，worker 侧自动摘除 viewer
-		fc.close()
-		return
+	ws, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return // Accept 已写 HTTP 错误响应。
 	}
 	ws.SetReadLimit(wsReadLimit)
 	ww := &wsConn{c: ws}
 
-	relay(ww, fc, workerProto, r)
+	relay(ww, fc)
 }
 
-// relay 把 WS 与 worker socket 双向中继。server 不解释内容，只按 worker 协议
-// 版本做必要的适配：
-//
-//	v2 worker：WS resize → 窗口申报帧（worker 内部做输入晋升）；接入即重建，
-//	           ready 在 attach 后立即到达。
-//	v1 worker（升级窗口）：客户端 2.5s 内未发 resize 时，以 query 兜底尺寸合成
-//	           一帧 resize 触发其重建（旧时序）。
+// relay 把 WS 与 worker socket 双向中继，resize 作为窗口申报转发。
 //
 // socket → WS：OUTPUT → 二进制帧；READY → 文本帧 `{"type":"ready"}`；EXIT →
 // 关闭码 1000；DETACH → 关闭码取载荷（4001=慢消费者）。
@@ -192,10 +138,11 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 //
 // 心跳（spec 005）：每 pingInterval 发文本帧 `{"type":"ping"}`；连续 pingTimeout 没有收到
 // 对端的任何消息（pong、输入、尺寸申报都算）→ 关闭码 4002。ping/pong 在此终结，不进 worker。
-func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
+func relay(w *wsConn, fc *frameConn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// 任一侧退出都必须关掉 socket（独占位时代的老坑：不关会悬挂状态）。
+	defer w.c.CloseNow()
+	// 任一侧退出都必须关掉 worker socket。
 	defer fc.close()
 	go func() {
 		<-ctx.Done()
@@ -208,9 +155,9 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 		started := time.Now()
 		c2, cl := context.WithTimeout(ctx, 5*time.Second)
 		defer cl()
-		err := w.write(c2, typ, data)
+		err := w.c.Write(c2, typ, data)
 		if err == nil && time.Since(started) >= slowWrite {
-			w.slow.Store(true)
+			w.lastSlowAt.Store(time.Now().UnixNano())
 		}
 		return err
 	}
@@ -238,8 +185,6 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 					ctl.Cols < 2 || ctl.Cols > 500 || ctl.Rows < 2 || ctl.Rows > 200 {
 					continue
 				}
-				// 语义按 worker 版本由 worker 解释（v2=申报 / v1=尺寸变更），server 只转发。
-				w.resizeSeen.Store(true)
 				if err := fc.writeFrame(ftResize, mustJSON(resizeMsg{Cols: ctl.Cols, Rows: ctl.Rows})); err != nil {
 					return
 				}
@@ -256,6 +201,7 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 	// 心跳：保活 + 判对端失联。无声死亡的连接（手机锁屏/切网）靠它收敛，
 	// 不必等输出积压或 TCP 超时才发现。
 	go func() {
+		defer cancel()
 		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {
@@ -265,38 +211,18 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 			case <-ticker.C:
 				if time.Since(time.Unix(0, lastHeard.Load())) >= pingTimeout {
 					w.close(websocket.StatusCode(4002), "heartbeat timeout")
-					cancel()
 					return
 				}
 				if err := writeWS(websocket.MessageText, []byte(`{"type":"ping"}`)); err != nil {
-					// 与输出写超时同样处理：对端停止消费 → 4001；其余原因连接已死，读侧会退出。
+					// 对端停止消费时尽量发送 4001。任何写失败都结束中继。
 					if errors.Is(err, context.DeadlineExceeded) {
 						w.close(websocket.StatusCode(4001), "too slow")
-						cancel()
 					}
 					return
 				}
 			}
 		}
 	}()
-
-	// v1 worker 的兜底：客户端迟迟不发 resize（query 有值时）→ 合成一帧。
-	if workerProto == 1 {
-		go func() {
-			time.Sleep(2500 * time.Millisecond)
-			if w.resizeSeen.Load() {
-				return
-			}
-			cols, rows := uint16(gridCols), uint16(gridRows)
-			if v, err := strconv.ParseUint(r.URL.Query().Get("cols"), 10, 16); err == nil && v >= 2 && v <= 500 {
-				cols = uint16(v)
-			}
-			if v, err := strconv.ParseUint(r.URL.Query().Get("rows"), 10, 16); err == nil && v >= 2 && v <= 200 {
-				rows = uint16(v)
-			}
-			_ = fc.writeFrame(ftResize, mustJSON(resizeMsg{Cols: cols, Rows: rows}))
-		}()
-	}
 
 	// socket 读侧（主循环）：把 worker 的帧翻译成 WS 侧动作。
 	for {
@@ -305,7 +231,7 @@ func relay(w *wsConn, fc *frameConn, workerProto int, r *http.Request) {
 			// worker 连接断开：有 EXIT 帧在先的已按 1000 处理。对端一直在慢慢消费时，
 			// 这是 worker 丢弃了慢 viewer——它的 DETACH 送不到（此刻正阻塞写给对端）→ 4001；
 			// 其余情况才是异常断开（worker 崩溃/被杀）→ 1011。
-			if w.slow.Load() {
+			if last := w.lastSlowAt.Load(); last != 0 && time.Since(time.Unix(0, last)) <= slowWriteWindow {
 				w.close(websocket.StatusCode(4001), "too slow")
 			} else {
 				w.close(websocket.StatusCode(1011), "worker connection lost")

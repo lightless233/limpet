@@ -4,10 +4,7 @@ package main
 //
 // 帧格式：[type:1][len:4 BE][payload]。握手帧是连接上的第一帧，双方各发一帧。
 //
-// 版本（spec 004）：protocolVersion 是 server/新 worker 使用的版本（2）。
-// ftResize 在 v2 中语义为「窗口尺寸申报」——不直接触发 resize；网格尺寸跟随
-// 输入者（输入批次触发晋升）。server 按握手应答里 worker 自报的版本适配：
-// 对 v1 旧 worker 维持旧语义（首帧 resize 触发其重建、申报照发即尺寸变更）。
+// ftResize 只申报窗口尺寸，实际调整由输入触发（spec 004）。
 
 import (
 	"encoding/binary"
@@ -20,10 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-// protocolVersion 是 server 与新 worker 使用的协议版本。worker 握手对 ≤ 本版本
-// 的请求向下兼容；旧 worker 只认自己的版本，由 server 端回退适配。
-const protocolVersion = 2
 
 const (
 	wsReadLimit = 1 << 20 // 大粘贴兜底；前端按 64KiB 主动切块
@@ -38,9 +31,10 @@ const (
 	exitWriteBudget = time.Second     // 向 viewer 发送会话结束通知
 	// 心跳（spec 005）：Cloudflare 在双向无数据 100s 后关闭 WebSocket，20s 周期留 5 倍余量；
 	// 60s 即容忍连续 3 个周期听不到对端。
-	pingInterval = 20 * time.Second
-	slowWrite    = 2 * time.Second // 单次 WS 写阻塞达到这个时长即记为「对端消费得慢」
-	pingTimeout  = 60 * time.Second
+	pingInterval    = 20 * time.Second
+	slowWrite       = 2 * time.Second  // 达到此时长的成功 WS 写入标记为慢写
+	slowWriteWindow = 15 * time.Second // 仅用近期慢写推断 worker 断开原因
+	pingTimeout     = 60 * time.Second
 )
 
 // jsonUnmarshal 语义化包装，统一错误来源。
@@ -51,7 +45,7 @@ type frameType byte
 const (
 	ftOutput       frameType = 0x01 // PTY 输出字节（worker → server）
 	ftInput        frameType = 0x02 // 终端输入字节（server → worker）
-	ftResize       frameType = 0x03 // v2：窗口尺寸申报（server → worker）；v1：尺寸变更
+	ftResize       frameType = 0x03 // 窗口尺寸申报（server → worker）
 	ftExit         frameType = 0x04 // 会话结束通知（worker → server）
 	ftReady        frameType = 0x05 // 重建完成、实时流开始（worker → server）
 	ftDetach       frameType = 0x06 // 消费者被丢弃（慢），带 WS 关闭码（worker → server）
@@ -61,17 +55,14 @@ const (
 
 // handshakeReq 是连接首帧。op：probe（探测，不占位）/ attach（成为 viewer）/ kill（回收会话）。
 type handshakeReq struct {
-	Op    string `json:"op"`
-	Proto int    `json:"proto"`
-	UUID  string `json:"uuid"`
+	Op   string `json:"op"`
+	UUID string `json:"uuid"`
 }
 
-// handshakeAck 是握手应答。UUID/PID 用于 server 核对身份（worker 自报 uuid 必须与
-// socket 文件名一致，spec 验收 18）；Busy 表示存在接入中的 viewer。
+// handshakeAck 自报操作与 UUID，Busy 表示存在接入中的 viewer。
 type handshakeAck struct {
 	Op     string `json:"op"`
 	OK     bool   `json:"ok"`
-	Proto  int    `json:"proto"`
 	UUID   string `json:"uuid"`
 	PID    int    `json:"pid"`
 	Busy   bool   `json:"busy"`
@@ -79,7 +70,7 @@ type handshakeAck struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// resizeMsg 是 ftResize 的载荷。v2 语义：窗口尺寸申报。
+// resizeMsg 是 ftResize 的窗口尺寸申报。
 type resizeMsg struct {
 	Cols uint16 `json:"cols"`
 	Rows uint16 `json:"rows"`

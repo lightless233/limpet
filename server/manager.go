@@ -45,7 +45,6 @@ type workerHandle struct {
 	createdAt  time.Time
 	socketPath string
 	logPath    string
-	proto      int // worker 自报的协议版本（升级窗口内可能是 1）
 	attached   bool
 }
 
@@ -124,15 +123,26 @@ func (m *manager) loadRegistry() error {
 // saveRegistry 原子写（tmp + rename），调用方持 m.mu。注册表单写者是 server。
 func (m *manager) saveRegistry() {
 	b, err := json.MarshalIndent(m.registry, "", "  ")
-	tmp := m.regPath + ".tmp"
-	if err == nil {
-		err = os.WriteFile(tmp, b, 0o644)
-	}
-	if err == nil {
-		err = os.Rename(tmp, m.regPath)
-	}
+	defer func() {
+		if err != nil {
+			log.Printf("保存会话注册表 %s 失败: %v", m.regPath, err)
+		}
+	}()
 	if err != nil {
-		log.Printf("保存会话注册表 %s 失败: %v", m.regPath, err)
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(m.regPath), ".sessions-*.tmp")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name())
+	_, err = tmp.Write(b)
+	closeErr := tmp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), m.regPath)
 	}
 }
 
@@ -160,7 +170,7 @@ func (m *manager) recoverWorkers() {
 			continue
 		}
 		path := filepath.Join(m.workersDir, name)
-		ack, proto, err := probeWorker(path, uuid)
+		ack, err := probeWorker(path, uuid)
 		if staleSocket(err) {
 			_ = os.Remove(path)
 			continue
@@ -189,11 +199,11 @@ func (m *manager) recoverWorkers() {
 		h := &workerHandle{
 			uuid: uuid, name: nm, createdAt: created,
 			socketPath: path, logPath: filepath.Join(m.workersDir, uuid+".log"),
-			proto: proto, attached: ack.Busy,
+			attached: ack.Busy,
 		}
 		m.sessions[uuid] = h
 		if err == nil {
-			log.Printf("[recover] 会话恢复: %s（%s，pid %d，协议 v%d）", uuid, nm, ack.PID, proto)
+			log.Printf("[recover] 会话恢复: %s（%s，pid %d）", uuid, nm, ack.PID)
 		}
 	}
 	// 注册表里已无 socket 的会话，记下首次观察到的结束时间。
@@ -218,8 +228,6 @@ func (m *manager) nameTakenLocked(name, exceptID string) bool {
 	}
 	return false
 }
-
-func (m *manager) byIDLocked(id string) *workerHandle { return m.sessions[id] }
 
 func (m *manager) get(id string) *workerHandle {
 	m.mu.Lock()
@@ -258,7 +266,6 @@ func (m *manager) create(name string) (*workerHandle, error) {
 	}
 
 	// 等就绪：socket 可探测且自报 uuid 一致（间隔 50ms，上限 spawnWait）。
-	workerProto := protocolVersion
 	deadline := time.Now().Add(spawnWait)
 	for {
 		if time.Now().After(deadline) {
@@ -267,16 +274,15 @@ func (m *manager) create(name string) (*workerHandle, error) {
 			return nil, fmt.Errorf("worker %s 未在 %v 内就绪", id, spawnWait)
 		}
 		time.Sleep(50 * time.Millisecond)
-		a, proto, err := probeWorker(sockPath, id)
-		if err == nil && a.OK && a.UUID == id && a.Op == "probe" {
-			workerProto = proto
+		ack, err := probeWorker(sockPath, id)
+		if err == nil && ack.OK && ack.UUID == id && ack.Op == "probe" {
 			break
 		}
 	}
 
 	h := &workerHandle{
 		uuid: id, name: name, createdAt: time.Now(),
-		socketPath: sockPath, logPath: logPath, proto: workerProto,
+		socketPath: sockPath, logPath: logPath,
 	}
 	m.mu.Lock()
 	m.sessions[id] = h
@@ -301,7 +307,7 @@ func (m *manager) closeSession(id string) error {
 		return errNotFound
 	}
 
-	ack, _, err := killWorker(h.socketPath, id)
+	ack, err := killWorker(h.socketPath, id)
 	if err != nil {
 		if staleSocket(err) {
 			m.dropStale(id, h)
@@ -373,7 +379,7 @@ func (m *manager) list() []map[string]any {
 	out := make([]map[string]any, 0, len(workers))
 	for _, worker := range workers {
 		h, state := worker.handle, worker.state
-		ack, proto, err := probeWorker(state.socketPath, state.uuid)
+		ack, err := probeWorker(state.socketPath, state.uuid)
 		if staleSocket(err) {
 			m.dropStale(state.uuid, h)
 			continue
@@ -384,13 +390,13 @@ func (m *manager) list() []map[string]any {
 			continue
 		}
 		if err == nil && ack.OK && ack.UUID == state.uuid && ack.Op == "probe" {
-			h.proto, h.attached = proto, ack.Busy
+			h.attached = ack.Busy
 		}
-		attached := h.attached
+		name, attached := h.name, h.attached
 		m.mu.Unlock()
 		out = append(out, map[string]any{
 			"id":       state.uuid,
-			"name":     state.name,
+			"name":     name,
 			"created":  state.createdAt.Format(time.RFC3339),
 			"attached": attached,
 		})

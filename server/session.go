@@ -84,7 +84,7 @@ type session struct {
 	fedBytes atomic.Int64 // 已喂入真实网格的字节数（读循环在网格临界区内维护）
 
 	viewersMu sync.Mutex
-	viewers   map[*viewer]viewerDims // 全部接入中的 viewer 及其申报尺寸
+	viewers   map[*viewer]struct{} // 全部接入中的 viewer
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -97,16 +97,16 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		id:         id,
 		createdAt:  time.Now(),
 		queryQueue: make(chan []byte, queryQueueSize),
-		viewers:    map[*viewer]viewerDims{},
+		viewers:    map[*viewer]struct{}{},
 		done:       make(chan struct{}),
 	}
 	s.curCols, s.curRows = gridCols, gridRows
 
-	lf, err := os.OpenFile(filepath.Join(paths.histDir, id+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	lf, err := os.OpenFile(filepath.Join(paths.histDir, id+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	mf, err := os.OpenFile(filepath.Join(paths.histDir, id+".meta"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	mf, err := os.OpenFile(filepath.Join(paths.histDir, id+".meta"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		lf.Close()
 		return nil, err
@@ -120,7 +120,7 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 	}()
 
 	// 网格。写回回调：查询应答路由（spec 003/004）——多视图下程序查询随字节流
-	// 到达所有 viewer，v1 已知限制是应答可能重复；worker 只在「没有任何 viewer
+	// 到达所有 viewer，可能收到重复应答；worker 只在「没有任何 viewer
 	// 持有实时流」时代答（全离线，程序不因无人接入而卡等）。
 	s.grid, err = libghostty.NewTerminal(
 		libghostty.WithSize(gridCols, gridRows),
@@ -490,6 +490,7 @@ func reapTree(base int) {
 		return false
 	}
 
+	_ = syscall.Kill(base, syscall.SIGHUP) // 交互式 Shell 可能忽略 TERM。
 	signalTree(syscall.SIGTERM)
 	if wait(time.Now().Add(killGrace), false) {
 		return
