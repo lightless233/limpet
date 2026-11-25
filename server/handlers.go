@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 // writeJSON 统一的 JSON 响应。
@@ -18,7 +19,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // nameValid 会话名（显示名）校验。规则沿用 001：非空、≤100 字符（UTF-8 计）、
 // 禁 `:` `.` 与控制字符——tmux 的技术限制已消失，规则作为产品选择保留（spec 003）。
 func nameValid(name string) bool {
-	if name == "" || len(name) > 100 {
+	if name == "" || utf8.RuneCountInString(name) > 100 {
 		return false
 	}
 	if strings.ContainsAny(name, ":.") {
@@ -33,8 +34,9 @@ func nameValid(name string) bool {
 }
 
 // readBody 读取请求体（上限 4KiB，名称场景绰绰有余）。
-func readBody(r *http.Request) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r.Body, 4096))
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	const maxBody = 4096
+	return io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 }
 
 // handleCreate POST /api/term。创建即启动 Shell（80×24）并开始录制，worker 就绪后
@@ -43,7 +45,12 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
 	}
-	if b, err := readBody(r); err == nil && len(b) > 0 {
+	b, err := readBody(w, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "读取请求体失败"})
+		return
+	}
+	if len(b) > 0 {
 		if err := json.Unmarshal(b, &body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
 			return
@@ -75,8 +82,12 @@ func (m *manager) handleList(w http.ResponseWriter, r *http.Request) {
 // handleClose POST /api/term/{id}/close。worker 回收整棵会话进程树
 // （前台任务 + 后台作业，验收 6），列表移除、endedAt 登记。
 func (m *manager) handleClose(w http.ResponseWriter, r *http.Request) {
-	if !m.closeSession(r.PathValue("id")) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+	if err := m.closeSession(r.PathValue("id")); err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
@@ -89,7 +100,12 @@ func (m *manager) handleRename(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
 	}
-	if b, err := readBody(r); err == nil && len(b) > 0 {
+	b, err := readBody(w, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "读取请求体失败"})
+		return
+	}
+	if len(b) > 0 {
 		if err := json.Unmarshal(b, &body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
 			return
@@ -101,29 +117,12 @@ func (m *manager) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m.mu.Lock()
-	h := m.byIDLocked(id)
-	if h == nil {
-		m.mu.Unlock()
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
-		return
-	}
-	if name == h.name {
-		m.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]string{"id": id})
-		return
-	}
-	for _, other := range m.sessions {
-		if other.uuid != id && other.name == name {
-			m.mu.Unlock()
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "同名会话已存在"})
-			return
+	if err := m.renameSession(id, name); err != nil {
+		status := http.StatusConflict
+		if errors.Is(err, errNotFound) {
+			status = http.StatusNotFound
 		}
-	}
-	m.mu.Unlock()
-
-	if !m.renameSession(id, name) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})

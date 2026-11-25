@@ -141,9 +141,12 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 	// 与 worker 握手（成为 viewer）——成功之后才升级 WS。版本适配见单元 2。
 	fc, ack, workerProto, err := attachWorker(h.socketPath, id, protocolVersion)
 	if err != nil {
-		// socket 拨不通：worker 已死（stale），清理并按不存在处理。
-		m.dropStale(id, h)
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+		if staleSocket(err) {
+			m.dropStale(id, h)
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "worker 握手失败"})
+		}
 		return
 	}
 	if !ack.OK {
