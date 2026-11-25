@@ -47,7 +47,7 @@ echo "→ 生成单元文件"
 # WSL 会话基线：systemd 不继承 WSL 会话环境，而缺 UTF-8 locale 时会话里的中文会出错。
 lang=${LANG:-C.UTF-8}
 # Windows 目录取自当前 PATH（安装时的快照，去重、保持顺序）；装了新的 Windows 工具后重新执行本脚本即可。
-win_path=$(printf '%s\n' "$PATH" | tr ':' '\n' | grep -E '^/mnt/[a-zA-Z]/' | awk '!seen[$0]++' | paste -sd: -)
+win_path=$(printf '%s\n' "$PATH" | tr ':' '\n' | grep -E '^/mnt/[a-zA-Z]/' | awk '!seen[$0]++' | paste -sd: - | sed 's/%/%%/g')
 {
   cat <<UNIT
 # 由 deploy/install.sh 生成（spec 005）。要改配置请改仓库里的脚本，然后重新执行安装。
@@ -71,7 +71,7 @@ Environment=DISPLAY=:0
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=PULSE_SERVER=unix:/mnt/wslg/PulseServer
 # 基础 PATH：系统目录在前、Windows 目录在后（与 WSL 的默认顺序一致）；Windows 目录是安装时的快照。
-Environment="PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$win_path"
+Environment="PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${win_path:+:$win_path}"
 Restart=on-failure
 RestartSec=2
 

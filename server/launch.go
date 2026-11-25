@@ -61,15 +61,16 @@ func ownServiceUnit() string {
 	if err != nil {
 		return ""
 	}
-	// cgroup v2：单行 "0::/user.slice/…/limpet-server.service"。
-	_, path, ok := strings.Cut(strings.TrimSpace(string(b)), ":")
-	if !ok {
-		return ""
-	}
-	path = strings.TrimSpace(path)
-	last := path[strings.LastIndex(path, "/")+1:]
-	if strings.HasSuffix(last, ".service") {
-		return last
+	for _, line := range strings.Split(string(b), "\n") {
+		path, ok := strings.CutPrefix(line, "0::")
+		if !ok {
+			continue
+		}
+		unit := path[strings.LastIndex(path, "/")+1:]
+		if strings.HasSuffix(unit, ".service") {
+			return unit
+		}
+		break
 	}
 	return ""
 }
@@ -90,10 +91,9 @@ func spawnWorkerDirect(exe, id, logPath string) (killHard func(), err error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	// server 从不 Wait 这个子进程：worker 退出后会在 server 的进程表里留一个僵尸条目。
-	// 只影响前台开发方式；服务方式下 worker 的父进程是 systemd。
-	pid := cmd.Process.Pid
-	return func() { _ = syscall.Kill(pid, syscall.SIGKILL) }, nil
+	process := cmd.Process
+	go func() { _ = cmd.Wait() }()
+	return func() { _ = process.Kill() }, nil
 }
 
 // spawnWorkerSystemdRun 让 systemd 在独立的临时单元里启动 worker。systemd-run 不继承调用方的
