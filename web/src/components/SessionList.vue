@@ -17,6 +17,9 @@ const sessions = ref<SessionItem[]>([])
 const loading = ref(true)
 const loadError = ref('')
 const busy = ref(false)
+const closing = ref(new Set<string>())
+const authExpired = ref(false)
+let refreshVersion = 0
 
 // 底部弹层：null = 关闭
 type Sheet = null | { mode: 'create'; name: string } | { mode: 'rename'; id: string; name: string }
@@ -28,17 +31,33 @@ watch(sheet, (v) => {
   if (v) nextTick(() => nameInput.value?.focus())
 })
 
+async function sessionRequest(url: string, init?: RequestInit) {
+  const res = await fetch(url, { ...init, redirect: 'manual' })
+  if (res.type === 'opaqueredirect') {
+    authExpired.value = true
+    return
+  }
+  return res
+}
+
+function reloadPage() {
+  location.reload()
+}
+
 async function refresh() {
+  const version = ++refreshVersion
   loading.value = true
   loadError.value = ''
   try {
-    const res = await fetch('/api/term')
+    const res = await sessionRequest('/api/term')
+    if (!res) return
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    sessions.value = await res.json()
+    const list: SessionItem[] = await res.json()
+    if (version === refreshVersion) sessions.value = list
   } catch (e) {
-    loadError.value = e instanceof Error ? e.message : String(e)
+    if (version === refreshVersion) loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
-    loading.value = false
+    if (version === refreshVersion) loading.value = false
   }
 }
 
@@ -46,17 +65,17 @@ onMounted(refresh)
 
 async function submitSheet() {
   const s = sheet.value
-  if (!s || busy.value) return
+  if (!s || busy.value || authExpired.value) return
   busy.value = true
   sheetError.value = ''
   try {
     const url = s.mode === 'create' ? '/api/term' : `/api/term/${encodeURIComponent(s.id)}/rename`
-    const body = s.mode === 'create' ? { name: s.name.trim() } : { name: s.name.trim() }
-    const res = await fetch(url, {
+    const res = await sessionRequest(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ name: s.name.trim() }),
     })
+    if (!res) return
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       throw new Error(data.error ?? `HTTP ${res.status}`)
@@ -73,17 +92,23 @@ async function submitSheet() {
 const closeError = ref('')
 
 async function closeSession(s: SessionItem) {
+  if (closing.value.has(s.id) || authExpired.value) return
   if (!confirm(`关闭会话「${s.name}」？其中的 Shell 将被终止。`)) return
+  closing.value.add(s.id)
   closeError.value = ''
   try {
-    const res = await fetch(`/api/term/${encodeURIComponent(s.id)}/close`, { method: 'POST' })
+    const res = await sessionRequest(`/api/term/${encodeURIComponent(s.id)}/close`, { method: 'POST' })
+    if (!res) return
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       throw new Error(data.error ?? `HTTP ${res.status}`)
     }
+    sessions.value = sessions.value.filter((item) => item.id !== s.id)
     await refresh()
   } catch (e) {
     closeError.value = `关闭失败: ${e instanceof Error ? e.message : String(e)}`
+  } finally {
+    closing.value.delete(s.id)
   }
 }
 
@@ -102,6 +127,7 @@ function fmtTime(iso: string) {
     <header class="flex items-center justify-between px-4 pb-2 pt-3">
       <h1 class="text-xl font-bold tracking-tight">Limpet</h1>
       <button
+        v-if="!authExpired"
         class="rounded-md bg-neutral-800 px-3 py-2 text-sm active:scale-95 hover:bg-neutral-700"
         @click="sheet = { mode: 'create', name: '' }; sheetError = ''"
       >
@@ -109,7 +135,20 @@ function fmtTime(iso: string) {
       </button>
     </header>
 
-    <main class="min-h-0 flex-1 overflow-y-auto px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
+    <main
+      v-if="authExpired"
+      class="min-h-0 flex-1 space-y-2 px-3"
+    >
+      <p class="px-1 py-2 text-sm text-red-400">登录已失效</p>
+      <button
+        class="rounded-md bg-neutral-800 px-3 py-2 text-sm active:scale-95 hover:bg-neutral-700"
+        @click="reloadPage"
+      >
+        刷新页面
+      </button>
+    </main>
+
+    <main v-else class="min-h-0 flex-1 overflow-y-auto px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
       <p v-if="closeError" class="px-1 py-2 text-sm text-red-400">{{ closeError }}</p>
       <p v-if="loadError" class="px-1 py-2 text-sm text-red-400">{{ loadError }}</p>
       <p v-else-if="loading && !sessions.length" class="px-1 py-2 text-sm text-neutral-500">加载中…</p>
@@ -121,7 +160,8 @@ function fmtTime(iso: string) {
         <li v-for="s in sessions" :key="s.id">
           <div class="flex items-center gap-1 rounded-lg border border-neutral-800 bg-neutral-900/60 p-1">
             <button
-              class="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-3 text-left active:bg-neutral-800"
+              class="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-3 text-left active:bg-neutral-800 disabled:opacity-50"
+              :disabled="closing.has(s.id)"
               @click="emit('open', s.id, s.name)"
             >
               <span
@@ -142,8 +182,9 @@ function fmtTime(iso: string) {
               ✎
             </button>
             <button
-              class="h-11 w-11 shrink-0 rounded-md text-neutral-400 active:bg-neutral-800 hover:text-red-400"
+              class="h-11 w-11 shrink-0 rounded-md text-neutral-400 active:bg-neutral-800 hover:text-red-400 disabled:opacity-50"
               title="关闭"
+              :disabled="closing.has(s.id)"
               @click.stop="closeSession(s)"
             >
               ✕
@@ -155,7 +196,7 @@ function fmtTime(iso: string) {
 
     <!-- 底部弹层：新建 / 重命名 -->
     <div
-      v-if="sheet"
+      v-if="sheet && !authExpired"
       class="fixed inset-0 z-10 flex flex-col justify-end bg-black/60"
       @click.self="sheet = null"
     >
@@ -167,7 +208,7 @@ function fmtTime(iso: string) {
           ref="nameInput"
           v-model="sheet.name"
           class="w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-base outline-none focus:border-neutral-500"
-          placeholder="会话名（留空自动生成）"
+          :placeholder="sheet.mode === 'create' ? '会话名（留空自动生成）' : '输入新的会话名'"
           enterkeyhint="done"
           autocomplete="off"
           spellcheck="false"

@@ -28,8 +28,7 @@ const status = ref<Status>('connecting')
 
 const encoder = new TextEncoder()
 let ws: WebSocket | null = null
-// Terminal 组件挂载后长期存活，@ready 在其生命周期内只触发一次；
-// ready 只置位一次、绝不随 connect() 重置，否则重连后输出会永远排队。
+// 每次接入重新挂载 Terminal，等该实例的 @ready 再交付输出。
 let termReady = false
 // ready 之前到达的输出先排队（重建帧 + 实时流都在 ready 之后）。
 const pending: Uint8Array[] = []
@@ -39,8 +38,8 @@ let lastSize: { cols: number; rows: number } | null = null
 
 // 重连状态。gen 是接入代数：connect() 中途有 await，期间若发起了新的接入，旧的那次自行作废。
 let gen = 0
-let attempts = 0
-let reconnectDelay = BACKOFF_START_MS
+let waitingToReconnect = false
+let reconnectDelay = 0
 let reconnectTimer = 0
 let watchdog = 0
 let lastMsgAt = 0
@@ -74,27 +73,27 @@ async function connect() {
   const my = ++gen
   clearTimeout(reconnectTimer)
   reconnectTimer = 0
+  waitingToReconnect = false
   detachSocket()
   pending.length = 0
-  status.value = attempts === 0 ? 'connecting' : 'reconnecting'
-  attempts++
+  status.value = my === 1 ? 'connecting' : 'reconnecting'
   // 每次接入都重建 core 并重新挂载终端组件，让本次接入拥有干净的
   // 屏幕状态。组件重挂载会重新触发 @ready，termReady 随之复位。
   core.value = null
   termReady = false
   fatalError.value = ''
-  lastSize = null as { cols: number; rows: number } | null
+  lastSize = null
 
   try {
-    core.value = await GhosttyCore.load()
+    const loaded = await GhosttyCore.load()
+    if (unmounted || my !== gen) return
+    core.value = loaded
   } catch (e) {
-    if (my !== gen) return
+    if (unmounted || my !== gen) return
     fatalError.value = e instanceof Error ? e.message : String(e)
     status.value = 'error'
     return
   }
-  if (my !== gen) return
-
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const sock = new WebSocket(`${proto}//${location.host}/api/ws/term/${encodeURIComponent(props.sessionId)}`)
   ws = sock
@@ -113,7 +112,7 @@ async function connect() {
       try {
         const ctl = JSON.parse(e.data)
         if (ctl.type === 'ready') {
-          reconnectDelay = BACKOFF_START_MS
+          reconnectDelay = 0
           status.value = 'connected'
           // 等 Vue 摘掉 inert 再聚焦，否则 focus 会被吞掉。
           nextTick(() => term.value?.focus())
@@ -146,15 +145,17 @@ async function onDisconnected(code: number) {
     status.value = 'ended'
     return
   }
+  status.value = 'reconnecting'
+  waitingToReconnect = true
+  const my = gen
   const verdict = await checkSession()
-  if (unmounted) return
-  if (verdict === 'gone') {
-    status.value = 'ended'
-  } else if (verdict === 'auth') {
-    status.value = 'authExpired'
-  } else {
-    scheduleReconnect()
+  if (unmounted || my !== gen) return
+  if (verdict === 'gone' || verdict === 'auth') {
+    waitingToReconnect = false
+    status.value = verdict === 'gone' ? 'ended' : 'authExpired'
+    return
   }
+  scheduleReconnect()
 }
 
 // 核对会话是否还在。redirect: 'manual' 是为了认出 Access 登录态失效——
@@ -173,19 +174,23 @@ async function checkSession(): Promise<'alive' | 'gone' | 'auth' | 'unknown'> {
 
 // 首次立即，之后 1s、2s、4s… 封顶 30s；收到 ready 复位。
 function scheduleReconnect() {
-  status.value = 'reconnecting'
   const delay = reconnectDelay
-  reconnectDelay = Math.min(reconnectDelay * 2, BACKOFF_MAX_MS)
+  reconnectDelay = delay === 0 ? BACKOFF_START_MS : Math.min(delay * 2, BACKOFF_MAX_MS)
+  if (delay === 0) {
+    void connect()
+    return
+  }
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = 0
     void connect()
   }, delay)
 }
 
-// 网络恢复或页面回到前台：正在等退避就立即试一次。
+// 网络恢复或页面回到前台时，可以跳过尚未完成的核对或退避。
 function reconnectNow() {
-  if (unmounted || document.visibilityState === 'hidden') return
-  if (status.value === 'reconnecting' && reconnectTimer !== 0) void connect()
+  if (unmounted || document.visibilityState === 'hidden' || !waitingToReconnect) return
+  reconnectDelay = Math.max(reconnectDelay, BACKOFF_START_MS)
+  void connect()
 }
 
 // 连接无声死亡时浏览器不会触发 close（手机切网的常态）。server 每 20s 发 ping，
@@ -193,7 +198,7 @@ function reconnectNow() {
 function checkLiveness() {
   if (!ws || status.value !== 'connected') return
   if (Date.now() - lastMsgAt <= PING_TIMEOUT_MS) return
-  void connect()
+  scheduleReconnect()
 }
 
 function flushPending() {
@@ -242,9 +247,7 @@ function onResize(cols: number, rows: number) {
 }
 
 function onReady(wt: WTerm) {
-  // 组件生命周期内只触发一次；不重挂载就不会再来。
-  // 初始网格与默认尺寸（80x24）一致时 ResizeObserver 不触发 @resize，
-  // 首个尺寸必须直接从实例读取，否则后端会等满 3s 超时兜底。
+  // 从实例申报初始尺寸，后续尺寸变化由 @resize 更新。
   lastSize = { cols: wt.cols, rows: wt.rows }
   sendResize()
   termReady = true
@@ -254,6 +257,12 @@ function onReady(wt: WTerm) {
 // WTerm 初始化失败（wasm 加载/实例化问题）：终端不可用，转为 fatalError；
 // 下次重连会重建 core 并重新挂载组件。
 function onTerminalError(e: unknown) {
+  gen++
+  waitingToReconnect = false
+  clearTimeout(reconnectTimer)
+  reconnectTimer = 0
+  detachSocket()
+  pending.length = 0
   fatalError.value = String(e)
   status.value = 'error'
 }
@@ -374,8 +383,7 @@ function reloadPage() {
       <button
         v-for="k in KEY_DEFS"
         :key="k.label"
-        class="min-w-[3.25rem] shrink-0 rounded-md px-2 py-2 text-sm active:bg-neutral-600"
-        :class="k.label === 'Ctrl+C' && ctrlSticky ? 'bg-emerald-700 text-white' : 'bg-neutral-800 text-neutral-200'"
+        class="min-w-[3.25rem] shrink-0 rounded-md bg-neutral-800 px-2 py-2 text-sm text-neutral-200 active:bg-neutral-600"
         @click="sendKey(k.bytes)"
       >
         {{ k.label }}

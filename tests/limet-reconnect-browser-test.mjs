@@ -14,12 +14,13 @@
 //   S6 Shell 内 exit → 「会话已结束」，不再重连
 //   S7 列表里关闭会话 → 「会话已结束」
 //   S8 worker 被 kill -9 → 核对后「会话已结束」
-//   S9 移动视口（375）：接入、输入可用
+//   S9 移动视口（375）：接入、输入及快捷键状态
+//   S10 列表：表单提示与单会话关闭中状态
 // 设置环境变量 SHOTS=<目录> 时保存截图（接入后的桌面与移动视口各一张）。
-import { execSync, spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createServer, connect } from 'node:net'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PORT = Number(process.env.PORT || 4040)
@@ -119,6 +120,11 @@ const relay = createServer((client) => {
       }
       c.ws = /^GET \/api\/ws\//.test(first)
       if (c.ws) wsOpens++
+      if (mode === 'authdown' && !c.ws) {
+        // 中继只检查每条 TCP 连接的第一个请求，模拟 Access 时避免复用 HTTP 连接。
+        const headers = first.replace(/\r\nConnection:[^\r\n]*/i, '')
+        head = Buffer.from(headers.replace('\r\n\r\n', '\r\nConnection: close\r\n\r\n'), 'latin1')
+      }
       upstream.write(head)
       return
     }
@@ -204,7 +210,8 @@ try {
   } catch {
     browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
   }
-  page = await (await browser.newContext({ viewport: { width: 1100, height: 700 } })).newPage()
+  const desktop = await (await browser.newContext({ viewport: { width: 1100, height: 700 } })).newPage()
+  page = desktop
 
   // ---- S1 ----
   console.log('S1 接入与输入')
@@ -231,11 +238,30 @@ try {
   has('接回后可以继续输入（MARK-2 到达 Shell）', (await recordedCount(s1, 'MARK-2', 2)) >= 2)
 
   // ---- S3 ----
-  console.log('S3 网络闪断')
-  relayCut()
-  has('连接被切断后经过「重连中」', await seeBadge('重连中'))
-  await waitBadge('已连接')
-  has('随即自动接回', true)
+  console.log('S3 网络闪断与旧核对结果')
+  let releaseCheck
+  const holdCheck = new Promise((resolve) => { releaseCheck = resolve })
+  const listURL = `${ORIGIN}/api/term`
+  await page.route(listURL, async (route) => {
+    await holdCheck
+    await route.fulfill({ json: [] })
+  }, { times: 1 })
+  const checking = page.waitForRequest(listURL, { timeout: 8000 })
+  try {
+    relayCut()
+    await checking
+    has('会话核对仍挂起时徽标已显示「重连中」', (await badgeText()) === '重连中')
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await waitBadge('已连接')
+    has('online 可以在核对返回前接回会话', true)
+    const oldResponse = page.waitForResponse(listURL, { timeout: 5000 })
+    releaseCheck()
+    await oldResponse
+    await sleep(250)
+    has('旧核对返回空列表后新连接仍有效', (await badgeText()) === '已连接')
+  } finally {
+    releaseCheck()
+  }
 
   // ---- S4 ----
   console.log('S4 登录失效')
@@ -244,10 +270,14 @@ try {
   await waitBadge('登录已失效')
   has('核对请求被重定向 → 「登录已失效」', true)
   has('出现「刷新页面」按钮', await page.getByRole('button', { name: '刷新页面' }).isVisible())
-  mode = 'normal'
   await page.getByRole('button', { name: '刷新页面' }).click()
   await page.getByRole('heading', { name: 'Limpet' }).waitFor({ state: 'visible' })
-  has('点击后页面重新加载（回到列表）', true)
+  await page.getByText('登录已失效', { exact: true }).waitFor()
+  has('列表能识别 Access 重定向并提供刷新按钮', await page.getByRole('button', { name: '刷新页面' }).isVisible())
+  mode = 'normal'
+  await page.getByRole('button', { name: '刷新页面' }).click()
+  await page.getByRole('button', { name: /重连-S1/ }).waitFor({ state: 'visible' })
+  has('重新登录后刷新能恢复列表', true)
 
   // ---- S5 ----
   console.log('S5 无声失联（约 1 分钟）')
@@ -295,7 +325,9 @@ try {
   console.log('S8 worker 被 kill -9')
   const s8 = await createSession('重连-S8'); ids.push(s8)
   await openInPage('重连-S8')
-  const wpid = execSync(`pgrep -f '[l]impet-new-server worker ${s8}$'`).toString().trim()
+  const binaryName = basename(SERVER_BIN).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const wpid = execFileSync('pgrep', ['-f', '--', `(^|/)${binaryName} worker ${s8}$`], { encoding: 'utf8' }).trim()
+  if (!/^[1-9][0-9]*$/.test(wpid)) throw new Error('预期找到唯一的测试 worker PID')
   process.kill(Number(wpid), 'SIGKILL')
   await waitBadge('会话已结束')
   has('worker 消失 → 核对后进入「会话已结束」', true)
@@ -308,10 +340,53 @@ try {
   const s9 = await createSession('重连-S9'); ids.push(s9)
   await openInPage('重连-S9')
   has('移动视口下徽标为「已连接」', (await badgeText()) === '已连接', await badgeText())
+  const ctrl = page.getByRole('button', { name: 'Ctrl', exact: true })
+  const ctrlC = page.getByRole('button', { name: 'Ctrl+C', exact: true })
+  await ctrl.click()
+  has('粘性 Ctrl 点亮时 Ctrl+C 保持普通样式',
+    (await ctrl.getAttribute('class')).includes('bg-emerald-700') &&
+    !(await ctrlC.getAttribute('class')).includes('bg-emerald-700'))
+  await ctrl.click()
   await typeLine('echo MARK-9')
   has('移动视口下按键到达 Shell', (await recordedCount(s9, 'MARK-9', 2)) >= 2)
   await shot(mpage, 'browser-mobile.png')
   await mctx.close()
+
+  // ---- S10 ----
+  console.log('S10 列表表单与关闭中状态')
+  page = desktop
+  const s10 = await createSession('关闭中会话'); ids.push(s10)
+  await page.goto(ORIGIN)
+  const row = page.locator('li').filter({ hasText: '关闭中会话' })
+  await row.waitFor({ state: 'visible' })
+  await page.getByRole('button', { name: /新建/ }).click()
+  has('创建输入框提示留空自动生成', await page.getByPlaceholder('会话名（留空自动生成）').isVisible())
+  await page.getByRole('button', { name: '取消' }).click()
+  await row.locator('[title="重命名"]').click()
+  has('重命名输入框提示输入新的会话名', await page.getByPlaceholder('输入新的会话名').isVisible())
+  await page.getByRole('button', { name: '取消' }).click()
+
+  const closeURL = `${ORIGIN}/api/term/${s10}/close`
+  let releaseClose
+  const holdClose = new Promise((resolve) => { releaseClose = resolve })
+  await page.route(closeURL, async (route) => {
+    await holdClose
+    await route.continue()
+  }, { times: 1 })
+  const closing = page.waitForRequest(closeURL, { timeout: 8000 })
+  try {
+    page.once('dialog', (dialog) => dialog.accept())
+    await row.locator('[title="关闭"]').click()
+    await closing
+    has('关闭期间只禁用对应会话的打开与关闭按钮',
+      await row.getByRole('button', { name: /关闭中会话/ }).isDisabled() &&
+      await row.locator('[title="关闭"]').isDisabled() &&
+      await page.getByRole('button', { name: /重连-S9/ }).isEnabled())
+  } finally {
+    releaseClose()
+  }
+  await row.waitFor({ state: 'detached' })
+  has('关闭完成后会话从列表移除', true)
 } catch (e) {
   has(`执行中断：${e instanceof Error ? e.message.split('\n')[0] : e}`, false)
 } finally {
