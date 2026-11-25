@@ -37,8 +37,8 @@ func runFormatter() error {
 		b.WriteString("\x1b[7m反显\x1b[27m \x1b[9m删除线\x1b[29m\r\n")
 		b.WriteString("\x1b]8;;https://example.com\x1b\\链接\x1b]8;;\x1b\\ 与 ")
 		b.WriteString("宽字符 中國🚚 结束\r\n")
-		b.WriteString(strings.Repeat("填充行\r\n", 30)) // 制造滚动历史
-		b.WriteString("\x1b[5;10H\x1b[93m游标行\x1b[0m")  // 光标停在 (10,4)，前面有彩色字
+		b.WriteString(strings.Repeat("填充行\r\n", 30))  // 制造滚动历史
+		b.WriteString("\x1b[5;10H\x1b[93m游标行\x1b[0m") // 光标停在 (10,4)，前面有彩色字
 		t.VTWrite([]byte(b.String()))
 		return t
 	}
