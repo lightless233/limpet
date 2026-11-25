@@ -1,114 +1,70 @@
-// 新启动协议综合验证（v2）：
-//   sendInput(s)  → 二进制帧（终端输入）
-//   sendControl(o)→ 文本帧（控制 JSON）
-// A. ready 帧先于任何终端输出；B. 首条 resize 决定启动尺寸（URL 旧值不生效）；
-// C. 超时兜底（query 尺寸）；D. 预启动输入缓冲；E. 大粘贴；F. exit 关闭。
-const { BASE } = await import('./env.mjs')
-const enc = new TextEncoder()
-const dec = new TextDecoder()
+// Spec 004：接入即 ready + 重建，resize 是尺寸申报，尺寸随输入者变化。
+import assert from 'node:assert/strict'
+const { BASE, WS } = await import('./env.mjs')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const sockets = []
 
-async function create() {
-  const res = await fetch(`${BASE}/api/term`, { method: 'POST' })
-  return (await res.json()).id
+async function waitFor(check, message) {
+  const deadline = Date.now() + 5000
+  while (!check() && Date.now() < deadline) await sleep(25)
+  assert.ok(check(), message)
 }
 
-function attach(id, query = '') {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${BASE.replace('http', 'ws')}/api/ws/term/${id}${query}`)
-    ws.binaryType = 'arraybuffer'
-    const state = { out: '', closed: false, closeCode: null, readyAt: null, firstBinaryAt: null }
-    const t0 = performance.now()
-    ws.onmessage = (e) => {
-      if (typeof e.data === 'string') {
-        try { if (JSON.parse(e.data).type === 'ready') state.readyAt = Math.round(performance.now() - t0) } catch {}
-        return
-      }
-      state.out += (typeof e.data === 'string' ? '' : dec.decode(e.data))
-      if (state.firstBinaryAt === null) state.firstBinaryAt = Math.round(performance.now() - t0)
+async function attach(id, query = '') {
+  const ws = new WebSocket(`${WS}/api/ws/term/${id}${query}`)
+  sockets.push(ws)
+  ws.binaryType = 'arraybuffer'
+  const state = { ready: false, outputBeforeReady: false, text: '', closeCode: 0 }
+  const decoder = new TextDecoder()
+  ws.onmessage = ({ data }) => {
+    if (typeof data === 'string') {
+      if (JSON.parse(data).type === 'ready') state.ready = true
+    } else {
+      if (!state.ready) state.outputBeforeReady = true
+      state.text += decoder.decode(data, { stream: true })
     }
-    ws.onclose = (e) => { state.closed = true; state.closeCode = e.code }
-    ws.onopen = () => resolve({
-      ws, state,
-      sendInput(s) { ws.send(typeof s === 'string' ? enc.encode(s) : s) },
-      sendControl(o) { ws.send(JSON.stringify(o)) },
-    })
-    ws.onerror = () => {}
-  })
+  }
+  ws.onclose = ({ code }) => { state.closeCode = code }
+  await waitFor(() => state.ready && state.text.length > 0, '未申报尺寸也应收到 ready 与重建输出')
+  assert.equal(state.outputBeforeReady, false, 'ready 必须先于第一帧输出')
+  return {
+    ws,
+    state,
+    send: (text) => ws.send(Buffer.from(text + '\r')),
+  }
 }
 
-function fillers(out) {
-  const re = /\x1b\[7m%\x1b\[27m\x1b\[1m\x1b\[0m( +)\r/g
-  const r = []
-  let m
-  while ((m = re.exec(out))) r.push(m[1].length + 1)
-  return r
+async function checkSize(viewer, cols, rows) {
+  const start = viewer.state.text.length
+  viewer.send('stty size')
+  await waitFor(() => viewer.state.text.slice(start).includes(`${rows} ${cols}\r\n`),
+    `PTY 应为 ${cols}×${rows}，实际输出 ${JSON.stringify(viewer.state.text.slice(start, start + 512))}`)
 }
 
-async function waitReady(s, timeoutMs = 5000) {
-  const start = performance.now()
-  while (s.readyAt === null && performance.now() - start < timeoutMs) await sleep(100)
-}
+let id
+try {
+  const res = await fetch(`${BASE}/api/term`, { method: 'POST' })
+  assert.equal(res.status, 200, '创建会话')
+  const created = await res.json()
+  id = created.id
+  const a = await attach(id, '?cols=68&rows=30')
+  const b = await attach(id)
+  await checkSize(a, 80, 24)
 
-// A + B
-{
-  const id = await create()
-  const { state, sendInput, sendControl } = await attach(id, '?cols=80&rows=30')
-  sendControl({ type: 'resize', cols: 41, rows: 30 })
-  await waitReady(state)
-  sendInput('echo limpet-proto-ok\r')
-  await sleep(1200)
-  console.log(`A ready帧: ${state.readyAt}ms，先于输出: ${state.firstBinaryAt === null || state.readyAt <= state.firstBinaryAt ? '✓' : '✗'}`)
-  console.log(`B 启动尺寸: [${fillers(state.out).join(', ')}]（期望 [41]，URL 的 80 不生效）`)
-  console.log(`B 会话可用: ${state.out.includes('limpet-proto-ok') ? '✓' : '✗'}`)
-  sendInput('exit\r')
-  await sleep(700)
-}
+  a.ws.send(JSON.stringify({ type: 'resize', cols: 41, rows: 30 }))
+  // 等申报到达 worker，随后检查观察者的输入尺寸。
+  await sleep(150)
+  await checkSize(b, 80, 24)
+  await checkSize(a, 41, 30)
+  console.log('接入即重建，ready 先于输出，尺寸仅在申报者输入时生效')
 
-// C：无 resize → 超时按 query 兜底启动；ready 后等足时间看首屏
-{
-  const id = await create()
-  const { ws, state } = await attach(id, '?cols=68&rows=30')
-  await waitReady(state, 5000)
-  await sleep(1500)
-  console.log(`C 超时兜底: ready@${state.readyAt}ms（期望≈3000），首屏尺寸 ${fillers(state.out)[0] ?? '?'}（期望 68）`)
-  ws.close()
-  await sleep(300)
+  a.ws.close()
+  await checkSize(b, 41, 30)
+  b.send('exit')
+  await waitFor(() => b.state.closeCode !== 0, 'Shell exit 应结束 viewer')
+  assert.equal(b.state.closeCode, 1000)
+  console.log('一个 viewer 断开后其余 viewer 可继续使用，Shell exit 收到 1000')
+} finally {
+  for (const ws of sockets) ws.close()
+  if (id) await fetch(`${BASE}/api/term/${id}/close`, { method: 'POST' }).catch(() => {})
 }
-
-// D1：接入后立即断开（不发 resize）→ 会话条目立即回收（再接入 404）
-{
-  const id = await create()
-  const { ws } = await attach(id, '?cols=68&rows=30')
-  await sleep(100)
-  ws.close()
-  await sleep(200)
-  const res = await fetch(`${BASE}/api/ws/term/${id}`)
-  console.log(`D1 未启动断开回收: HTTP ${res.status}（期望 404）`)
-}
-
-// D2：启动前发二进制输入 → 1008 terminal not ready + 条目回收
-{
-  const id = await create()
-  const { ws, state, sendInput } = await attach(id, '?cols=68&rows=30')
-  sendInput('echo premature\r')
-  for (let i = 0; i < 20 && !state.closed; i++) await sleep(100)
-  const res = await fetch(`${BASE}/api/ws/term/${id}`)
-  console.log(`D2 预启动输入拒绝: closed=${state.closed} code=${state.closeCode}（期望 1008） 回收=${res.status}（期望 404）`)
-}
-
-// E：大粘贴（60KB 单条）
-{
-  const id = await create()
-  const { state, sendInput, sendControl } = await attach(id, '?cols=68&rows=30')
-  sendControl({ type: 'resize', cols: 68, rows: 30 })
-  await waitReady(state)
-  sendInput('echo ' + 'A'.repeat(60000) + '\r')
-  await sleep(1200)
-  sendInput('echo limpet-paste-alive\r')
-  await sleep(900)
-  console.log(`E 大粘贴: closed=${state.closed} 回显=${state.out.includes('AAAA') ? '✓' : '✗'} 存活=${state.out.includes('limpet-paste-alive') ? '✓' : '✗'}`)
-  sendInput('exit\r')
-  await sleep(600)
-}
-process.exit(0)

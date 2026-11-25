@@ -151,14 +151,21 @@ has('丢弃慢 viewer 后会话继续可用', a.text.includes('丢弃后仍可�
 
 // ---- 4. viewer 断开重连 ----
 a.ws.close()
-await sleep(300)
+const marker = (n) => `LIMPET-REPLAY-${String(n).padStart(3, '0')}`
+b.ws.send(Buffer.from("for n in $(seq 1 60); do printf 'LIMPET-REPLAY-%03d\\n' \"$n\"; sleep 0.025; done\r"))
+const before = Date.now() + 5000
+while (!b.text.includes(marker(5)) && Date.now() < before) await sleep(25)
+has('重连前编号输出已开始', b.text.includes(marker(5)))
 const a2 = await attach(id)
 const rA2 = await waitReady(a2)
-await sleep(500)
-a2.ws.send(Buffer.from('echo 重连甲OK\r'))
-await sleep(1000)
-has('A 断开重连成功', rA2 && a2.text.includes('重连甲OK'))
-has('重连画面恰好一次（无整段双份）', !/多视图标记-乙[\s\S]*多视图标记-乙/.test(a2.text.slice(0, 2000)))
+const deadline = Date.now() + 5000
+while (!a2.text.includes(marker(60)) && Date.now() < deadline) await sleep(25)
+const lines = a2.text.match(/LIMPET-REPLAY-\d{3}/g) ?? []
+const expected = Array.from({ length: 60 }, (_, i) => marker(i + 1))
+has('A 断开重连成功并收到实时尾巴', rA2 && lines.includes(marker(60)))
+has('重建与实时尾巴的 60 条编号输出按序且恰好出现一次',
+  lines.length === expected.length && lines.every((line, i) => line === expected[i]),
+  `收到 ${lines.length}/${expected.length} 条，前后标记 ${lines.at(0)}/${lines.at(-1)}`)
 
 // 清理
 for (const st of [a2, b]) st.ws.send(Buffer.from('exit\r'))

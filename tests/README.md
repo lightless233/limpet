@@ -18,7 +18,7 @@
 
 | 脚本 | 验证什么 | 新架构下的状态 |
 |---|---|---|
-| `limet-proto-test.mjs` | ready 先于输出、ready 前输入 1008、尺寸消息时序 | 保留，权威 |
+| `limet-proto-test.mjs` | 接入即重建、ready 先于输出、尺寸申报与输入者晋升 | 保留，权威 |
 | `limet-bigpaste-test.mjs` | 1.1MB 中文大粘贴，端到端 md5 一致 | 保留，权威 |
 | `limet-chunked-paste-test.mjs` | 900KB 按 64KiB 切块粘贴：连接不断、输出完整送达、Ctrl+C 后 Shell 仍可操作（碎块突发的慢消费者误判回归点） | 保留，权威 |
 | `limet-paste-test.mjs` | 一般粘贴回显 | 保留 |
