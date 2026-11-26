@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, useTemplateRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
 import AppIcon from './components/AppIcon.vue'
 import SessionList from './components/SessionList.vue'
 import TerminalView from './components/TerminalView.vue'
@@ -10,6 +10,7 @@ const list = useTemplateRef('list')
 const activeId = ref<string>()
 const initialName = ref('')
 const activeName = computed(() => store.sessions.value.find((s) => s.id === activeId.value)?.name ?? initialName.value)
+let stopAutoRefresh: (() => void) | undefined
 
 function open(id: string, name: string) {
   activeId.value = id
@@ -21,7 +22,14 @@ function back() {
   void store.refresh()
 }
 
-onMounted(store.refresh)
+onMounted(() => {
+  void store.refresh()
+  stopAutoRefresh = store.startAutoRefresh(() => !activeId.value)
+})
+
+onBeforeUnmount(() => {
+  stopAutoRefresh?.()
+})
 </script>
 
 <template>

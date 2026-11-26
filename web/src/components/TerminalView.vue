@@ -521,6 +521,9 @@ function reloadPage() {
         <button class="control" aria-label="滚到底部" title="滚到底部" :disabled="!core" @click="scrollToBottom">
           <AppIcon name="bottom" />
         </button>
+        <button class="control" aria-label="重载页面" title="重载页面" @click="reloadPage">
+          <AppIcon name="refresh" />
+        </button>
       </div>
       <p v-if="supportsLockWidth === false" role="status" class="mt-2 text-xs text-[var(--limpet-muted)]">
         旧版 worker 不支持锁定原宽

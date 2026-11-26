@@ -5,7 +5,7 @@ import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{ store: ReturnType<typeof useSessions>; activeId?: string }>()
 const emit = defineEmits<{ open: [id: string, name: string] }>()
-const { sessions, loading, loadError, authExpired, request, refresh } = props.store
+const { sessions, loading, refreshing, loadError, authExpired, request, refresh } = props.store
 const busy = ref(false)
 const closing = ref(new Set<string>())
 const closeError = ref('')
@@ -222,9 +222,14 @@ function fmtTime(iso: string) {
       <h1 class="flex items-center gap-2 text-lg font-semibold tracking-tight">
         <AppIcon name="terminal" class="text-[var(--limpet-accent)]" /> Limpet
       </h1>
-      <button v-if="!authExpired" class="control text-sm" @click="openCreate">
-        <AppIcon name="add" /> 新建
-      </button>
+      <div v-if="!authExpired" class="flex items-center gap-1">
+        <button class="control" aria-label="刷新列表" title="刷新列表" :disabled="refreshing" @click="refresh()">
+          <AppIcon name="refresh" :class="{ 'animate-spin': refreshing }" />
+        </button>
+        <button class="control text-sm" @click="openCreate">
+          <AppIcon name="add" /> 新建
+        </button>
+      </div>
     </header>
 
     <div v-if="authExpired" class="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
@@ -235,7 +240,7 @@ function fmtTime(iso: string) {
     <div v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2" @scroll.passive="hideCwdTip">
       <p v-if="closeError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">{{ closeError }}</p>
       <p v-if="loadError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">
-        {{ loadError }} <button class="control" @click="refresh">重试</button>
+        {{ loadError }} <button class="control" @click="refresh()">重试</button>
       </p>
       <p v-else-if="loading && !sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">加载中…</p>
       <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>

@@ -11,6 +11,7 @@ const paths = {
   minus: 'M5 12h14',
   bottom: 'm6 12 6 6 6-6M12 18V4M5 21h14',
   composer: 'M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9l-5 3v-3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm3 4h10m-10 4h7',
+  refresh: 'M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5',
 }
 
 defineProps<{ name: keyof typeof paths }>()
