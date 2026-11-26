@@ -75,11 +75,31 @@ See [deploy/README.md](./deploy/README.md) (Chinese) or [README.AGENT.md](./READ
 # One-time install directory creation
 sudo mkdir -p /opt/limpet && sudo chown "$USER": /opt/limpet
 
-# Build, install to /opt/limpet, symlink ~/.local/bin/limpet, and start on 127.0.0.1:13000
+# Build, install to /opt/limpet, symlink ~/.local/bin/limpet, and start on 127.0.0.1:13000 (override with LIMPET_PORT)
 ./deploy/install.sh
 ```
 
-> Running `deploy/install.sh` immediately enables and starts the production service. Ensure your auth proxy / Cloudflare Access is active beforehand if routed externally.
+> `127.0.0.1:13000` is the default production address and can be customized via `LIMPET_PORT=<port> ./deploy/install.sh` (direct foreground/dev runs default to `127.0.0.1:4040` via `LIMPET_ADDR`). Running `deploy/install.sh` immediately enables and starts the production service—ensure your auth proxy / Cloudflare Access is active beforehand if routed externally.
+
+---
+
+## Remote Access: Cloudflare Tunnel + Access
+
+Cloudflare Zero Trust lets you expose Limpet safely over HTTPS/WSS without opening inbound firewall ports:
+
+1. **Configure Cloudflare Tunnel (`cloudflared`)**:
+   - Create a Tunnel in Cloudflare Zero Trust and add a Public Hostname (e.g., `terminal.example.com`) pointing to `http://127.0.0.1:13000` (match your custom `LIMPET_PORT` if changed).
+   - WebSocket upgrades are supported out of the box.
+2. **Protect with Cloudflare Access**:
+   - Create a **Self-hosted** application in **Access → Applications** for the same hostname, add an **Allow** policy restricted to your own email/identity provider, and tune **Session Duration** (e.g., `24h`+) for comfortable mobile reuse.
+3. **Verify gating before starting production**:
+   ```sh
+   curl -sI https://<your-domain>/api/term   # Expect HTTP 302 redirecting to *.cloudflareaccess.com
+   ```
+4. **Mobile PWA behind Access (optional Bypass)**:
+   - `web/index.html` already includes `crossorigin="use-credentials"` on the manifest link so logged-in browsers send `CF_Authorization` cookies.
+   - If an Android browser's background WebAPK packager still fails to fetch icons without cookies, add a narrow Access **Bypass** policy (Everyone) covering **only these 4 static paths** (no API or session data is exposed):
+     - `/manifest.json`, `/limpet.svg`, `/limpet-192.png`, `/limpet-512.png`
 
 ---
 

@@ -74,11 +74,32 @@ LIMPET_HOME=~/.limpet-dev ~/.limpet-dev/limpet zsh
 # 首次创建安装目录（仅一次）
 sudo mkdir -p /opt/limpet && sudo chown "$USER": /opt/limpet
 
-# 构建并安装到 /opt/limpet，生成 ~/.local/bin/limpet 软链并启动 127.0.0.1:13000
+# 构建并安装到 /opt/limpet，生成 ~/.local/bin/limpet 软链并启动 127.0.0.1:13000（可用 LIMPET_PORT 自定义）
 ./deploy/install.sh
 ```
 
-> 执行 `deploy/install.sh` 会直接启用并启动正式服务，请先确认反向代理 / Cloudflare Access 已配置好。
+> 默认生产监听端口为 `127.0.0.1:13000`，可通过 `LIMPET_PORT=<端口> ./deploy/install.sh` 调整（开发直接运行 `limpet-server` 时默认 `127.0.0.1:4040`，可通过 `LIMPET_ADDR` 修改）。执行 `deploy/install.sh` 会直接启用并启动正式服务，请先确认下方反向代理 / Cloudflare Access 已配置好。
+
+---
+
+## 远程访问：Cloudflare Tunnel + Access 配置
+
+推荐通过 Cloudflare Zero Trust 暴露服务，无需开放公网端口或维护反向代理证书：
+
+1. **配置 Cloudflare Tunnel（`cloudflared`）**：
+   - 在 Cloudflare Zero Trust 创建 Tunnel，添加一条 Public Hostname（如 `terminal.example.com`），Service 指向 `HTTP` → `http://127.0.0.1:13000`（若安装了自定义 `LIMPET_PORT`，这里填写对应端口）。
+   - Cloudflare Tunnel 原生透传 WebSocket 升级请求，无需额外开关。
+2. **配置 Cloudflare Access（鉴权门禁）**：
+   - 在 **Access → Applications** 新建 **Self-hosted** 应用，域名填同一地址，添加仅允许本人邮箱或指定身份提供商的 **Allow** 策略。
+   - 可按习惯调整 **Session Duration**（如 `24h` 或更长），减少手机切回应用时重新验证的次数。
+3. **上线前验证拦截是否生效**：
+   ```sh
+   curl -sI https://<your-domain>/api/term   # 期望返回 302，Location 指向 *.cloudflareaccess.com
+   ```
+4. **手机安装 PWA（可选 Bypass）**：
+   - 首页已对 `/manifest.json` 启用 `crossorigin="use-credentials"`，使浏览器携带 `CF_Authorization` Cookie 拉取清单。
+   - 若部分 Android 浏览器在打包桌面 WebAPK 时使用无 Cookie 后台抓取图标导致安装失败，可在 Access 中额外建一条 **Bypass**（Everyone）策略，**仅放行以下 4 个纯静态资源路径**（不含任何会话或接口数据）：
+     - `/manifest.json`、`/limpet.svg`、`/limpet-192.png`、`/limpet-512.png`
 
 ---
 

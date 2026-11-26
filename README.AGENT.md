@@ -139,13 +139,24 @@ Production installs to `/opt/limpet` (default) and runs independent of the Git w
 
 ### Playbook C — Reverse Proxy / Cloudflare Tunnel + Cloudflare Access
 
-Point your tunnel or reverse proxy to `http://127.0.0.1:13000` (HTTP + WebSocket upgrade required on `/api/ws/term/*`):
+Production defaults to `127.0.0.1:13000` (configurable via `LIMPET_PORT`). Point `cloudflared` or a reverse proxy to that loopback address (HTTP + WebSocket upgrade required on `/api/ws/term/*`):
 
-- Verify Access gates unauthenticated traffic:
-  ```sh
-  curl -sI https://<your-domain>/api/term   # expect HTTP 302 to *.cloudflareaccess.com
+- **Cloudflare Tunnel (`cloudflared`) ingress example**:
+  ```yaml
+  ingress:
+    - hostname: terminal.example.com
+      service: http://127.0.0.1:13000   # match LIMPET_PORT if customized
+    - service: http_status:404
   ```
-- **PWA behind Cloudflare Access**: `web/index.html` already includes `<link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />` so logged-in browsers attach `CF_Authorization` cookies when fetching the manifest. If a specific Android browser's background WebAPK packager still fails to fetch icons without session cookies, instruct the user to add an unauthenticated Access **Bypass** policy strictly for `/manifest.json`, `/limpet.svg`, `/limpet-192.png`, and `/limpet-512.png`.
+- **Cloudflare Access checklist**:
+  1. Create a **Self-hosted** Access Application covering the public hostname, with an **Allow** policy restricted strictly to the owner's email/IdP.
+  2. Set a practical **Session Duration** (e.g., `24h`+) so mobile browsers do not constantly interrupt active terminal tabs.
+  3. Verify Access gates unauthenticated traffic **before** starting `limpet-server.service`:
+     ```sh
+     curl -sI https://<your-domain>/api/term   # expect HTTP 302 to *.cloudflareaccess.com
+     ```
+- **PWA behind Cloudflare Access**: `web/index.html` already includes `<link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />` so logged-in browsers attach `CF_Authorization` cookies when fetching the manifest. If a specific Android browser's background WebAPK packager still fails to fetch icons without session cookies, instruct the user to add an unauthenticated Access **Bypass** policy strictly for these 4 static paths (contains zero API or session data):
+  - `/manifest.json`, `/limpet.svg`, `/limpet-192.png`, `/limpet-512.png`
 
 ---
 
