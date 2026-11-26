@@ -148,12 +148,12 @@ function fmtTime(iso: string) {
       </button>
     </header>
 
-    <main v-if="authExpired" class="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
+    <div v-if="authExpired" class="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
       <p role="alert" class="text-sm text-[var(--limpet-danger)]">登录已失效</p>
-      <button class="control text-sm" @click="reloadPage">刷新页面</button>
-    </main>
+      <button v-if="!activeId" class="control text-sm" @click="reloadPage">刷新页面</button>
+    </div>
 
-    <main v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">
+    <div v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">
       <p v-if="closeError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">{{ closeError }}</p>
       <p v-if="loadError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">
         {{ loadError }} <button class="control" @click="refresh">重试</button>
@@ -191,7 +191,7 @@ function fmtTime(iso: string) {
           </button>
         </li>
       </ul>
-    </main>
+    </div>
 
     <dialog ref="dialog" closedby="any" class="session-dialog" aria-labelledby="session-action-title"
       @close="onDialogClose" v-on="lightDismiss">

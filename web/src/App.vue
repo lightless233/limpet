@@ -38,6 +38,13 @@ onMounted(store.refresh)
       :key="activeId"
       :session-id="activeId"
       :session-name="activeName"
+      :sessions="store.sessions.value"
+      :sessions-loading="store.loading.value"
+      :sessions-error="store.loadError.value"
+      :auth-expired="store.authExpired.value"
+      @refresh-sessions="store.refresh"
+      @session-auth-expired="store.authExpired.value = true"
+      @open-session="open"
       @back="back"
     />
     <main v-else class="hidden min-h-0 min-w-0 place-items-center lg:grid">

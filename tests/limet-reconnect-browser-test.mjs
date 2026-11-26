@@ -152,7 +152,7 @@ const relayStall = () => {
 
 // ---- 浏览器侧小工具 ----
 let page
-const badgeSel = 'header span.rounded-full'
+const badgeSel = 'header [data-status]'
 const badgeText = async () => (await page.locator(badgeSel).first().textContent())?.trim()
 async function waitBadge(text, timeout = 15000) {
   await page.locator(badgeSel, { hasText: text }).first().waitFor({ state: 'visible', timeout })
@@ -343,9 +343,9 @@ try {
   const ctrl = page.getByRole('button', { name: 'Ctrl', exact: true })
   const ctrlC = page.getByRole('button', { name: 'Ctrl+C', exact: true })
   await ctrl.click()
-  has('粘性 Ctrl 点亮时 Ctrl+C 保持普通样式',
-    (await ctrl.getAttribute('class')).includes('bg-emerald-700') &&
-    !(await ctrlC.getAttribute('class')).includes('bg-emerald-700'))
+  has('粘性 Ctrl 点亮时 Ctrl+C 保持普通按键语义',
+    (await ctrl.getAttribute('aria-pressed')) === 'true' &&
+    (await ctrlC.getAttribute('aria-pressed')) === null)
   await ctrl.click()
   await typeLine('echo MARK-9')
   has('移动视口下按键到达 Shell', (await recordedCount(s9, 'MARK-9', 2)) >= 2)

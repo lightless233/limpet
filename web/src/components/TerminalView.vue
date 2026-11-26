@@ -1,15 +1,22 @@
 <script setup lang="ts">
 // 终端视图：wterm(ghostty core) ↔ WebSocket ↔ Go(worker PTY)。
-// 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready/ping，前端→resize/pong）。
+// 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready/size/ping，前端→resize/pong）。
 // 接入由调用方给定的会话 ID 直接进行（会话已在列表中创建）。
 // 断线自动重连（spec 005）：网络抖动、切网、锁屏恢复、server 重启之后自动接回原会话。
-import { nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
 import { Terminal, type WTerm } from '@wterm/vue'
 import { GhosttyCore } from '@wterm/ghostty'
 import '@wterm/vue/css'
+import type { SessionItem } from '../sessions'
+import AppIcon from './AppIcon.vue'
 
-const props = defineProps<{ sessionId: string; sessionName: string }>()
-const emit = defineEmits<{ back: [] }>()
+const props = defineProps<{
+  sessionId: string; sessionName: string; sessions: SessionItem[]
+  sessionsLoading: boolean; sessionsError: string; authExpired: boolean
+}>()
+const emit = defineEmits<{
+  back: []; openSession: [id: string, name: string]; refreshSessions: []; sessionAuthExpired: []
+}>()
 
 // server 每 20s 发一帧 ping；超过这个时限没收到任何消息即判定连接已死（与服务端的 60s 判定对称）。
 const PING_TIMEOUT_MS = 60_000
@@ -17,6 +24,8 @@ const BACKOFF_START_MS = 1000
 const BACKOFF_MAX_MS = 30_000
 
 const term = useTemplateRef('term')
+const rail = useTemplateRef('rail')
+const composerInput = useTemplateRef('composerInput')
 const core = ref<GhosttyCore | null>(null)
 // fatalError：core 加载或 Terminal 初始化失败，终端组件无法存在，
 // 以全屏错误替代终端；重新连接会重建 core 并重新挂载组件。
@@ -30,11 +39,25 @@ const encoder = new TextEncoder()
 let ws: WebSocket | null = null
 // 每次接入重新挂载 Terminal，等该实例的 @ready 再交付输出。
 let termReady = false
-// ready 之前到达的输出先排队（重建帧 + 实时流都在 ready 之后）。
-const pending: Uint8Array[] = []
-// autoResize 的首次回调早于 WS 握手完成，必须把尺寸存下来，
-// 在 onopen 时补发，否则 worker 永远停在初始 80x24。
-let lastSize: { cols: number; rows: number } | null = null
+type Dimensions = { cols: number; rows: number }
+// Vue 终端挂载前收到的尺寸与 VT 字节按同一顺序重放。
+const pending: (Uint8Array | Dimensions)[] = []
+const lockPreference = ref(localStorage.getItem('limpet.lock-width') === 'true')
+const supportsLockWidth = ref<boolean | null>(null)
+const lockedWidth = ref(false)
+const remoteSize = ref<Dimensions>()
+const defaultFontSize = matchMedia('(min-width: 768px)').matches ? 13 : 11
+const storedFontSize = Number(localStorage.getItem('limpet.font-size'))
+const fontSize = ref(Number.isInteger(storedFontSize) && storedFontSize >= 10 && storedFontSize <= 18 ? storedFontSize : defaultFontSize)
+const terminalStyle = computed(() => ({
+  '--limpet-font-size': fontSize.value + 'px',
+  '--limpet-row-height': Math.ceil(fontSize.value * 1.25) + 'px',
+  '--limpet-remote-cols': remoteSize.value?.cols,
+}))
+const viewportHeight = ref<number>()
+const viewportTop = ref(0)
+const railWidth = ref(0)
+let stopRail: (() => void) | undefined
 
 // 重连状态。gen 是接入代数：connect() 中途有 await，期间若发起了新的接入，旧的那次自行作废。
 let gen = 0
@@ -48,6 +71,9 @@ let unmounted = false
 onMounted(() => {
   window.addEventListener('online', reconnectNow)
   document.addEventListener('visibilitychange', reconnectNow)
+  window.visualViewport?.addEventListener('resize', syncViewport)
+  window.visualViewport?.addEventListener('scroll', syncViewport)
+  syncViewport()
   watchdog = window.setInterval(checkLiveness, 1000)
   void connect()
 })
@@ -56,12 +82,16 @@ onBeforeUnmount(() => {
   unmounted = true
   window.removeEventListener('online', reconnectNow)
   document.removeEventListener('visibilitychange', reconnectNow)
+  window.visualViewport?.removeEventListener('resize', syncViewport)
+  window.visualViewport?.removeEventListener('scroll', syncViewport)
   clearTimeout(reconnectTimer)
   clearInterval(watchdog)
   detachSocket()
 })
 
 function detachSocket() {
+  stopRail?.()
+  stopRail = undefined
   if (!ws) return
   // 先摘回调再关闭，避免旧连接的 onclose 污染新一轮连接的状态。
   ws.onopen = ws.onmessage = ws.onclose = null
@@ -82,12 +112,16 @@ async function connect() {
   core.value = null
   termReady = false
   fatalError.value = ''
-  lastSize = null
+  supportsLockWidth.value = null
+  lockedWidth.value = false
+  remoteSize.value = undefined
+  railWidth.value = 0
+  lastMsgAt = 0
 
+  let loaded: GhosttyCore
   try {
-    const loaded = await GhosttyCore.load()
+    loaded = await GhosttyCore.load()
     if (unmounted || my !== gen) return
-    core.value = loaded
   } catch (e) {
     if (unmounted || my !== gen) return
     fatalError.value = e instanceof Error ? e.message : String(e)
@@ -102,7 +136,7 @@ async function connect() {
   sock.onopen = () => {
     if (ws !== sock) return
     lastMsgAt = Date.now()
-    sendResize()
+    if (lockPreference.value) sock.send('{"type":"resize","cols":0,"rows":0}')
   }
   sock.onmessage = (e) => {
     if (ws !== sock) return
@@ -111,23 +145,22 @@ async function connect() {
       // 文本帧 = 控制 JSON。
       try {
         const ctl = JSON.parse(e.data)
-        if (ctl.type === 'ready') {
+        if (ctl.type === 'ready' && !core.value) {
           reconnectDelay = 0
-          status.value = 'connected'
-          // 等 Vue 摘掉 inert 再聚焦，否则 focus 会被吞掉。
-          nextTick(() => term.value?.focus())
+          remoteSize.value = parseDimensions(ctl)
+          supportsLockWidth.value = remoteSize.value !== undefined
+          lockedWidth.value = lockPreference.value && supportsLockWidth.value
+          core.value = loaded
+        } else if (ctl.type === 'size' && lockedWidth.value) {
+          const size = parseDimensions(ctl)
+          if (size) deliver(size)
         } else if (ctl.type === 'ping' && sock.readyState === WebSocket.OPEN) {
           sock.send('{"type":"pong"}')
         }
       } catch { /* 忽略无法解析的控制帧 */ }
       return
     }
-    const bytes = new Uint8Array(e.data as ArrayBuffer)
-    if (!termReady) {
-      pending.push(bytes)
-    } else {
-      term.value?.write(bytes)
-    }
+    deliver(new Uint8Array(e.data as ArrayBuffer))
   }
   sock.onclose = (e) => {
     // 已被替换或主动关闭的旧连接不算断线。
@@ -153,6 +186,7 @@ async function onDisconnected(code: number) {
   if (verdict === 'gone' || verdict === 'auth') {
     waitingToReconnect = false
     status.value = verdict === 'gone' ? 'ended' : 'authExpired'
+    if (verdict === 'auth') emit('sessionAuthExpired')
     return
   }
   scheduleReconnect()
@@ -201,17 +235,38 @@ function checkLiveness() {
   scheduleReconnect()
 }
 
-function flushPending() {
-  for (const bytes of pending) term.value?.write(bytes)
-  pending.length = 0
+function parseDimensions(ctl: Dimensions): Dimensions | undefined {
+  const { cols, rows } = ctl
+  if (Number.isInteger(cols) && cols >= 2 && cols <= 500 && Number.isInteger(rows) && rows >= 2 && rows <= 200) {
+    return { cols, rows }
+  }
+}
+
+function deliver(event: Uint8Array | Dimensions) {
+  if (!termReady) {
+    pending.push(event)
+  } else if (event instanceof Uint8Array) {
+    term.value?.write(event)
+  } else {
+    // Apply synchronously, before the next VT frame. The props also retain the current geometry.
+    remoteSize.value = event
+    term.value?.resize(event.cols, event.rows)
+  }
 }
 
 // 输入闸门：WS 打开 + 已收到 ready。接入中与重连中的按键直接丢弃，不缓冲。
-function sendInput(bytes: Uint8Array) {
-  if (ws?.readyState !== WebSocket.OPEN || status.value !== 'connected') return
+function sendInput(bytes: Uint8Array): boolean {
+  const sock = ws
+  if (sock?.readyState !== WebSocket.OPEN || status.value !== 'connected') return false
   const CHUNK = 64 * 1024
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    ws.send(bytes.slice(i, i + CHUNK))
+  try {
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      if (sock.readyState !== WebSocket.OPEN) return false
+      sock.send(bytes.slice(i, i + CHUNK))
+    }
+    return sock.readyState === WebSocket.OPEN
+  } catch {
+    return false
   }
 }
 
@@ -235,23 +290,28 @@ function onBinary(bytes: Uint8Array) {
   sendInput(new Uint8Array(bytes))
 }
 
-function sendResize() {
-  if (ws?.readyState === WebSocket.OPEN && lastSize) {
-    ws.send(JSON.stringify({ type: 'resize', ...lastSize }))
+function onResize(cols: number, rows: number) {
+  if (!lockedWidth.value && ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'resize', cols, rows }))
   }
 }
 
-function onResize(cols: number, rows: number) {
-  lastSize = { cols, rows }
-  sendResize()
-}
-
 function onReady(wt: WTerm) {
-  // 从实例申报初始尺寸，后续尺寸变化由 @resize 更新。
-  lastSize = { cols: wt.cols, rows: wt.rows }
-  sendResize()
+  if (ws?.readyState !== WebSocket.OPEN || !core.value) return
+  onResize(wt.cols, wt.rows)
   termReady = true
-  flushPending()
+  status.value = 'connected'
+  for (const event of pending) deliver(event)
+  pending.length = 0
+  if (lockedWidth.value) observeRail(wt.element)
+  emit('refreshSessions')
+  const my = gen
+  void nextTick(() => {
+    const focus = document.activeElement
+    if (my === gen && status.value === 'connected' && focus !== composerInput.value && !focus?.closest('dialog[open]')) {
+      term.value?.focus()
+    }
+  })
 }
 
 // WTerm 初始化失败（wasm 加载/实例化问题）：终端不可用，转为 fatalError；
@@ -294,8 +354,94 @@ function toggleCtrl() {
   term.value?.focus()
 }
 
-function goBack() {
-  emit('back')
+function syncViewport() {
+  const viewport = window.visualViewport
+  const keyboardResized = viewport && Math.abs(viewport.scale - 1) < 0.01 && viewport.height < window.innerHeight - 1
+  viewportHeight.value = keyboardResized ? viewport.height : undefined
+  viewportTop.value = keyboardResized ? viewport.offsetTop : 0
+}
+
+function observeRail(el: HTMLElement) {
+  const syncScroll = () => {
+    if (rail.value && rail.value.scrollLeft !== el.scrollLeft) rail.value.scrollLeft = el.scrollLeft
+  }
+  let lastHeight = el.clientHeight
+  let following = el.scrollHeight - el.scrollTop - lastHeight < 5
+  const onScroll = () => {
+    if (el.clientHeight === lastHeight) following = el.scrollHeight - el.scrollTop - lastHeight < 5
+    syncScroll()
+  }
+  const observer = new ResizeObserver(() => {
+    if (el.clientHeight !== lastHeight) {
+      lastHeight = el.clientHeight
+      if (following) el.scrollTop = el.scrollHeight
+    }
+    const overflow = el.scrollWidth - el.clientWidth
+    railWidth.value = overflow > 1 ? el.offsetWidth + overflow : 0
+    void nextTick(syncScroll)
+  })
+  observer.observe(el)
+  const grid = el.querySelector('.term-grid')
+  if (grid) observer.observe(grid)
+  el.addEventListener('scroll', onScroll, { passive: true })
+  stopRail = () => {
+    observer.disconnect()
+    el.removeEventListener('scroll', onScroll)
+  }
+}
+
+function panTerminal() {
+  const el = term.value?.instance?.element
+  if (el && rail.value && el.scrollLeft !== rail.value.scrollLeft) el.scrollLeft = rail.value.scrollLeft
+}
+
+function scrollToBottom() {
+  const el = term.value?.instance?.element
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function toggleLockWidth() {
+  if (!supportsLockWidth.value || status.value !== 'connected') return
+  lockPreference.value = !lockedWidth.value
+  localStorage.setItem('limpet.lock-width', String(lockPreference.value))
+  void connect()
+}
+
+function setFontSize(size?: number) {
+  fontSize.value = size ?? defaultFontSize
+  if (size === undefined) localStorage.removeItem('limpet.font-size')
+  else localStorage.setItem('limpet.font-size', String(size))
+}
+
+const composerOpen = ref(false)
+const draft = ref('')
+function toggleComposer() {
+  composerOpen.value = !composerOpen.value
+  void nextTick(() => {
+    if (composerOpen.value) composerInput.value?.focus({ preventScroll: true })
+    else term.value?.focus()
+  })
+}
+
+function sendDraft(enter: boolean) {
+  if (sendInput(encoder.encode(draft.value + (enter ? '\r' : '')))) {
+    draft.value = ''
+    composerInput.value?.focus({ preventScroll: true })
+  }
+}
+
+function composerEnter(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) {
+    e.preventDefault()
+    return
+  }
+  if (e.shiftKey) return
+  e.preventDefault()
+  composerInput.value?.form?.requestSubmit()
+}
+
+function refreshQuickSwitch(e: ToggleEvent) {
+  if (e.newState === 'open') emit('refreshSessions')
 }
 
 const statusText = {
@@ -313,89 +459,122 @@ function reloadPage() {
 </script>
 
 <template>
-  <div
-    class="flex h-dvh flex-col bg-neutral-950 text-neutral-200 pt-[env(safe-area-inset-top)]"
-  >
-    <header class="flex items-center gap-2 px-3 py-2 text-sm">
-      <button
-        class="h-9 w-9 shrink-0 rounded-md text-lg text-neutral-400 active:bg-neutral-800 hover:text-neutral-200"
-        title="返回列表"
-        @click="goBack"
-      >
-        ←
+  <main class="terminal-page flex min-h-0 min-w-0 flex-col bg-[var(--limpet-canvas)]"
+    :style="{ height: viewportHeight === undefined ? '100%' : viewportHeight + 'px', marginTop: viewportTop + 'px' }">
+    <header class="terminal-header flex shrink-0 items-center gap-1 border-b border-[var(--limpet-line)] bg-[var(--limpet-surface)] text-sm">
+      <button class="control shrink-0" aria-label="返回会话列表" title="返回会话列表" @click="emit('back')">
+        <AppIcon name="back" />
       </button>
-      <span class="truncate font-semibold tracking-tight">{{ sessionName }}</span>
-      <span
-        class="shrink-0 rounded-full px-2 py-0.5 text-xs"
-        :class="{
-          'bg-neutral-800 text-neutral-400': status === 'connecting' || status === 'ended',
-          'bg-amber-900/60 text-amber-400': status === 'reconnecting',
-          'bg-emerald-900/60 text-emerald-400': status === 'connected',
-          'bg-red-900/60 text-red-400': status === 'authExpired' || status === 'error',
-        }"
-      >
-        {{ statusText[status] }}
-      </span>
-      <button
-        v-if="status === 'error'"
-        class="ml-auto shrink-0 rounded-md bg-neutral-800 px-3 py-1.5 text-xs active:scale-95 hover:bg-neutral-700"
-        @click="connect"
-      >
-        重新连接
+      <button class="control min-w-0 flex-1 justify-start bg-transparent text-left" popovertarget="quick-switch"
+        aria-label="切换会话" :title="sessionName">
+        <span class="min-w-0 truncate font-semibold">{{ sessionName }}</span><AppIcon name="down" class="shrink-0" />
       </button>
-      <button
-        v-else-if="status === 'authExpired'"
-        class="ml-auto shrink-0 rounded-md bg-neutral-800 px-3 py-1.5 text-xs active:scale-95 hover:bg-neutral-700"
-        @click="reloadPage"
-      >
-        刷新页面
+      <span class="terminal-status shrink-0 text-xs" :data-status="status" role="status">{{ statusText[status] }}</span>
+      <button v-if="status === 'error'" class="control shrink-0 text-xs" @click="connect">重新连接</button>
+      <button v-else-if="status === 'authExpired'" class="control shrink-0 text-xs" @click="reloadPage">刷新页面</button>
+      <button class="control terminal-lock shrink-0" :aria-pressed="lockedWidth" aria-label="锁定原宽"
+        :title="supportsLockWidth === false ? '旧版 worker 不支持锁定原宽' : '锁定原宽'"
+        :disabled="status !== 'connected' || !supportsLockWidth" @click="toggleLockWidth">
+        <AppIcon name="lock" />
+      </button>
+      <button class="control shrink-0" aria-label="终端工具" title="终端工具" popovertarget="terminal-tools">
+        <AppIcon name="more" />
       </button>
     </header>
 
-    <div v-if="fatalError" class="flex-1 overflow-auto p-6 font-mono text-sm text-red-400">
+    <nav id="quick-switch" class="terminal-popover terminal-switcher" aria-label="快速切换会话" popover
+      @toggle="refreshQuickSwitch">
+      <p v-if="authExpired" role="status" class="text-sm text-[var(--limpet-danger)]">登录已失效</p>
+      <template v-else>
+        <p v-if="sessionsError" role="alert" class="text-sm text-[var(--limpet-danger)]">
+          {{ sessionsError }} <button class="control" @click="emit('refreshSessions')">重试</button>
+        </p>
+        <p v-else-if="sessionsLoading && !sessions.length" class="text-sm text-[var(--limpet-muted)]">加载中…</p>
+        <ul class="grid gap-1">
+          <li v-for="session in sessions" :key="session.id" class="min-w-0">
+            <button class="control w-full min-w-0 justify-start text-left" :aria-current="session.id === sessionId ? 'true' : undefined"
+              :disabled="session.id === sessionId" @click="emit('openSession', session.id, session.name)">
+              <span class="size-1.5 shrink-0 rounded-full"
+                :class="session.attached ? 'bg-[var(--limpet-accent)]' : 'bg-[var(--limpet-muted)]'"></span>
+              <span class="truncate">{{ session.name }}</span>
+            </button>
+          </li>
+        </ul>
+      </template>
+      <button class="control mt-2 w-full justify-start" @click="emit('back')">
+        <AppIcon name="back" /> 返回会话列表
+      </button>
+    </nav>
+
+    <div id="terminal-tools" class="terminal-popover terminal-tools" aria-label="终端工具" popover>
+      <div class="flex items-center gap-1 text-sm">
+        <button class="control" aria-label="减小字号" title="减小字号" :disabled="fontSize <= 10" @click="setFontSize(fontSize - 1)">
+          <AppIcon name="minus" />
+        </button>
+        <output aria-label="终端字号" class="min-w-6 text-center tabular-nums">{{ fontSize }}</output>
+        <button class="control" aria-label="增大字号" title="增大字号" :disabled="fontSize >= 18" @click="setFontSize(fontSize + 1)">
+          <AppIcon name="add" />
+        </button>
+        <button class="control" @click="setFontSize()">重置字号</button>
+        <button class="control" aria-label="滚到底部" title="滚到底部" :disabled="!core" @click="scrollToBottom">
+          <AppIcon name="bottom" />
+        </button>
+      </div>
+      <p v-if="supportsLockWidth === false" role="status" class="mt-2 text-xs text-[var(--limpet-muted)]">
+        旧版 worker 不支持锁定原宽
+      </p>
+    </div>
+
+    <div v-if="fatalError" class="min-h-0 flex-1 overflow-auto p-4 text-sm text-[var(--limpet-danger)]">
       {{ fatalError }}
     </div>
-
-    <div
-      v-else
-      class="min-h-0 flex-1 px-2"
-      :inert="status === 'connecting' || status === 'reconnecting'"
-    >
-      <Terminal
-        v-if="core"
-        ref="term"
-        :core="core"
-        auto-resize
-        :scrollback-lines="10000"
-        class="h-full w-full"
-        @data="onData"
-        @binary="onBinary"
-        @resize="onResize"
-        @ready="onReady"
-        @error="onTerminalError"
-      />
+    <div v-else class="terminal-viewport flex min-h-0 min-w-0 flex-1 flex-col"
+      :class="{ 'terminal-locked': lockedWidth }" :style="terminalStyle"
+      :inert="status === 'connecting' || status === 'reconnecting'">
+      <div class="relative min-h-0 min-w-0 flex-1">
+        <Terminal
+          v-if="core"
+          ref="term"
+          :core="core"
+          :auto-resize="!lockedWidth"
+          :cols="lockedWidth ? remoteSize?.cols : undefined"
+          :rows="lockedWidth ? remoteSize?.rows : undefined"
+          :scrollback-lines="10000"
+          class="absolute inset-0 h-full w-full"
+          @data="onData"
+          @binary="onBinary"
+          @resize="onResize"
+          @ready="onReady"
+          @error="onTerminalError"
+        />
+      </div>
+      <div v-if="lockedWidth" v-show="railWidth" ref="rail" class="terminal-pan shrink-0"
+        role="region" tabindex="0" aria-label="横向滚动终端" @scroll.passive="panTerminal">
+        <div :style="{ width: railWidth + 'px' }"></div>
+      </div>
     </div>
 
-    <!-- 移动按键栏（charter 验收 3）：桌面视口隐藏 -->
-    <div
-      class="flex gap-1 overflow-x-auto border-t border-neutral-800 bg-neutral-900/80 px-1 py-1 pb-[max(env(safe-area-inset-bottom),0.25rem)] touch-manipulation md:hidden"
-    >
-      <button
-        v-for="k in KEY_DEFS"
-        :key="k.label"
-        class="min-w-[3.25rem] shrink-0 rounded-md bg-neutral-800 px-2 py-2 text-sm text-neutral-200 active:bg-neutral-600"
-        @click="sendKey(k.bytes)"
-      >
-        {{ k.label }}
-      </button>
-      <button
-        class="min-w-[3.25rem] shrink-0 rounded-md px-2 py-2 text-sm active:bg-neutral-600"
-        :class="ctrlSticky ? 'bg-emerald-700 text-white' : 'bg-neutral-800 text-neutral-200'"
-        title="粘性 Ctrl：点亮后下一个字母以 Ctrl 组合发送"
-        @click="toggleCtrl"
-      >
-        Ctrl
-      </button>
+    <form v-if="composerOpen" class="terminal-footer flex shrink-0 items-end gap-1 border-t border-[var(--limpet-line)] bg-[var(--limpet-surface)] py-1"
+      @submit.prevent="sendDraft(true)">
+      <label for="terminal-draft" class="sr-only">终端输入</label>
+      <textarea id="terminal-draft" ref="composerInput" v-model="draft" rows="2"
+        class="terminal-draft min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-control)] px-2 py-1.5"
+        autocapitalize="off" spellcheck="false" @keydown.enter="composerEnter"></textarea>
+      <button type="button" class="control shrink-0 text-sm" :disabled="status !== 'connected' || !draft" @click="sendDraft(false)">仅发字</button>
+      <button type="submit" class="control control-primary shrink-0 text-sm" :disabled="status !== 'connected'">发送</button>
+    </form>
+
+    <div class="terminal-footer terminal-keys min-w-0 shrink-0 items-stretch gap-1 border-t border-[var(--limpet-line)] bg-[var(--limpet-surface)] pt-1">
+      <div class="flex min-w-0 flex-1 items-start gap-1 overflow-x-auto overscroll-x-contain" aria-label="终端快捷键">
+        <button v-for="k in KEY_DEFS" :key="k.label" class="control shrink-0 text-sm" @click="sendKey(k.bytes)">{{ k.label }}</button>
+        <button class="control shrink-0 text-sm" title="粘性 Ctrl：点亮后下一个字母以 Ctrl 组合发送"
+          :aria-pressed="ctrlSticky" @click="toggleCtrl">Ctrl</button>
+      </div>
+      <div class="flex shrink-0 items-start border-l border-[var(--limpet-line)] pl-1">
+        <button class="control" aria-label="输入条" title="输入条" :aria-expanded="composerOpen" @click="toggleComposer">
+          <AppIcon name="composer" />
+        </button>
+      </div>
     </div>
-  </div>
+  </main>
 </template>
