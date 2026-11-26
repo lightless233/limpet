@@ -4,7 +4,7 @@
 
 - 每完成一个可提交的工作单元就自动 commit，不用询问用户
 - 提交信息：英文 Conventional Commits（`feat:` / `fix:` / `docs:` …）
-- 尾注固定为：`Co-authored-by: ZCode (GLM-5.3-Flash) <noreply@bigmodel.cn>`
+- `Co-authored-by` 尾注按实际执行的 agent / 模型填写，不在文档中写死具体型号；执行方自行获取自身实际的 agent 与模型名称，若拿不准必须先向用户确认，不可沿用历史型号或猜测
 - 仓库局部身份：`lightless233 <lightless@foxmail.com>`；分支 `master`；不主动 push
 
 ## 开发与运行
