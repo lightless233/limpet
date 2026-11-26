@@ -359,7 +359,7 @@ try {
   await page.goto(ORIGIN)
   const row = page.locator('li').filter({ hasText: '关闭中会话' })
   await row.waitFor({ state: 'visible' })
-  await page.getByRole('button', { name: /新建/ }).click()
+  await page.getByRole('complementary', { name: '会话列表' }).getByRole('button', { name: '新建', exact: true }).click()
   has('创建输入框提示留空自动生成', await page.getByPlaceholder('会话名（留空自动生成）').isVisible())
   await page.getByRole('button', { name: '取消' }).click()
   await row.locator('[title="重命名"]').click()
@@ -375,11 +375,14 @@ try {
   }, { times: 1 })
   const closing = page.waitForRequest(closeURL, { timeout: 8000 })
   try {
-    page.once('dialog', (dialog) => dialog.accept())
     await row.locator('[title="关闭"]').click()
+    const dialog = page.getByRole('dialog', { name: '关闭会话' })
+    has('关闭确认初始焦点在取消按钮', await dialog.getByRole('button', { name: '取消' }).evaluate((el) => el === document.activeElement))
+    await dialog.getByRole('button', { name: '确认关闭' }).click()
     await closing
-    has('关闭期间只禁用对应会话的打开与关闭按钮',
+    has('关闭期间禁用对应会话的打开、重命名与关闭按钮',
       await row.getByRole('button', { name: /关闭中会话/ }).isDisabled() &&
+      await row.getByRole('button', { name: '重命名' }).isDisabled() &&
       await row.locator('[title="关闭"]').isDisabled() &&
       await page.getByRole('button', { name: /重连-S9/ }).isEnabled())
   } finally {

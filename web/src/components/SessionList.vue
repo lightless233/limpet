@@ -1,236 +1,241 @@
 <script setup lang="ts">
-// 会话列表（移动端即首页）：新建（可命名）/ 接入 / 重命名 / 关闭。
-// 数据实时来自后端（worker 进程是事实来源），增删改后刷新。
-// 显示一律用 name（显示名）；id（uuid）只用于寻址，不出现在界面上。
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, toRaw, useTemplateRef, watch } from 'vue'
+import type { useSessions } from '../sessions'
+import AppIcon from './AppIcon.vue'
 
-interface SessionItem {
-  id: string
-  name: string
-  created: string
-  attached: boolean
-}
-
+const props = defineProps<{ store: ReturnType<typeof useSessions>; activeId?: string }>()
 const emit = defineEmits<{ open: [id: string, name: string] }>()
-
-const sessions = ref<SessionItem[]>([])
-const loading = ref(true)
-const loadError = ref('')
+const { sessions, loading, loadError, authExpired, request, refresh } = props.store
 const busy = ref(false)
 const closing = ref(new Set<string>())
-const authExpired = ref(false)
-let refreshVersion = 0
+const closeError = ref('')
 
-// 底部弹层：null = 关闭
-type Sheet = null | { mode: 'create'; name: string } | { mode: 'rename'; id: string; name: string }
-const sheet = ref<Sheet>(null)
-const sheetError = ref('')
-const nameInput = ref<HTMLInputElement | null>(null)
-
-watch(sheet, (v) => {
-  if (v) nextTick(() => nameInput.value?.focus())
-})
-
-async function sessionRequest(url: string, init?: RequestInit) {
-  const res = await fetch(url, { ...init, redirect: 'manual' })
-  if (res.type === 'opaqueredirect') {
-    authExpired.value = true
-    return
+type Action = { mode: 'create'; name: string } | { mode: 'rename' | 'close'; id: string; name: string }
+const action = ref<Action | null>(null)
+const actionError = ref('')
+const dialog = useTemplateRef('dialog')
+const actionTitle = computed(() => {
+  switch (action.value?.mode) {
+    case 'create': return '新建会话'
+    case 'rename': return '重命名会话'
+    case 'close': return '关闭会话'
+    default: return ''
   }
-  return res
-}
+})
 
 function reloadPage() {
   location.reload()
 }
 
-async function refresh() {
-  const version = ++refreshVersion
-  loading.value = true
-  loadError.value = ''
-  try {
-    const res = await sessionRequest('/api/term')
-    if (!res) return
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const list: SessionItem[] = await res.json()
-    if (version === refreshVersion) sessions.value = list
-  } catch (e) {
-    if (version === refreshVersion) loadError.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    if (version === refreshVersion) loading.value = false
-  }
+async function openAction(next: Action) {
+  if (busy.value || authExpired.value || ('id' in next && closing.value.has(next.id))) return
+  action.value = next
+  actionError.value = ''
+  await nextTick()
+  if (toRaw(action.value) === next && !dialog.value?.open) dialog.value?.showModal()
 }
 
-onMounted(refresh)
+function openCreate() {
+  void openAction({ mode: 'create', name: '' })
+}
 
-async function submitSheet() {
-  const s = sheet.value
-  if (!s || busy.value || authExpired.value) return
+defineExpose({ openCreate })
+
+let outsidePointer: number | null = null
+function isOutside(e: PointerEvent) {
+  const bounds = dialog.value!.getBoundingClientRect()
+  return e.clientX < bounds.left || e.clientX > bounds.right || e.clientY < bounds.top || e.clientY > bounds.bottom
+}
+const lightDismiss = 'closedBy' in HTMLDialogElement.prototype ? {} : {
+  pointerdown(e: PointerEvent) {
+    outsidePointer = e.isPrimary && e.button === 0 && isOutside(e) ? e.pointerId : null
+  },
+  pointerup(e: PointerEvent) {
+    if (outsidePointer === e.pointerId && isOutside(e)) dialog.value?.close()
+    outsidePointer = null
+  },
+  pointercancel() {
+    outsidePointer = null
+  },
+}
+
+function onDialogClose() {
+  const el = dialog.value
+  if (!el || el.open) return
+  el.returnValue = ''
+  outsidePointer = null
+  action.value = null
+}
+
+watch(authExpired, (expired) => {
+  if (expired) dialog.value?.close()
+})
+
+function preventComposingSubmit(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) e.preventDefault()
+}
+
+async function submitAction() {
+  const current = action.value
+  if (!current || !dialog.value?.open || busy.value || authExpired.value) return
+  if (current.mode === 'close') {
+    dialog.value?.close()
+    await closeSession(current.id)
+    return
+  }
+  if (current.mode === 'rename' && closing.value.has(current.id)) return
   busy.value = true
-  sheetError.value = ''
+  actionError.value = ''
   try {
-    const url = s.mode === 'create' ? '/api/term' : `/api/term/${encodeURIComponent(s.id)}/rename`
-    const res = await sessionRequest(url, {
+    const url = current.mode === 'create' ? '/api/term' : '/api/term/' + encodeURIComponent(current.id) + '/rename'
+    const res = await request(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: s.name.trim() }),
+      body: JSON.stringify({ name: current.name.trim() }),
     })
     if (!res) return
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
-      throw new Error(data.error ?? `HTTP ${res.status}`)
+      throw new Error(data.error ?? 'HTTP ' + res.status)
     }
-    sheet.value = null
+    if (action.value === current) dialog.value?.close()
     await refresh()
   } catch (e) {
-    sheetError.value = e instanceof Error ? e.message : String(e)
+    actionError.value = e instanceof Error ? e.message : String(e)
   } finally {
     busy.value = false
   }
 }
 
-const closeError = ref('')
-
-async function closeSession(s: SessionItem) {
-  if (closing.value.has(s.id) || authExpired.value) return
-  if (!confirm(`关闭会话「${s.name}」？其中的 Shell 将被终止。`)) return
-  closing.value.add(s.id)
+async function closeSession(id: string) {
+  if (closing.value.has(id) || authExpired.value) return
+  closing.value.add(id)
   closeError.value = ''
   try {
-    const res = await sessionRequest(`/api/term/${encodeURIComponent(s.id)}/close`, { method: 'POST' })
+    const res = await request('/api/term/' + encodeURIComponent(id) + '/close', { method: 'POST' })
     if (!res) return
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
-      throw new Error(data.error ?? `HTTP ${res.status}`)
+      throw new Error(data.error ?? 'HTTP ' + res.status)
     }
-    sessions.value = sessions.value.filter((item) => item.id !== s.id)
+    sessions.value = sessions.value.filter((item) => item.id !== id)
     await refresh()
   } catch (e) {
-    closeError.value = `关闭失败: ${e instanceof Error ? e.message : String(e)}`
+    closeError.value = '关闭失败：' + (e instanceof Error ? e.message : String(e))
   } finally {
-    closing.value.delete(s.id)
+    closing.value.delete(id)
   }
 }
 
 function fmtTime(iso: string) {
   const d = new Date(iso)
   const now = new Date()
-  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
   return d.toDateString() === now.toDateString()
-    ? `今天 ${hm}`
-    : `${d.getMonth() + 1}/${d.getDate()} ${hm}`
+    ? '今天 ' + hm
+    : (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm
 }
 </script>
 
 <template>
-  <div class="flex h-dvh flex-col bg-neutral-950 text-neutral-200 pt-[env(safe-area-inset-top)]">
-    <header class="flex items-center justify-between px-4 pb-2 pt-3">
-      <h1 class="text-xl font-bold tracking-tight">Limpet</h1>
-      <button
-        v-if="!authExpired"
-        class="rounded-md bg-neutral-800 px-3 py-2 text-sm active:scale-95 hover:bg-neutral-700"
-        @click="sheet = { mode: 'create', name: '' }; sheetError = ''"
-      >
-        ＋ 新建
+  <aside aria-label="会话列表" class="session-list min-h-0 min-w-0 flex-col bg-[var(--limpet-surface)] lg:border-r lg:border-[var(--limpet-line)]">
+    <header class="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--limpet-line)] px-3 py-2">
+      <h1 class="flex items-center gap-2 text-lg font-semibold tracking-tight">
+        <AppIcon name="terminal" class="text-[var(--limpet-accent)]" /> Limpet
+      </h1>
+      <button v-if="!authExpired" class="control text-sm" @click="openCreate">
+        <AppIcon name="add" /> 新建
       </button>
     </header>
 
-    <main
-      v-if="authExpired"
-      class="min-h-0 flex-1 space-y-2 px-3"
-    >
-      <p class="px-1 py-2 text-sm text-red-400">登录已失效</p>
-      <button
-        class="rounded-md bg-neutral-800 px-3 py-2 text-sm active:scale-95 hover:bg-neutral-700"
-        @click="reloadPage"
-      >
-        刷新页面
-      </button>
+    <main v-if="authExpired" class="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
+      <p role="alert" class="text-sm text-[var(--limpet-danger)]">登录已失效</p>
+      <button class="control text-sm" @click="reloadPage">刷新页面</button>
     </main>
 
-    <main v-else class="min-h-0 flex-1 overflow-y-auto px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
-      <p v-if="closeError" class="px-1 py-2 text-sm text-red-400">{{ closeError }}</p>
-      <p v-if="loadError" class="px-1 py-2 text-sm text-red-400">{{ loadError }}</p>
-      <p v-else-if="loading && !sessions.length" class="px-1 py-2 text-sm text-neutral-500">加载中…</p>
-      <p v-else-if="!sessions.length" class="px-1 py-6 text-center text-sm text-neutral-500">
-        还没有会话<br />点右上角「新建」开始
+    <main v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">
+      <p v-if="closeError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">{{ closeError }}</p>
+      <p v-if="loadError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">
+        {{ loadError }} <button class="control" @click="refresh">重试</button>
       </p>
+      <p v-else-if="loading && !sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">加载中…</p>
+      <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>
 
-      <ul class="space-y-2">
-        <li v-for="s in sessions" :key="s.id">
-          <div class="flex items-center gap-1 rounded-lg border border-neutral-800 bg-neutral-900/60 p-1">
-            <button
-              class="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-3 text-left active:bg-neutral-800 disabled:opacity-50"
-              :disabled="closing.has(s.id)"
-              @click="emit('open', s.id, s.name)"
-            >
-              <span
-                class="h-2 w-2 shrink-0 rounded-full"
-                :class="s.attached ? 'bg-emerald-400' : 'bg-neutral-600'"
-                :title="s.attached ? '使用中' : '空闲'"
-              ></span>
-              <span class="min-w-0">
-                <span class="block truncate font-medium">{{ s.name }}</span>
-                <span class="block text-xs text-neutral-500">{{ fmtTime(s.created) }}</span>
+      <ul class="grid gap-1">
+        <li v-for="s in sessions" :key="s.id" class="flex min-w-0 items-center gap-1 rounded-md px-1"
+          :class="activeId === s.id ? 'bg-[var(--limpet-control)]' : ''">
+          <button
+            class="session-entry flex min-h-11 min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-2 text-left disabled:opacity-50"
+            :aria-current="activeId === s.id ? 'true' : undefined"
+            :disabled="closing.has(s.id)"
+            @click="emit('open', s.id, s.name)"
+          >
+            <span class="mt-1.5 size-2 shrink-0 rounded-full" :class="s.attached ? 'bg-[var(--limpet-accent)]' : 'bg-[var(--limpet-muted)]'"
+              :title="s.attached ? '使用中' : '空闲'"></span>
+            <span class="grid min-w-0 flex-1 gap-0.5">
+              <span class="truncate text-sm font-medium">{{ s.name }}</span>
+              <span v-if="s.cmd || s.cwd" class="flex min-w-0 items-center gap-1.5 text-xs text-[var(--limpet-muted)] [font-family:var(--limpet-mono)]">
+                <span v-if="s.cmd" class="max-w-[6rem] shrink-0 truncate rounded bg-[var(--limpet-control)] px-1">{{ s.cmd }}</span>
+                <span v-if="s.cwd" class="cwd truncate" :title="s.cwd"><bdi dir="ltr">{{ s.cwd }}</bdi></span>
               </span>
-            </button>
-            <button
-              class="h-11 w-11 shrink-0 rounded-md text-neutral-400 active:bg-neutral-800 hover:text-neutral-200"
-              title="重命名"
-              @click.stop="sheet = { mode: 'rename', id: s.id, name: s.name }; sheetError = ''"
-            >
-              ✎
-            </button>
-            <button
-              class="h-11 w-11 shrink-0 rounded-md text-neutral-400 active:bg-neutral-800 hover:text-red-400 disabled:opacity-50"
-              title="关闭"
-              :disabled="closing.has(s.id)"
-              @click.stop="closeSession(s)"
-            >
-              ✕
-            </button>
-          </div>
+              <time :datetime="s.created" class="text-xs text-[var(--limpet-muted)]">{{ fmtTime(s.created) }}</time>
+            </span>
+          </button>
+          <button class="control shrink-0 text-[var(--limpet-muted)]" aria-label="重命名" title="重命名"
+            :disabled="closing.has(s.id)" @click="openAction({ mode: 'rename', id: s.id, name: s.name })">
+            <AppIcon name="edit" />
+          </button>
+          <button class="control shrink-0 text-[var(--limpet-danger)]" aria-label="关闭" title="关闭"
+            :disabled="closing.has(s.id)" @click="openAction({ mode: 'close', id: s.id, name: s.name })">
+            <AppIcon name="close" />
+          </button>
         </li>
       </ul>
     </main>
 
-    <!-- 底部弹层：新建 / 重命名 -->
-    <div
-      v-if="sheet && !authExpired"
-      class="fixed inset-0 z-10 flex flex-col justify-end bg-black/60"
-      @click.self="sheet = null"
-    >
-      <div class="rounded-t-2xl bg-neutral-900 p-4 pb-[max(env(safe-area-inset-bottom),1rem)]">
-        <h2 class="mb-3 text-sm font-semibold text-neutral-300">
-          {{ sheet.mode === 'create' ? '新建会话' : '重命名会话' }}
-        </h2>
-        <input
-          ref="nameInput"
-          v-model="sheet.name"
-          class="w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-base outline-none focus:border-neutral-500"
-          :placeholder="sheet.mode === 'create' ? '会话名（留空自动生成）' : '输入新的会话名'"
-          enterkeyhint="done"
-          autocomplete="off"
-          spellcheck="false"
-          @keyup.enter="submitSheet"
-        />
-        <p v-if="sheetError" class="mt-2 text-sm text-red-400">{{ sheetError }}</p>
-        <div class="mt-4 flex gap-2">
-          <button
-            class="flex-1 rounded-md bg-neutral-800 py-2.5 text-sm active:scale-95"
-            @click="sheet = null"
-          >
-            取消
-          </button>
-          <button
-            class="flex-1 rounded-md bg-emerald-600 py-2.5 text-sm font-medium text-white active:scale-95 disabled:opacity-50"
-            :disabled="busy"
-            @click="submitSheet"
-          >
-            确定
+    <dialog ref="dialog" closedby="any" class="session-dialog" aria-labelledby="session-action-title"
+      @close="onDialogClose" v-on="lightDismiss">
+      <form v-if="action" class="grid gap-3" @submit.prevent="submitAction">
+        <h2 id="session-action-title" class="text-base font-semibold">{{ actionTitle }}</h2>
+        <p v-if="action.mode === 'close'" class="min-w-0 wrap-anywhere text-sm text-[var(--limpet-muted)]">
+          关闭「{{ action.name }}」会终止其中的进程。
+        </p>
+        <input v-else v-model="action.name" autofocus autocomplete="off" spellcheck="false" enterkeyhint="done"
+          class="min-w-0 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-2 text-base focus-visible:outline-[var(--limpet-accent)]"
+          aria-label="会话名" :placeholder="action.mode === 'create' ? '会话名（留空自动生成）' : '输入新的会话名'"
+          @keydown.enter="preventComposingSubmit" />
+        <p v-if="actionError" role="alert" class="text-sm text-[var(--limpet-danger)]">{{ actionError }}</p>
+        <div class="flex justify-end gap-2 text-sm">
+          <button v-if="action.mode === 'close'" type="button" class="control" autofocus @click="dialog?.close()">取消</button>
+          <button v-else type="button" class="control" @click="dialog?.close()">取消</button>
+          <button type="submit" class="control" :class="action.mode === 'close' ? 'control-danger' : 'control-primary'" :disabled="busy">
+            {{ action.mode === 'close' ? '确认关闭' : '确定' }}
           </button>
         </div>
-      </div>
-    </div>
-  </div>
+      </form>
+    </dialog>
+  </aside>
 </template>
+
+<style scoped>
+.session-list {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+.session-entry:hover { background: var(--limpet-control); }
+.cwd { direction: rtl; }
+.session-dialog {
+  margin: auto;
+  width: min(26rem, calc(100% - max(1rem, env(safe-area-inset-left)) - max(1rem, env(safe-area-inset-right))));
+  max-height: calc(100% - max(1rem, env(safe-area-inset-top)) - max(1rem, env(safe-area-inset-bottom)));
+  padding: 1rem;
+  overflow: auto;
+  border: 1px solid var(--limpet-line);
+  border-radius: 0.75rem;
+  background: var(--limpet-surface);
+  color: var(--limpet-text);
+}
+
+.session-dialog:modal { overscroll-behavior: contain; }
+.session-dialog::backdrop { background: rgb(0 0 0 / 65%); overflow: hidden; overscroll-behavior: contain; }
+</style>
