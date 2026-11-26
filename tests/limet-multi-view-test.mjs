@@ -38,138 +38,142 @@ const waitReady = async (st) => {
   return st.ready
 }
 
-// ---- 0. 清理上次运行的同名残留（关闭含 TERM→KILL 宽限）----
-{
-  const list = await (await fetch(`${BASE}/api/term`)).json()
-  for (const s of list.filter((x) => x.name === '多视图')) {
-    await fetch(`${BASE}/api/term/${s.id}/close`, { method: 'POST' })
-    await sleep(3500)
-  }
-}
-
-// ---- 1. 双 viewer 同时接入 ----
-const { id } = await (await fetch(`${BASE}/api/term`, {
+const created = await fetch(`${BASE}/api/term`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ name: '多视图' }),
-})).json()
-console.log('创建:', id)
-const [a, b] = await Promise.all([attach(id), attach(id)])
-const rA = await waitReady(a)
-const rB = await waitReady(b)
-has('viewer A ready', rA)
-has('viewer B ready（无 409，互不踢）', rB)
-
-// ---- 2. 输入互通 ----
-a.ws.send(Buffer.from('echo 甲输入-标记\r'))
-await sleep(1000)
-has('A 的输入出现在 A', a.text.includes('甲输入-标记'))
-has('A 的输入同步到 B', b.text.includes('甲输入-标记'))
-b.ws.send(Buffer.from('echo 乙输入-标记\r'))
-await sleep(1000)
-has('B 的输入出现在 B', b.text.includes('乙输入-标记'))
-has('B 的输入同步到 A', a.text.includes('乙输入-标记'))
-
-// ---- 3. 高吞吐下慢 viewer 单独丢弃（C 用原始 socket 以便暂停读取）----
-const cRaw = netConnect(LIMPET_HOME + '/workers/' + id + '.sock')
-let cClosed = 0
-let cEOF = false
-let cUp = false
-let cBuf = Buffer.alloc(0)
-let eof = false
-const t0 = Date.now()
-cRaw.on('connect', () => {
-  const hs = Buffer.from(JSON.stringify({ op: 'attach', uuid: id }))
-  const head = Buffer.alloc(5)
-  head[0] = 0x10
-  head.writeUInt32BE(hs.length, 1)
-  cRaw.write(Buffer.concat([head, hs]))
+  body: JSON.stringify({ name: `多视图-${Date.now().toString(36)}-${process.pid}` }),
 })
-cRaw.on('data', (d) => {
-  cBuf = Buffer.concat([cBuf, d])
-  // 握手应答
-  if (!cUp && cBuf.length >= 5 && cBuf[0] === 0x11) {
-    cUp = true
-    cBuf = cBuf.slice(5 + cBuf.readUInt32BE(1))
-    // resize 申报帧（掩码文本帧）
+if (!created.ok) throw new Error(`创建测试会话失败 HTTP ${created.status}`)
+const { id } = await created.json()
+if (!/^[0-9a-f]{16}$/.test(id)) throw new Error('未获得本轮测试会话 ID')
 
-    // 窗口尺寸申报帧（worker 协议：[0x03][len BE32][JSON]，不掩码）
-    cRaw.write(workerFrame(0x03, Buffer.from(JSON.stringify({ cols: 100, rows: 30 }))))
-    // 启动高吞吐负载（输入帧：[0x02][len BE32][字节]）
-    const load = Buffer.from("yes '0123456789012345678901234567890123456789012345678901234567890123' | head -c 30000000\r")
-    cRaw.write(workerFrame(0x02, load))
-    // 占空比制造真实背压：停 6s / 观察 0.4s（暂停期间 data 事件停止，观察窗才能看到 DETACH）
-    setTimeout(() => {
-      console.log(`  ${String(Date.now() - t0).padStart(5)}ms C 暂停读取（模拟慢 viewer）`)
-      cRaw.pause()
-      const cycle = (n) => {
-        setTimeout(() => {
-          console.log(`  [调试] 恢复#${n}: closed=${cClosed} eof=${cEOF} readableEnded=${cRaw.readableEnded} cBuf=${cBuf.length}`)
-          cRaw.resume()
-          setTimeout(() => {
-            console.log(`  [调试] 再暂停#${n}: 缓冲 ${cBuf.length}B`)
-            cRaw.pause()
-            cycle(n + 1)
-          }, 400)
-        }, 6000)
+try {
+  console.log('创建:', id)
+  const [a, b] = await Promise.all([attach(id), attach(id)])
+  const rA = await waitReady(a)
+  const rB = await waitReady(b)
+  has('viewer A ready', rA)
+  has('viewer B ready（无 409，互不踢）', rB)
+
+  // ---- 2. 输入互通 ----
+  a.ws.send(Buffer.from('echo 甲输入-标记\r'))
+  await sleep(1000)
+  has('A 的输入出现在 A', a.text.includes('甲输入-标记'))
+  has('A 的输入同步到 B', b.text.includes('甲输入-标记'))
+  b.ws.send(Buffer.from('echo 乙输入-标记\r'))
+  await sleep(1000)
+  has('B 的输入出现在 B', b.text.includes('乙输入-标记'))
+  has('B 的输入同步到 A', a.text.includes('乙输入-标记'))
+
+  // ---- 3. 高吞吐下慢 viewer 单独丢弃（C 用原始 socket 以便暂停读取）----
+  const cRaw = netConnect(LIMPET_HOME + '/workers/' + id + '.sock')
+  let cClosed = 0
+  let cEOF = false
+  let cUp = false
+  let cBuf = Buffer.alloc(0)
+  const t0 = Date.now()
+  cRaw.on('end', () => { cEOF = true })
+  cRaw.on('error', (err) => {
+    if (err.code === 'ECONNRESET') cEOF = true
+    else has('慢 viewer 原始 socket 可用', false, err.message)
+  })
+  cRaw.on('connect', () => {
+    const hs = Buffer.from(JSON.stringify({ op: 'attach', uuid: id }))
+    const head = Buffer.alloc(5)
+    head[0] = 0x10
+    head.writeUInt32BE(hs.length, 1)
+    cRaw.write(Buffer.concat([head, hs]))
+  })
+  cRaw.on('data', (d) => {
+    cBuf = Buffer.concat([cBuf, d])
+    // 握手应答
+    if (!cUp) {
+      if (cBuf.length < 5 || cBuf.length < 5 + cBuf.readUInt32BE(1)) return
+      if (cBuf[0] !== 0x11) {
+        has('慢 viewer 首帧是握手应答', false, cBuf[0])
+        cRaw.destroy()
+        return
       }
-      cycle(1)
-    }, 300)
-    return
-  }
-  // 帧扫描：找 DETACH(0x06) / 关闭
-  let i = 0
-  for (;;) {
-    if (i + 5 > cBuf.length) return
-    const op = cBuf[i]
-    const len = cBuf.readUInt32BE(i + 1)
-    if (i + 5 + len > cBuf.length) return
-    if (op === 0x06) {
-      try { cClosed = JSON.parse(cBuf.slice(i + 5, i + 5 + len).toString()).code } catch {}
+      cUp = true
+      cBuf = cBuf.subarray(5 + cBuf.readUInt32BE(1))
+      // 窗口尺寸申报帧（worker 协议：[0x03][len BE32][JSON]，不掩码）
+      cRaw.write(workerFrame(0x03, Buffer.from(JSON.stringify({ cols: 100, rows: 30 }))))
+      // 启动高吞吐负载（输入帧：[0x02][len BE32][字节]）
+      const load = Buffer.from("yes '0123456789012345678901234567890123456789012345678901234567890123' | head -c 30000000\r")
+      cRaw.write(workerFrame(0x02, load))
+      // 占空比制造真实背压：停 6s / 观察 0.4s（暂停期间 data 事件停止，观察窗才能看到 DETACH）
+      setTimeout(() => {
+        console.log(`  ${String(Date.now() - t0).padStart(5)}ms C 暂停读取（模拟慢 viewer）`)
+        cRaw.pause()
+        const cycle = (n) => {
+          setTimeout(() => {
+            console.log(`  [调试] 恢复#${n}: closed=${cClosed} eof=${cEOF} readableEnded=${cRaw.readableEnded} cBuf=${cBuf.length}`)
+            if (cRaw.destroyed) return
+            cRaw.resume()
+            setTimeout(() => {
+              console.log(`  [调试] 再暂停#${n}: 缓冲 ${cBuf.length}B`)
+              cRaw.pause()
+              cycle(n + 1)
+            }, 400)
+          }, 6000)
+        }
+        cycle(1)
+      }, 300)
+      return
     }
-    if (op === 0x04) cClosed = 1000
-    cBuf = cBuf.slice(i + 5 + len)
-    i = 0
-  }
-})
-const waitCDrop = new Promise((r) => {
-  const iv = setInterval(() => {
-    if (cClosed || (cEOF && Date.now() - t0 > 8000)) { clearInterval(iv); r() }
-  }, 200)
-})
-await Promise.race([waitCDrop, sleep(25000)])
-// 断言：C 被丢弃。DETACH(4001)送达 或 worker 关闭连接（EOF）均算——
-// 前者是慢消费者主路径（server 中继 5s 写超时也走 4001），后者是原始 socket
-// 停读时 DETACH 写不进打满缓冲的 EOF 兜底。会话与他人不受影响才是关键不变量。
-const droppedC = cClosed === 4001 || cRaw.readableEnded
-has(`慢 viewer C 被单独丢弃（code=${cClosed}，readableEnded=${cRaw.readableEnded}）`, droppedC)
-has('A 不受 C 影响', a.closedCode === 0)
-has('B 不受 C 影响', b.closedCode === 0)
-a.ws.send(Buffer.from('echo 丢弃后仍可用\r'))
-await sleep(1000)
-has('丢弃慢 viewer 后会话继续可用', a.text.includes('丢弃后仍可用'))
+    // 帧扫描：找 DETACH(0x06) / 关闭
+    let i = 0
+    for (;;) {
+      if (i + 5 > cBuf.length) return
+      const op = cBuf[i]
+      const len = cBuf.readUInt32BE(i + 1)
+      if (i + 5 + len > cBuf.length) return
+      if (op === 0x06) {
+        try { cClosed = JSON.parse(cBuf.slice(i + 5, i + 5 + len).toString()).code } catch {}
+      }
+      if (op === 0x04) cClosed = 1000
+      cBuf = cBuf.slice(i + 5 + len)
+      i = 0
+    }
+  })
+  const waitCDrop = new Promise((r) => {
+    const iv = setInterval(() => {
+      if (cClosed || (cEOF && Date.now() - t0 > 8000)) { clearInterval(iv); r() }
+    }, 200)
+  })
+  await Promise.race([waitCDrop, sleep(25000)])
+  // 断言：C 被丢弃。DETACH(4001)送达 或 worker 关闭连接（EOF）均算——
+  // 前者是慢消费者主路径（server 中继 5s 写超时也走 4001），后者是原始 socket
+  // 停读时 DETACH 写不进打满缓冲的 EOF 兜底。会话与他人不受影响才是关键不变量。
+  const droppedC = cClosed === 4001 || cEOF
+  has(`慢 viewer C 被单独丢弃（code=${cClosed}，readableEnded=${cRaw.readableEnded}）`, droppedC)
+  has('A 不受 C 影响', a.closedCode === 0)
+  has('B 不受 C 影响', b.closedCode === 0)
+  a.ws.send(Buffer.from('echo 丢弃后仍可用\r'))
+  await sleep(1000)
+  has('丢弃慢 viewer 后会话继续可用', a.text.includes('丢弃后仍可用'))
 
-// ---- 4. viewer 断开重连 ----
-a.ws.close()
-const marker = (n) => `LIMPET-REPLAY-${String(n).padStart(3, '0')}`
-b.ws.send(Buffer.from("for n in $(seq 1 60); do printf 'LIMPET-REPLAY-%03d\\n' \"$n\"; sleep 0.025; done\r"))
-const before = Date.now() + 5000
-while (!b.text.includes(marker(5)) && Date.now() < before) await sleep(25)
-has('重连前编号输出已开始', b.text.includes(marker(5)))
-const a2 = await attach(id)
-const rA2 = await waitReady(a2)
-const deadline = Date.now() + 5000
-while (!a2.text.includes(marker(60)) && Date.now() < deadline) await sleep(25)
-const lines = a2.text.match(/LIMPET-REPLAY-\d{3}/g) ?? []
-const expected = Array.from({ length: 60 }, (_, i) => marker(i + 1))
-has('A 断开重连成功并收到实时尾巴', rA2 && lines.includes(marker(60)))
-has('重建与实时尾巴的 60 条编号输出按序且恰好出现一次',
-  lines.length === expected.length && lines.every((line, i) => line === expected[i]),
-  `收到 ${lines.length}/${expected.length} 条，前后标记 ${lines.at(0)}/${lines.at(-1)}`)
-
-// 清理
-for (const st of [a2, b]) st.ws.send(Buffer.from('exit\r'))
-await sleep(600)
+  // ---- 4. viewer 断开重连 ----
+  a.ws.close()
+  const marker = (n) => `LIMPET-REPLAY-${String(n).padStart(3, '0')}`
+  b.ws.send(Buffer.from("for n in $(seq 1 60); do printf 'LIMPET-REPLAY-%03d\\n' \"$n\"; sleep 0.025; done\r"))
+  const before = Date.now() + 5000
+  while (!b.text.includes(marker(5)) && Date.now() < before) await sleep(25)
+  has('重连前编号输出已开始', b.text.includes(marker(5)))
+  const a2 = await attach(id)
+  const rA2 = await waitReady(a2)
+  const deadline = Date.now() + 5000
+  while (!a2.text.includes(marker(60)) && Date.now() < deadline) await sleep(25)
+  const lines = a2.text.match(/LIMPET-REPLAY-\d{3}/g) ?? []
+  const expected = Array.from({ length: 60 }, (_, i) => marker(i + 1))
+  has('A 断开重连成功并收到实时尾巴', rA2 && lines.includes(marker(60)))
+  has('重建与实时尾巴的 60 条编号输出按序且恰好出现一次',
+    lines.length === expected.length && lines.every((line, i) => line === expected[i]),
+    `收到 ${lines.length}/${expected.length} 条，前后标记 ${lines.at(0)}/${lines.at(-1)}`)
+} finally {
+  const response = await fetch(`${BASE}/api/term/${id}/close`, { method: 'POST' })
+  has('当前测试会话已关闭', response.ok || response.status === 404, response.status)
+}
 
 console.log(pass ? '=> 通过' : '=> 失败')
 process.exit(pass ? 0 : 1)

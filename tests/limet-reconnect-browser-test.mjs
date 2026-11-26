@@ -2,7 +2,7 @@
 //
 // 前置：本机有可用的 Playwright + Chromium（依次尝试 import 'playwright'、环境变量
 // PLAYWRIGHT_MODULE、~/.npm/_npx 里与已缓存 Chromium 版本匹配的一份）；仓库里已有 web/dist。
-// 脚本自己起 server（SERVER_BIN，默认 /tmp/limpet-new-server，cwd 为仓库根，页面由它从磁盘托管），
+// 脚本以 SERVER_BIN 指向的二进制启动临时 server（cwd 为仓库根），
 // 浏览器经一个可干预的 TCP 中继（PORT+2）访问它，用中继模拟网络闪断、无声失联、登录失效。
 // 要求 PORT（默认 4040）与 PORT+2 空闲。
 //
@@ -26,7 +26,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const PORT = Number(process.env.PORT || 4040)
 const BASE = `http://127.0.0.1:${PORT}`
 const ORIGIN = `http://127.0.0.1:${PORT + 2}` // 经中继访问
-const SERVER_BIN = process.env.SERVER_BIN || '/tmp/limpet-new-server'
+const SERVER_BIN = process.env.SERVER_BIN
+if (!SERVER_BIN) throw new Error('请用 SERVER_BIN 指定本轮构建的测试二进制')
+const runToken = `${Date.now().toString(36)}-${process.pid}`
+const testName = (label) => `${label}-${runToken}`
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const { LIMPET_HOME } = await import('./env.mjs') // 数据目录，随环境传给脚本起的 server
 const { homedir } = await import('node:os')
@@ -71,7 +74,11 @@ async function portFree(port) {
   })
 }
 async function startServer() {
-  server = spawn(SERVER_BIN, { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] })
+  server = spawn(SERVER_BIN, {
+    cwd: repoRoot,
+    env: { ...process.env, LIMPET_ADDR: `127.0.0.1:${PORT}` },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
   server.stdout.resume()
   server.stderr.resume()
   const t0 = Date.now()
@@ -162,13 +169,17 @@ async function createSession(name) {
   const r = await fetch(`${BASE}/api/term`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name: testName(name) }),
   })
-  return (await r.json()).id
+  if (!r.ok) throw new Error(`创建测试会话失败 HTTP ${r.status}`)
+  const { id } = await r.json()
+  if (!/^[0-9a-f]{16}$/.test(id)) throw new Error('未获得本轮测试会话 ID')
+  ids.push(id)
+  return id
 }
 async function openInPage(name) {
   await page.goto(`${ORIGIN}/`)
-  await page.locator('li button').filter({ hasText: name }).first().click()
+  await page.locator('li button').filter({ hasText: testName(name) }).first().click()
   await waitBadge('已连接')
 }
 async function typeLine(text) {
@@ -215,7 +226,7 @@ try {
 
   // ---- S1 ----
   console.log('S1 接入与输入')
-  const s1 = await createSession('重连-S1'); ids.push(s1)
+  const s1 = await createSession('重连-S1')
   await openInPage('重连-S1')
   has('打开会话后徽标为「已连接」', (await badgeText()) === '已连接', await badgeText())
   await typeLine('echo MARK-1')
@@ -276,28 +287,39 @@ try {
   has('列表能识别 Access 重定向并提供刷新按钮', await page.getByRole('button', { name: '刷新页面' }).isVisible())
   mode = 'normal'
   await page.getByRole('button', { name: '刷新页面' }).click()
-  await page.getByRole('button', { name: /重连-S1/ }).waitFor({ state: 'visible' })
+  await page.getByRole('button', { name: new RegExp(testName('重连-S1')) }).waitFor({ state: 'visible' })
   has('重新登录后刷新能恢复列表', true)
 
   // ---- S5 ----
   console.log('S5 无声失联（约 1 分钟）')
   await openInPage('重连-S1')
   const opens = wsOpens
-  let sawReconnecting = false
+  const badgeTransitions = await page.locator(badgeSel).first().evaluateHandle((badge) => {
+    const statuses = new Set([badge.getAttribute('data-status')])
+    const observer = new MutationObserver((records) => {
+      for (const change of records) statuses.add(change.oldValue)
+      statuses.add(badge.getAttribute('data-status'))
+    })
+    observer.observe(badge, { attributeFilter: ['data-status'], attributeOldValue: true })
+    return { statuses, observer }
+  })
   let decide = 0
   relayStall()
   const t5 = Date.now()
   // 判定时刻以「页面发起了新的接入」为准：浏览器自己不会因为收不到数据而触发 close，
-  // 是前端看门狗在 60s 没收到任何消息后主动关闭并重连的。徽标一路采样到重新连上为止
-  // （「重连中」只持续一两百毫秒）。
+  // 是前端看门狗在 60s 没收到任何消息后主动关闭并重连的。徽标过渡可能短于轮询间隔。
   while (Date.now() - t5 < 85000) {
     if (!decide && wsOpens > opens) decide = (Date.now() - t5) / 1000
     const t = await badgeText()
-    if (t === '重连中') sawReconnecting = true
     if (t === '已连接' && decide) break
     await sleep(50)
   }
   const back = (Date.now() - t5) / 1000
+  const sawReconnecting = await badgeTransitions.evaluate(({ statuses, observer }) => {
+    observer.disconnect()
+    return statuses.has('reconnecting')
+  })
+  await badgeTransitions.dispose()
   has(`没有任何帧到达时 ${decide.toFixed(1)}s 自行判定断开（≤ 65s）`, decide > 0 && decide <= 65)
   has('判定期间徽标显示「重连中」', sawReconnecting)
   has(`随后自动接回（共 ${back.toFixed(1)}s）`, back <= 80 && (await badgeText()) === '已连接')
@@ -315,7 +337,7 @@ try {
 
   // ---- S7 ----
   console.log('S7 列表里关闭会话')
-  const s7 = await createSession('重连-S7'); ids.push(s7)
+  const s7 = await createSession('重连-S7')
   await openInPage('重连-S7')
   await fetch(`${BASE}/api/term/${s7}/close`, { method: 'POST' })
   await waitBadge('会话已结束')
@@ -323,10 +345,11 @@ try {
 
   // ---- S8 ----
   console.log('S8 worker 被 kill -9')
-  const s8 = await createSession('重连-S8'); ids.push(s8)
+  const s8 = await createSession('重连-S8')
   await openInPage('重连-S8')
   const binaryName = basename(SERVER_BIN).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const wpid = execFileSync('pgrep', ['-f', '--', `(^|/)${binaryName} worker ${s8}$`], { encoding: 'utf8' }).trim()
+  const binaryPattern = binaryName.replace(/[a-zA-Z]/, (letter) => `[${letter}]`)
+  const wpid = execFileSync('pgrep', ['-f', '--', `(^|/)${binaryPattern} worker ${s8}$`], { encoding: 'utf8' }).trim()
   if (!/^[1-9][0-9]*$/.test(wpid)) throw new Error('预期找到唯一的测试 worker PID')
   process.kill(Number(wpid), 'SIGKILL')
   await waitBadge('会话已结束')
@@ -337,7 +360,7 @@ try {
   const mctx = await browser.newContext({ viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true })
   const mpage = await mctx.newPage()
   page = mpage
-  const s9 = await createSession('重连-S9'); ids.push(s9)
+  const s9 = await createSession('重连-S9')
   await openInPage('重连-S9')
   has('移动视口下徽标为「已连接」', (await badgeText()) === '已连接', await badgeText())
   const ctrl = page.getByRole('button', { name: 'Ctrl', exact: true })
@@ -355,9 +378,9 @@ try {
   // ---- S10 ----
   console.log('S10 列表表单与关闭中状态')
   page = desktop
-  const s10 = await createSession('关闭中会话'); ids.push(s10)
+  const s10 = await createSession('关闭中会话')
   await page.goto(ORIGIN)
-  const row = page.locator('li').filter({ hasText: '关闭中会话' })
+  const row = page.locator('li').filter({ hasText: testName('关闭中会话') })
   await row.waitFor({ state: 'visible' })
   await page.getByRole('complementary', { name: '会话列表' }).getByRole('button', { name: '新建', exact: true }).click()
   has('创建输入框提示留空自动生成', await page.getByPlaceholder('会话名（留空自动生成）').isVisible())
@@ -381,10 +404,10 @@ try {
     await dialog.getByRole('button', { name: '确认关闭' }).click()
     await closing
     has('关闭期间禁用对应会话的打开、重命名与关闭按钮',
-      await row.getByRole('button', { name: /关闭中会话/ }).isDisabled() &&
+      await row.getByRole('button', { name: new RegExp(testName('关闭中会话')) }).isDisabled() &&
       await row.getByRole('button', { name: '重命名' }).isDisabled() &&
       await row.locator('[title="关闭"]').isDisabled() &&
-      await page.getByRole('button', { name: /重连-S9/ }).isEnabled())
+      await page.getByRole('button', { name: new RegExp(testName('重连-S9')) }).isEnabled())
   } finally {
     releaseClose()
   }

@@ -176,6 +176,7 @@ async function onDisconnected(code: number) {
   if (unmounted) return
   if (code === 1000) {
     status.value = 'ended'
+    emit('refreshSessions')
     return
   }
   status.value = 'reconnecting'
@@ -187,6 +188,7 @@ async function onDisconnected(code: number) {
     waitingToReconnect = false
     status.value = verdict === 'gone' ? 'ended' : 'authExpired'
     if (verdict === 'auth') emit('sessionAuthExpired')
+    else emit('refreshSessions')
     return
   }
   scheduleReconnect()
