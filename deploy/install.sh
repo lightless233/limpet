@@ -5,7 +5,7 @@
 #   deploy/install.sh [安装目录]        默认 /opt/limpet
 #
 # 步骤：构建前端 → 发布构建（内嵌前端、写入版本）→ 原子替换安装目录里的二进制 →
-#       生成单元文件 → 链接进 systemd 用户目录 → daemon-reload → 启用并重启服务。
+#       维护本地 CLI 入口 → 生成单元文件 → 注册、启用并重启服务。
 # 服务监听 127.0.0.1:${LIMPET_PORT:-13000}，数据目录是 ~/.limpet。重启服务不影响已有会话
 # （worker 在各自的 systemd 单元里）。详见 deploy/README.md。
 set -eu
@@ -20,6 +20,27 @@ fail() {
   echo "安装失败：$*" >&2
   exit 1
 }
+
+check_cli_entry() {
+  if [ ! -L "$cli_link" ] && [ -e "$cli_link" ]; then
+    fail "$cli_link 已存在且不是符号链接，请先移开该文件"
+  fi
+}
+
+link_cli() {
+  mkdir -p "$cli_dir"
+  check_cli_entry
+  if [ -L "$cli_link" ]; then
+    ln -sfnT "$install_dir/limpet-server" "$cli_link"
+  else
+    ln -sT "$install_dir/limpet-server" "$cli_link"
+  fi
+  case ":${PATH:-}:" in
+    *":$cli_dir:"*) ;;
+    *) echo "提示：将 $cli_dir 加入 PATH 后可直接运行 limpet。" ;;
+  esac
+}
+
 command -v go >/dev/null 2>&1 || fail "缺少 go"
 command -v pnpm >/dev/null 2>&1 || fail "缺少 pnpm"
 systemctl --user show-environment >/dev/null 2>&1 || fail "systemd 用户管理器不可用"
@@ -28,6 +49,10 @@ if [ ! -d "$install_dir" ]; then
     sudo mkdir -p $install_dir && sudo chown \$USER: $install_dir"
 fi
 [ -w "$install_dir" ] || fail "安装目录 $install_dir 对当前用户不可写（权限见上一条提示）"
+install_dir=$(cd "$install_dir" && pwd -P)
+cli_dir="$HOME/.local/bin"
+cli_link="$cli_dir/limpet"
+check_cli_entry
 
 # libghostty-vt 的 .pc 不在 pkg-config 的默认搜索路径里；不带上它，构建缓存一失效 go build 就失败。
 : "${LIMPET_PKG_CONFIG:=$HOME/.local/opt/limpet-toolchain/install-1.0.1/usr/lib/pkgconfig}"
@@ -42,6 +67,7 @@ tmp="$install_dir/.limpet-server.tmp"
 (cd "$repo" && go build -tags limpet_embed -ldflags "-X main.version=$version" -o "$tmp" ./server)
 chmod 755 "$tmp"
 mv "$tmp" "$install_dir/limpet-server"
+link_cli
 
 echo "→ 生成单元文件"
 # WSL 会话基线：systemd 不继承 WSL 会话环境，而缺 UTF-8 locale 时会话里的中文会出错。

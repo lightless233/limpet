@@ -23,8 +23,9 @@
    curl -sI https://<域名>/api/term    # 期望 302，Location 指向 *.cloudflareaccess.com
    ```
 
-3. 在仓库根目录执行 `deploy/install.sh`。脚本依次完成：构建前端 → 发布构建 → 替换二进制 →
-   生成单元文件 → 启用并（重新）启动服务。
+3. 在仓库根目录执行 `deploy/install.sh`。脚本构建并替换发布二进制，维护
+   `~/.local/bin/limpet` 软链，生成单元文件并启用、启动服务。已有同名普通文件时，
+   请先移开该文件。将 `~/.local/bin` 加入 `PATH` 后可直接运行 `limpet`。
 
 ## 升级
 
@@ -32,6 +33,12 @@
 旧的二进制；此后新建的会话用新的。
 
 查看线上版本：`/opt/limpet/limpet-server version`。
+
+## 本地终端
+
+在当前目录运行 `limpet` 启动交互式 Shell，或运行 `limpet <命令> [参数...]` 启动指定程序。
+用 `limpet ls` 查看活跃会话，用 `limpet attach <名称或ID>` 接回。关掉本地标签页后，
+会话仍可从网页或本地接回。CLI 创建的会话使用调用方的环境。
 
 ## 日常操作
 
@@ -76,6 +83,7 @@ Windows 目录是一份快照。装了新的 Windows 工具后 `explorer.exe`、
 systemctl --user disable --now limpet-server
 rm ~/.config/systemd/user/limpet-server.service
 systemctl --user daemon-reload
+rm -f ~/.local/bin/limpet
 rm -rf /opt/limpet
 ```
 
