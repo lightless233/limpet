@@ -32,8 +32,9 @@ const (
 // viewer 是一个接入的渲染器：连接、有界实时流队列、申报窗口尺寸与切点。
 type viewer struct {
 	conn      *frameConn
-	queue     chan []byte
+	queue     chan viewerEvent
 	dims      viewerDims   // 申报的窗口尺寸（跟随输入者的晋升依据）
+	locked    bool         // 只发送输入，不参与尺寸晋升（inputMu）
 	cutOffset atomic.Int64 // 重建覆盖到的流偏移；实时流从此之后接上
 	queued    atomic.Int64 // 队列里积压的字节数
 	closed    atomic.Bool
@@ -41,6 +42,12 @@ type viewer struct {
 	// 关闭原因（仅在赢得 closed 置位的那次写入，输出泵在 done 之后读取）。code 为 0 = 不发 DETACH。
 	dropCode   int
 	dropReason string
+}
+
+// 尺寸和 VT 字节共享一个队列，以网格应用顺序发送。只有尺寸事件的 data 为空。
+type viewerEvent struct {
+	data []byte
+	size resizeMsg
 }
 
 // closeWith 丢弃 viewer（积压超限）。它只置位并通知输出泵——DETACH 与关闭连接都由泵来做：
@@ -317,8 +324,8 @@ func (s *session) handleOutput(batch []byte) {
 	// 重建可能读到旧值——刚喂入的字节「在重建画面里 + 又被实时流重发」
 	// （验收 15 实测抓到过：5 行重复）。
 	s.gridMu.Lock()
+	defer s.gridMu.Unlock()
 	if s.grid == nil {
-		s.gridMu.Unlock()
 		return
 	}
 	start := s.fedBytes.Load()
@@ -331,7 +338,6 @@ func (s *session) handleOutput(batch []byte) {
 	}
 	s.fedBytes.Store(start + int64(len(batch)))
 	s.rec.enqueue(viewerDims{Cols: s.curCols, Rows: s.curRows}, batch, at)
-	s.gridMu.Unlock()
 
 	// 广播：只送各 viewer 切点之后的字节（切点之前的已在各自重建画面里）。
 	// 积压按字节计（queueBytes），槽数只是碎块突发的余量：PTY 的一批可能只有几十字节
@@ -363,7 +369,7 @@ func (s *session) handleOutput(batch []byte) {
 			continue
 		}
 		select {
-		case v.queue <- tail:
+		case v.queue <- viewerEvent{data: tail}:
 		default:
 			v.closeWith(4001, "too slow")
 		}
@@ -385,6 +391,23 @@ func (s *session) resize(cols, rows uint16) {
 	_ = s.shadow.Resize(cols, rows, 0, 0)
 	s.curCols, s.curRows = cols, rows
 	s.rec.enqueue(viewerDims{Cols: cols, Rows: rows}, nil, 0)
+	// 播放切点与 VT 入队同受 gridMu 保护，保证前后两侧的字节不会越过尺寸事件。
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	if s.end.Reason != "" {
+		return
+	}
+	cut := s.fedBytes.Load()
+	for v := range s.viewers {
+		if v.closed.Load() || v.cutOffset.Load() > cut {
+			continue
+		}
+		select {
+		case v.queue <- viewerEvent{size: resizeMsg{Cols: cols, Rows: rows}}:
+		default:
+			v.closeWith(4001, "too slow")
+		}
+	}
 }
 
 // currentDims 返回网格当前尺寸；会话结束后返回零值。
@@ -398,35 +421,35 @@ func (s *session) currentDims() (uint16, uint16) {
 }
 
 // rebuildFor 在当前切点为指定 viewer 生成重建画面（U0 定案）。备用屏激活时用
-// 影子网格还原主屏，再进入备用屏还原活动屏。返回 (画面, 未完成序列前缀, 错误)。
-func (s *session) rebuildFor(v *viewer) ([]byte, []byte, error) {
+// 影子网格还原主屏，再进入备用屏还原活动屏。切点、画面与尺寸锁内对齐。
+func (s *session) rebuildFor(v *viewer) ([]byte, []byte, uint16, uint16, error) {
 	s.gridMu.Lock()
 	defer s.gridMu.Unlock()
 	if s.grid == nil {
-		return nil, nil, errors.New("会话已结束")
+		return nil, nil, 0, 0, errors.New("会话已结束")
 	}
 
 	v.cutOffset.Store(s.fedBytes.Load())
 
 	screen, err := s.grid.ActiveScreen()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, 0, err
 	}
 	var out []byte
 	if screen == libghostty.ScreenAlternate {
 		sh, err := formatVT(s.shadow)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, 0, 0, err
 		}
 		rt, err := formatVT(s.grid)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, 0, 0, err
 		}
 		out = append(append(sh, "\x1b[?1049h"...), rt...)
 	} else {
 		out, err = formatVT(s.grid)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, 0, 0, err
 		}
 	}
 
@@ -436,7 +459,7 @@ func (s *session) rebuildFor(v *viewer) ([]byte, []byte, error) {
 		//（U0-8a 验证过，浏览器端与 worker 端状态一致）。
 		cont, _ = s.grid.Continuation()
 	}
-	return out, cont, nil
+	return out, cont, s.curCols, s.curRows, nil
 }
 
 // attached 是否存在接入中的 viewer（已被丢弃、尚未摘除的不算）。

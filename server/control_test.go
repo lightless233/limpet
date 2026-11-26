@@ -3,9 +3,13 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -136,16 +140,66 @@ func TestControlRegisterAndDiscover(t *testing.T) {
 	if len(r.Sessions) != 2 {
 		t.Fatalf("控制列表丢失会话: %+v", r)
 	}
-	for _, row := range m.list() {
-		if len(row) != 4 {
-			t.Errorf("HTTP 泄露内部元数据: %+v", row)
-		}
-	}
-
 	m.mu.Lock()
 	delete(m.sessions, id)
 	delete(m.sessions, id2)
 	m.mu.Unlock()
+}
+
+func TestHTTPListMetadata(t *testing.T) {
+	m := testManager(t)
+	home := t.TempDir()
+	cwd := filepath.Join(home, "workspace")
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	web, err := m.create("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "test-limpet-private-argv-marker"
+	_, id, socket := startTestCLIWorker(t, filepath.Dir(m.workersDir), cwd, "/bin/sh", "-c", "read line", "sh", secret)
+	fc, ack, err := openWorker(socket, id, "start", frameBudget)
+	if err != nil || !ack.OK {
+		t.Fatalf("start = %+v, %v", ack, err)
+	}
+	defer fc.close()
+	if r := testControl(t, m, controlRequest{Op: "register", UUID: id, Name: "cli", ExplicitName: true}); r.Error != "" {
+		t.Fatal(r.Error)
+	}
+	if kind, _, err := fc.readFrame(); err != nil || kind != ftReady {
+		t.Fatalf("start 后首帧 = %v, %v", kind, err)
+	}
+	srv := httptest.NewServer(m.handler())
+	defer srv.Close()
+	res, err := srv.Client().Get(srv.URL + "/api/term")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil || res.StatusCode != http.StatusOK || strings.Contains(string(body), secret) || strings.Contains(string(body), home) {
+		t.Fatalf("HTTP 列表泄露启动元数据或请求失败，HTTP %d: %s, %v", res.StatusCode, body, err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil || len(rows) != 2 {
+		t.Fatalf("HTTP 列表 = %s, %v", body, err)
+	}
+	for _, row := range rows {
+		want := map[string]any{"id": row["id"], "created": row["created"]}
+		switch row["id"] {
+		case id:
+			want["name"], want["attached"], want["cmd"], want["cwd"] = "cli", true, "sh", "~/workspace"
+		case web.uuid:
+			want["name"], want["attached"] = "web", false
+		default:
+			t.Fatalf("意外会话 %v", row)
+		}
+		if _, err := time.Parse(time.RFC3339, row["created"].(string)); err != nil || !reflect.DeepEqual(row, want) {
+			t.Errorf("HTTP 列表项 = %v，期望 %v", row, want)
+		}
+	}
 }
 
 func TestDiscoverCannotReviveEndedSession(t *testing.T) {

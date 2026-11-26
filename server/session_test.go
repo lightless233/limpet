@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,7 +87,7 @@ func TestSessionConcurrentOutputResizeAndFinish(t *testing.T) {
 	run(func() { s.resize(92, 25) })
 	run(func() { s.resize(70, 27) })
 	run(func() {
-		_, _, _ = s.rebuildFor(new(viewer))
+		_, _, _, _, _ = s.rebuildFor(new(viewer))
 		_, _ = s.currentDims()
 	})
 	for range cap(ready) {
@@ -94,7 +97,7 @@ func TestSessionConcurrentOutputResizeAndFinish(t *testing.T) {
 	close(stop)
 	routines.Wait()
 
-	if _, _, err := s.rebuildFor(new(viewer)); err == nil {
+	if _, _, _, _, err := s.rebuildFor(new(viewer)); err == nil {
 		t.Error("已关闭的网格仍允许重建")
 	}
 	if cols, rows := s.currentDims(); cols != 0 || rows != 0 {
@@ -105,6 +108,99 @@ func TestSessionConcurrentOutputResizeAndFinish(t *testing.T) {
 	data, err := os.ReadFile(raw.Name())
 	if err != nil || !bytes.Contains(data, batch) {
 		t.Errorf("录制未保存关闭前的输出，err=%v", err)
+	}
+}
+
+func TestViewerReplayAndResizeOrder(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	newGrid := func() *libghostty.Terminal {
+		t.Helper()
+		grid, err := libghostty.NewTerminal(libghostty.WithSize(gridCols, gridRows))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(grid.Close)
+		return grid
+	}
+	s := &session{
+		ptmx: master, grid: newGrid(), shadow: newGrid(), curCols: gridCols, curRows: gridRows,
+		viewers: make(map[*viewer]struct{}), rec: &recording{queue: make(chan recordingEvent, 8)},
+	}
+	worker, client := net.Pipe()
+	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+	v := newViewer(newFrameConn(worker), 1<<62)
+	if !s.addViewer(v) {
+		t.Fatal("接入失败")
+	}
+	s.handleOutput([]byte("\x1b[2;3Hsnapshot"))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.serveViewer(v, handshakeAck{OK: true}, true)
+	}()
+	defer func() {
+		_ = client.Close()
+		<-done
+	}()
+	if kind, _, err := readFrame(client); err != nil || kind != ftHandshakeAck {
+		t.Fatalf("握手 = %v, %v", kind, err)
+	}
+	var header [5]byte
+	if _, err := io.ReadFull(client, header[:]); err != nil || frameType(header[0]) != ftReady {
+		t.Fatalf("ready 帧头 = %v, %v", header, err)
+	}
+	// Keep the viewer writer blocked in ready while publishing output on both sides of a resize.
+	before := "\x1b[4;7Hbefore"
+	after := "\x1b[5;111Hafter"
+	s.handleOutput([]byte(before))
+	s.resize(120, 34)
+	s.handleOutput([]byte(after))
+	s.ending.Store(true)
+	s.viewersMu.Lock()
+	s.end = exitMsg{Reason: "test"}
+	close(v.queue)
+	s.viewersMu.Unlock()
+	ready := make([]byte, binary.BigEndian.Uint32(header[1:]))
+	if _, err := io.ReadFull(client, ready); err != nil || string(ready) != `{"cols":80,"rows":24}` {
+		t.Fatalf("快照尺寸 = %q, %v", ready, err)
+	}
+	read := func(want frameType) []byte {
+		t.Helper()
+		kind, body, err := readFrame(client)
+		if err != nil || kind != want {
+			t.Fatalf("帧 = %v %q (%v)，期望 %v", kind, body, err, want)
+		}
+		return body
+	}
+	renderer := newGrid()
+	feedGround(renderer, read(ftOutput))
+	if body := read(ftOutput); string(body) != before {
+		t.Fatalf("resize 前的 VT = %q", body)
+	} else {
+		feedGround(renderer, body)
+	}
+	_, dims, ok := decodeResize(read(ftSize))
+	if !ok || dims != (viewerDims{Cols: 120, Rows: 34}) {
+		t.Fatalf("实时尺寸 = %+v", dims)
+	}
+	if err := renderer.Resize(dims.Cols, dims.Rows, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if body := read(ftOutput); string(body) != after {
+		t.Fatalf("resize 后的 VT = %q", body)
+	} else {
+		feedGround(renderer, body)
+	}
+	read(ftExit)
+	want, err := formatVT(s.grid)
+	got, renderErr := formatVT(renderer)
+	if err != nil || renderErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("重放网格与 worker 不一致\n渲染: %q\nworker: %q\n错误: %v / %v", got, want, renderErr, err)
 	}
 }
 

@@ -49,6 +49,7 @@ const (
 	ftExit         frameType = 0x04 // 会话结束通知（worker → server）
 	ftReady        frameType = 0x05 // 重建完成、实时流开始（worker → server）
 	ftDetach       frameType = 0x06 // 消费者被丢弃（慢），带 WS 关闭码（worker → server）
+	ftSize         frameType = 0x07 // PTY 与网格的实时尺寸（worker → server）
 	ftHandshake    frameType = 0x10 // 握手请求（server → worker，连接首帧）
 	ftHandshakeAck frameType = 0x11 // 握手应答（worker → server）
 )
@@ -208,3 +209,17 @@ type viewerDims struct {
 }
 
 func (d viewerDims) valid() bool { return d.Cols >= 2 && d.Cols <= 500 && d.Rows >= 2 && d.Rows <= 200 }
+
+// decodeResize 要求两个维度显式存在，区分清空申报与缺失字段。
+func decodeResize(payload []byte) (string, viewerDims, bool) {
+	var rm struct {
+		Type string  `json:"type"`
+		Cols *uint16 `json:"cols"`
+		Rows *uint16 `json:"rows"`
+	}
+	if jsonUnmarshal(payload, &rm) != nil || rm.Cols == nil || rm.Rows == nil {
+		return "", viewerDims{}, false
+	}
+	dims := viewerDims{Cols: *rm.Cols, Rows: *rm.Rows}
+	return rm.Type, dims, dims == (viewerDims{}) || dims.valid()
+}

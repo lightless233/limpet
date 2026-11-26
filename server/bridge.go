@@ -139,7 +139,7 @@ func (m *manager) handleWS(w http.ResponseWriter, r *http.Request) {
 
 // relay 把 WS 与 worker socket 双向中继，resize 作为窗口申报转发。
 //
-// socket → WS：OUTPUT → 二进制帧；READY → 文本帧 `{"type":"ready"}`；EXIT →
+// socket → WS：OUTPUT → 二进制帧；READY / SIZE → 文本控制帧；EXIT →
 // 关闭码 1000；DETACH → 关闭码取载荷（4001=慢消费者）。
 // WS 写均有 5s 有界超时：对端停止消费 → 关闭码 4001（spec 003 背压）。
 //
@@ -183,16 +183,11 @@ func relay(w *wsConn, fc *frameConn) {
 			}
 			lastHeard.Store(time.Now().UnixNano())
 			if mt == websocket.MessageText {
-				var ctl struct {
-					Type string `json:"type"`
-					Cols uint16 `json:"cols"`
-					Rows uint16 `json:"rows"`
-				}
-				if jsonUnmarshal(data, &ctl) != nil || ctl.Type != "resize" ||
-					ctl.Cols < 2 || ctl.Cols > 500 || ctl.Rows < 2 || ctl.Rows > 200 {
+				typ, dims, ok := decodeResize(data)
+				if typ != "resize" || !ok {
 					continue
 				}
-				if err := fc.writeFrame(ftResize, mustJSON(resizeMsg{Cols: ctl.Cols, Rows: ctl.Rows})); err != nil {
+				if err := fc.writeFrame(ftResize, mustJSON(resizeMsg{Cols: dims.Cols, Rows: dims.Rows})); err != nil {
 					return
 				}
 				continue
@@ -246,13 +241,30 @@ func relay(w *wsConn, fc *frameConn) {
 			break
 		}
 		switch t {
-		case ftReady:
-			if err := writeWS(websocket.MessageText, []byte(`{"type":"ready"}`)); err != nil {
-				cancel()
-				return
+		case ftReady, ftSize, ftOutput:
+			kind := websocket.MessageBinary
+			if t != ftOutput {
+				kind = websocket.MessageText
+				_, dims, ok := decodeResize(payload)
+				valid := ok && dims.valid()
+				typ := "ready"
+				if t == ftSize {
+					if !valid {
+						continue
+					}
+					typ = "size"
+				}
+				ctl := struct {
+					Type string `json:"type"`
+					Cols uint16 `json:"cols,omitempty"`
+					Rows uint16 `json:"rows,omitempty"`
+				}{Type: typ}
+				if valid {
+					ctl.Cols, ctl.Rows = dims.Cols, dims.Rows
+				}
+				payload = mustJSON(ctl)
 			}
-		case ftOutput:
-			if err := writeWS(websocket.MessageBinary, payload); err != nil {
+			if err := writeWS(kind, payload); err != nil {
 				// 对端停止消费 → 4001；其他（对端断开/取消）→ 静默退出。
 				if errors.Is(err, context.DeadlineExceeded) {
 					w.close(websocket.StatusCode(4001), "too slow")

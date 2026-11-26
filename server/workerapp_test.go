@@ -21,6 +21,11 @@ func cliTestWorker(t *testing.T, argv ...string) (paths sessionPaths, id, socket
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return startTestCLIWorker(t, dir, dir, argv...)
+}
+
+func startTestCLIWorker(t *testing.T, dir, cwd string, argv ...string) (paths sessionPaths, id, socket string) {
+	t.Helper()
 	paths = sessionPaths{histDir: filepath.Join(dir, "history"), socketDir: filepath.Join(dir, "workers")}
 	id = newID()
 	socket = filepath.Join(paths.socketDir, id+".sock")
@@ -56,7 +61,7 @@ func cliTestWorker(t *testing.T, argv ...string) (paths sessionPaths, id, socket
 	})
 	_ = r.Close()
 	if err := json.NewEncoder(w).Encode(workerConfig{
-		Argv: argv, Cwd: dir, Dims: viewerDims{Cols: 140, Rows: 40}, Name: "test-cli", WaitFirstViewer: true,
+		Argv: argv, Cwd: cwd, Dims: viewerDims{Cols: 140, Rows: 40}, Name: "test-cli", WaitFirstViewer: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -214,10 +219,20 @@ func TestCLIWorkerActiveSize(t *testing.T) {
 		var b strings.Builder
 		for !strings.Contains(b.String(), want) {
 			kind, body, err := fc.readFrame()
-			if err != nil || kind != ftOutput {
+			if err != nil {
 				t.Fatalf("等待 %q，已见 %q，帧 %v，错误 %v", want, b.String(), kind, err)
 			}
-			b.Write(body)
+			switch kind {
+			case ftOutput:
+				b.Write(body)
+			case ftSize:
+				_, dims, ok := decodeResize(body)
+				if !ok || !dims.valid() {
+					t.Fatalf("无效尺寸通知 %q", body)
+				}
+			default:
+				t.Fatalf("等待 %q 时收到意外帧 %v", want, kind)
+			}
 		}
 	}
 	send := func(c *frameConn, typ frameType, data []byte) {
@@ -228,6 +243,8 @@ func TestCLIWorkerActiveSize(t *testing.T) {
 	}
 	send(fc, ftInput, []byte("\n"))
 	waitOutput("40 140")
+	send(fc, ftResize, []byte(`{}`))
+	send(fc, ftResize, []byte(`{"cols":0,"rows":null}`))
 	send(fc, ftResize, mustJSON(resizeMsg{Cols: 110, Rows: 31}))
 	waitOutput("31 110")
 	peer, ack, err := attachWorker(socket, id)
@@ -235,9 +252,25 @@ func TestCLIWorkerActiveSize(t *testing.T) {
 		t.Fatalf("attach = %+v, %v", ack, err)
 	}
 	defer peer.close()
-	send(peer, ftResize, mustJSON(resizeMsg{Cols: 51, Rows: 36}))
+	// An undeclared legacy viewer still becomes the owner as in Spec 006.
+	send(peer, ftInput, []byte("\n"))
+	waitOutput("31 110")
+	send(peer, ftResize, mustJSON(resizeMsg{Cols: 105, Rows: 32}))
+	waitOutput("32 105")
+	// Clearing the active viewer keeps the current grid. Its later input leaves the CLI owner intact.
+	send(peer, ftResize, mustJSON(resizeMsg{}))
+	send(peer, ftInput, []byte("\n"))
+	waitOutput("32 105")
 	send(fc, ftInput, []byte("\n"))
 	waitOutput("31 110")
+	send(peer, ftInput, []byte("\n"))
+	waitOutput("31 110")
+	send(fc, ftResize, mustJSON(resizeMsg{Cols: 115, Rows: 33}))
+	waitOutput("33 115")
+
+	send(peer, ftResize, mustJSON(resizeMsg{Cols: 51, Rows: 36}))
+	send(fc, ftInput, []byte("\n"))
+	waitOutput("33 115")
 	send(peer, ftInput, []byte("\n"))
 	waitOutput("36 51")
 }

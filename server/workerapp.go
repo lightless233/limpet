@@ -278,7 +278,7 @@ func (w *workerHost) handleConn(fc *frameConn) {
 }
 
 func newViewer(fc *frameConn, cut int64) *viewer {
-	v := &viewer{conn: fc, queue: make(chan []byte, queueChunks), done: make(chan struct{})}
+	v := &viewer{conn: fc, queue: make(chan viewerEvent, queueChunks), done: make(chan struct{})}
 	v.cutOffset.Store(cut)
 	return v
 }
@@ -315,14 +315,16 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 	}
 
 	var out, cont []byte
+	// The first CLI viewer receives output from byte zero, at its startup dimensions.
+	cols, rows := v.dims.Cols, v.dims.Rows
 	if replay {
 		var err error
-		out, cont, err = s.rebuildFor(v)
+		out, cont, cols, rows, err = s.rebuildFor(v)
 		if err != nil {
 			return
 		}
 	}
-	if fc.writeFrame(ftReady, nil) != nil {
+	if fc.writeFrame(ftReady, mustJSON(resizeMsg{Cols: cols, Rows: rows})) != nil {
 		return
 	}
 	for i := 0; i < len(out); i += wsChunk {
@@ -336,28 +338,49 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 	go s.readViewer(v)
 
 	buf := make([]byte, 0, wsChunk)
+	writeSize := func(size resizeMsg) bool {
+		if v.closed.Load() {
+			return false
+		}
+		if fc.writeFrame(ftSize, mustJSON(size)) != nil {
+			v.closeWith(4001, "too slow")
+			return false
+		}
+		return true
+	}
 	for !v.closed.Load() {
 		select {
 		case <-v.done:
 			return
-		case chunk, ok := <-v.queue:
+		case event, ok := <-v.queue:
 			if !ok {
 				if !v.closed.Load() {
 					_ = fc.writeFrameTimeout(ftExit, mustJSON(s.end), exitWriteBudget)
 				}
 				return
 			}
-			buf = append(buf[:0], chunk...)
-			v.queued.Add(-int64(len(chunk)))
+			if len(event.data) == 0 {
+				if !writeSize(event.size) {
+					return
+				}
+				continue
+			}
+			buf = append(buf[:0], event.data...)
+			v.queued.Add(-int64(len(event.data)))
+			var nextSize resizeMsg
 		drain:
 			for len(buf) < wsChunk {
 				select {
-				case chunk, ok := <-v.queue:
+				case event, ok := <-v.queue:
 					if !ok {
 						break drain
 					}
-					buf = append(buf, chunk...)
-					v.queued.Add(-int64(len(chunk)))
+					if len(event.data) == 0 {
+						nextSize = event.size
+						break drain
+					}
+					buf = append(buf, event.data...)
+					v.queued.Add(-int64(len(event.data)))
 				default:
 					break drain
 				}
@@ -367,6 +390,9 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 			}
 			if fc.writeFrame(ftOutput, buf) != nil {
 				v.closeWith(4001, "too slow")
+				return
+			}
+			if nextSize.Cols != 0 && !writeSize(nextSize) {
 				return
 			}
 		}
@@ -390,17 +416,16 @@ func (s *session) readViewer(v *viewer) {
 		}
 		switch t {
 		case ftResize:
-			var rm resizeMsg
-			if jsonUnmarshal(payload, &rm) != nil {
-				continue
-			}
-			dims := viewerDims{Cols: rm.Cols, Rows: rm.Rows}
-			if !dims.valid() {
+			_, dims, ok := decodeResize(payload)
+			if !ok {
 				continue
 			}
 			s.inputMu.Lock()
 			v.dims = dims
-			if s.owner == v && !v.closed.Load() {
+			v.locked = dims == (viewerDims{})
+			if v.locked && s.owner == v {
+				s.owner = nil
+			} else if s.owner == v && !v.closed.Load() {
 				s.resize(dims.Cols, dims.Rows)
 			}
 			s.inputMu.Unlock()
@@ -413,11 +438,13 @@ func (s *session) readViewer(v *viewer) {
 				s.inputMu.Unlock()
 				return
 			}
-			if s.cli {
-				s.owner = v
-			}
-			if v.dims.valid() {
-				s.resize(v.dims.Cols, v.dims.Rows)
+			if !v.locked {
+				if s.cli {
+					s.owner = v
+				}
+				if v.dims.valid() {
+					s.resize(v.dims.Cols, v.dims.Rows)
+				}
 			}
 			_, err := s.ptmx.Write(payload)
 			s.inputMu.Unlock()

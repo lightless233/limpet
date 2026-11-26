@@ -95,8 +95,58 @@ func TestHandshakeAndCrossOriginGuards(t *testing.T) {
 		}
 		defer conn.CloseNow()
 		kind, body, err := conn.Read(ctx)
-		if err != nil || kind != websocket.MessageText || string(body) != `{"type":"ready"}` {
+		if err != nil || kind != websocket.MessageText || string(body) != `{"type":"ready","cols":80,"rows":24}` {
 			t.Fatalf("同源接入的首帧 = %v %q, err=%v", kind, body, err)
 		}
 	})
+}
+
+func TestRelayLegacyReadyAndExplicitResize(t *testing.T) {
+	for _, payload := range []string{"", `{"cols":80,"rows":null}`} {
+		t.Run(payload, func(t *testing.T) {
+			serverEnd, worker := net.Pipe()
+			defer worker.Close()
+			_ = worker.SetDeadline(time.Now().Add(3 * time.Second))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err == nil {
+					relay(&wsConn{c: conn}, newFrameConn(serverEnd))
+				}
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			conn, _, err := websocket.Dial(ctx, server.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.CloseNow()
+			if err := writeFrame(worker, ftReady, []byte(payload)); err != nil {
+				t.Fatal(err)
+			}
+			kind, body, err := conn.Read(ctx)
+			if err != nil || kind != websocket.MessageText || string(body) != `{"type":"ready"}` {
+				t.Fatalf("旧 worker ready = %v %q, %v", kind, body, err)
+			}
+			for _, msg := range []string{
+				`{"type":"resize"}`, `{"type":"resize","cols":null,"rows":0}`,
+				`{"type":"resize","cols":0,"rows":20}`, `{"type":"resize","cols":0,"rows":0}`,
+			} {
+				if err := conn.Write(ctx, websocket.MessageText, []byte(msg)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := conn.Write(ctx, websocket.MessageBinary, []byte("marker")); err != nil {
+				t.Fatal(err)
+			}
+			frame, data, err := readFrame(worker)
+			if err != nil || frame != ftResize || string(data) != `{"cols":0,"rows":0}` {
+				t.Fatalf("显式清空 = %v %q, %v", frame, data, err)
+			}
+			frame, data, err = readFrame(worker)
+			if err != nil || frame != ftInput || string(data) != "marker" {
+				t.Fatalf("清空后的下一帧 = %v %q, %v", frame, data, err)
+			}
+		})
+	}
 }

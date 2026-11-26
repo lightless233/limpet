@@ -444,14 +444,30 @@ type listedSession struct {
 	Cmd      string `json:"cmd,omitempty"`
 }
 
-// list keeps the existing HTTP representation and metadata boundary.
+// list publishes only the HTTP display fields. CLI and registry retain the launch directory.
 func (m *manager) list() []map[string]any {
 	items := m.listSessions()
 	out := make([]map[string]any, 0, len(items))
+	home, _ := os.UserHomeDir()
 	for _, item := range items {
-		out = append(out, map[string]any{
+		row := map[string]any{
 			"id": item.ID, "name": item.Name, "created": item.Created, "attached": item.Attached,
-		})
+		}
+		if item.Cwd != "" {
+			cwd := item.Cwd
+			if home != "" {
+				if cwd == home {
+					cwd = "~"
+				} else if suffix, ok := strings.CutPrefix(cwd, strings.TrimRight(home, "/")+"/"); ok {
+					cwd = "~/" + suffix
+				}
+			}
+			row["cwd"] = cwd
+		}
+		if item.Cmd != "" {
+			row["cmd"] = filepath.Base(item.Cmd)
+		}
+		out = append(out, row)
 	}
 	return out
 }
