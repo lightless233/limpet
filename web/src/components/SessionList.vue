@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, toRaw, useTemplateRef, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRaw, useTemplateRef, watch } from 'vue'
 import type { useSessions } from '../sessions'
 import AppIcon from './AppIcon.vue'
 
@@ -9,6 +9,84 @@ const { sessions, loading, loadError, authExpired, request, refresh } = props.st
 const busy = ref(false)
 const closing = ref(new Set<string>())
 const closeError = ref('')
+
+const cwdTip = useTemplateRef<HTMLDivElement>('cwdTip')
+const cwdTipText = ref('')
+const cwdTipPos = ref({ left: 0, top: 0 })
+let showTipTimer = 0
+let hideTipTimer = 0
+let tipSeq = 0
+
+function hideCwdTip() {
+  tipSeq++
+  clearTimeout(showTipTimer)
+  clearTimeout(hideTipTimer)
+  showTipTimer = 0
+  hideTipTimer = 0
+  cwdTipText.value = ''
+  const el = cwdTip.value
+  if (el?.matches(':popover-open')) {
+    try { el.hidePopover() } catch {}
+  }
+}
+
+function cancelHideCwdTip() {
+  clearTimeout(hideTipTimer)
+  hideTipTimer = 0
+}
+
+function scheduleHideCwdTip() {
+  tipSeq++
+  clearTimeout(showTipTimer)
+  showTipTimer = 0
+  clearTimeout(hideTipTimer)
+  hideTipTimer = window.setTimeout(hideCwdTip, 120)
+}
+
+function showCwdTip(e: PointerEvent, cwd: string) {
+  if (e.pointerType && e.pointerType !== 'mouse') return
+  const target = e.currentTarget as HTMLElement | null
+  if (!target) return
+  cancelHideCwdTip()
+  clearTimeout(showTipTimer)
+  const seq = ++tipSeq
+  showTipTimer = window.setTimeout(async () => {
+    showTipTimer = 0
+    if (seq !== tipSeq || !target.isConnected) return
+    cwdTipText.value = cwd
+    await nextTick()
+    const el = cwdTip.value
+    if (seq !== tipSeq || !el || !target.isConnected) return
+    const rect = target.getBoundingClientRect()
+    el.style.visibility = 'hidden'
+    if (!el.matches(':popover-open')) {
+      try { el.showPopover() } catch {
+        el.style.visibility = ''
+        return
+      }
+    }
+    const tipRect = el.getBoundingClientRect()
+    const gap = 6
+    const margin = 8
+    let top = rect.bottom + gap
+    if (top + tipRect.height > window.innerHeight - margin && rect.top - tipRect.height - gap >= margin) {
+      top = rect.top - tipRect.height - gap
+    }
+    const left = Math.max(margin, Math.min(rect.left, window.innerWidth - tipRect.width - margin))
+    cwdTipPos.value = { left, top }
+    el.style.visibility = ''
+  }, 180)
+}
+
+function onWindowKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') hideCwdTip()
+}
+
+onMounted(() => window.addEventListener('keydown', onWindowKeydown))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onWindowKeydown)
+  hideCwdTip()
+})
 
 type Action = { mode: 'create'; name: string } | { mode: 'rename' | 'close'; id: string; name: string }
 const action = ref<Action | null>(null)
@@ -28,6 +106,7 @@ function reloadPage() {
 }
 
 async function openAction(next: Action) {
+  hideCwdTip()
   if (busy.value || authExpired.value || ('id' in next && closing.value.has(next.id))) return
   action.value = next
   actionError.value = ''
@@ -153,7 +232,7 @@ function fmtTime(iso: string) {
       <button class="control text-sm" @click="reloadPage">刷新页面</button>
     </div>
 
-    <div v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">
+    <div v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2" @scroll.passive="hideCwdTip">
       <p v-if="closeError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">{{ closeError }}</p>
       <p v-if="loadError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">
         {{ loadError }} <button class="control" @click="refresh">重试</button>
@@ -162,8 +241,8 @@ function fmtTime(iso: string) {
       <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>
 
       <ul class="grid gap-1">
-        <li v-for="s in sessions" :key="s.id" class="flex min-w-0 items-center gap-1 rounded-md px-1"
-          :class="activeId === s.id ? 'bg-[var(--limpet-control)]' : ''">
+        <li v-for="s in sessions" :key="s.id" class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
+          :class="{ 'session-row-active': activeId === s.id }">
           <button
             class="session-entry flex min-h-11 min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-2 text-left disabled:opacity-50"
             :aria-current="activeId === s.id ? 'true' : undefined"
@@ -175,17 +254,18 @@ function fmtTime(iso: string) {
             <span class="grid min-w-0 flex-1 gap-0.5">
               <span class="truncate text-sm font-medium">{{ s.name }}</span>
               <span v-if="s.cmd || s.cwd" class="flex min-w-0 items-center gap-1.5 text-xs text-[var(--limpet-muted)] [font-family:var(--limpet-mono)]">
-                <span v-if="s.cmd" class="max-w-[6rem] shrink-0 truncate rounded bg-[var(--limpet-control)] px-1">{{ s.cmd }}</span>
-                <span v-if="s.cwd" class="cwd truncate" :title="s.cwd"><bdi dir="ltr">{{ s.cwd }}</bdi></span>
+                <span v-if="s.cmd" class="max-w-[6rem] shrink-0 truncate rounded border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-1.5">{{ s.cmd }}</span>
+                <span v-if="s.cwd" class="cwd truncate"
+                  @pointerenter="showCwdTip($event, s.cwd)" @pointerleave="scheduleHideCwdTip"><bdi dir="ltr">{{ s.cwd }}</bdi></span>
               </span>
               <time :datetime="s.created" class="text-xs text-[var(--limpet-muted)]">{{ fmtTime(s.created) }}</time>
             </span>
           </button>
-          <button class="control shrink-0 text-[var(--limpet-muted)]" aria-label="重命名" title="重命名"
+          <button class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-pressed)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]" aria-label="重命名" title="重命名"
             :disabled="closing.has(s.id)" @click="openAction({ mode: 'rename', id: s.id, name: s.name })">
             <AppIcon name="edit" />
           </button>
-          <button class="control shrink-0 text-[var(--limpet-danger)]" aria-label="关闭" title="关闭"
+          <button class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-pressed)] hover:text-[var(--limpet-danger)] active:bg-[var(--limpet-pressed)]" aria-label="关闭" title="关闭"
             :disabled="closing.has(s.id)" @click="openAction({ mode: 'close', id: s.id, name: s.name })">
             <AppIcon name="close" />
           </button>
@@ -214,6 +294,19 @@ function fmtTime(iso: string) {
         </div>
       </form>
     </dialog>
+
+    <div
+      ref="cwdTip"
+      :popover="'hint' as any"
+      role="tooltip"
+      dir="ltr"
+      class="cwd-tooltip"
+      :style="{ left: cwdTipPos.left + 'px', top: cwdTipPos.top + 'px' }"
+      @pointerenter="cancelHideCwdTip"
+      @pointerleave="scheduleHideCwdTip"
+    >
+      {{ cwdTipText }}
+    </div>
   </aside>
 </template>
 
@@ -222,8 +315,30 @@ function fmtTime(iso: string) {
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-.session-entry:hover { background: var(--limpet-control); }
+.session-row { transition: background-color 120ms ease; }
+.session-row:hover { background: rgb(255 255 255 / 4%); }
+.session-row-active,
+.session-row-active:hover {
+  background: var(--limpet-control);
+  box-shadow: inset 2px 0 0 var(--limpet-accent);
+}
 .cwd { direction: rtl; }
+.cwd-tooltip {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  max-width: min(28rem, calc(100vw - 16px));
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--limpet-line);
+  border-radius: 0.375rem;
+  background: var(--limpet-surface);
+  color: var(--limpet-text);
+  font-family: var(--limpet-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  word-break: break-all;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+}
 .session-dialog {
   margin: auto;
   width: min(26rem, calc(100% - max(1rem, env(safe-area-inset-left)) - max(1rem, env(safe-area-inset-right))));
