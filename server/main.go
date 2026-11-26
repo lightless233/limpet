@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 )
 
@@ -58,39 +59,65 @@ func main() {
 		return
 	}
 
+	if err := runServer(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runServer() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	// worker 的启动方式要先核实：systemd-run 方式下拉不起单元就不启动（见 launch.go）。
 	launch, err := launchFromEnv(os.Getenv("LIMPET_WORKER_LAUNCH"))
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	if err := checkLaunch(launch); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	addr := os.Getenv("LIMPET_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:4040"
 	}
+	base, err := limpetHome()
+	if err != nil {
+		return err
+	}
+	lock, err := lockServer(base)
+	if err != nil {
+		return err
+	}
+	// Leave the lock held until process exit, including for handlers
+	// unwinding after the HTTP listener closes.
+	defer runtime.KeepAlive(lock)
 	m, err := newManager(launch)
 	if err != nil {
-		log.Fatalf("初始化失败: %v", err)
+		return fmt.Errorf("初始化失败: %w", err)
 	}
+
+	control, err := listenControl(base)
+	if err != nil {
+		return fmt.Errorf("启动本机控制通道: %w", err)
+	}
+	defer control.Close()
+	go m.serveControl(control)
 
 	srv := &http.Server{Addr: addr, Handler: m.handler()}
 
-	// server 停止路径：只关 HTTP，绝不向 worker 发终止信号（它们继续运行）。
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// server 停止路径只关闭自己的监听器。
 	go func() {
 		<-ctx.Done()
 		log.Printf("server 停止（worker 不受影响）")
+		_ = control.Close()
 		_ = srv.Close()
 	}()
 
 	log.Printf("limpet-server %s 监听 %s", version, addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 func (m *manager) handler() http.Handler {

@@ -43,6 +43,7 @@ func testManager(t *testing.T) *manager {
 	m := &manager{
 		sessions:   make(map[string]*workerHandle),
 		creating:   make(map[string]struct{}),
+		pendingIDs: make(map[string]struct{}),
 		registry:   make(map[string]regEntry),
 		workersDir: filepath.Join(dir, "workers"),
 		regPath:    filepath.Join(dir, "sessions.json"),

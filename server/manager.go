@@ -30,6 +30,7 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
 var (
 	errDuplicate = errors.New("同名会话已存在")
 	errNotFound  = errors.New("会话不存在")
+	errNotReady  = errors.New("worker 尚未就绪")
 )
 
 func newID() string {
@@ -52,12 +53,15 @@ type regEntry struct {
 	Name      string     `json:"name"`
 	CreatedAt time.Time  `json:"createdAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
+	Cwd       string     `json:"cwd,omitempty"`
+	Cmd       string     `json:"cmd,omitempty"`
 }
 
 type manager struct {
 	mu         sync.Mutex
 	sessions   map[string]*workerHandle
 	creating   map[string]struct{} // worker 就绪前预占的名称
+	pendingIDs map[string]struct{} // Web create owns admission until it completes
 	histDir    string
 	workersDir string // socket 与 worker 日志的所在目录（0700）
 	regPath    string
@@ -78,6 +82,7 @@ func newManager(launch launchMode) (*manager, error) {
 	m := &manager{
 		sessions:   map[string]*workerHandle{},
 		creating:   map[string]struct{}{},
+		pendingIDs: map[string]struct{}{},
 		histDir:    filepath.Join(base, "history"),
 		workersDir: filepath.Join(base, "workers"),
 		regPath:    filepath.Join(base, "sessions.json"),
@@ -121,29 +126,29 @@ func (m *manager) loadRegistry() error {
 }
 
 // saveRegistry 原子写（tmp + rename），调用方持 m.mu。注册表单写者是 server。
-func (m *manager) saveRegistry() {
-	b, err := json.MarshalIndent(m.registry, "", "  ")
+func (m *manager) saveRegistry() (err error) {
 	defer func() {
 		if err != nil {
 			log.Printf("保存会话注册表 %s 失败: %v", m.regPath, err)
 		}
 	}()
+	b, err := json.MarshalIndent(m.registry, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(m.regPath), ".sessions-*.tmp")
 	if err != nil {
-		return
+		return err
 	}
 	defer os.Remove(tmp.Name())
 	_, err = tmp.Write(b)
-	closeErr := tmp.Close()
-	if err == nil {
+	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), m.regPath)
+	if err != nil {
+		return err
 	}
+	return os.Rename(tmp.Name(), m.regPath)
 }
 
 func (m *manager) registryEndLocked(id string) {
@@ -155,68 +160,136 @@ func (m *manager) registryEndLocked(id string) {
 	}
 }
 
-// recoverWorkers 启动时探测现存 socket。瞬时探测失败时保留已有会话以便下次列表重试。
+// recoverWorkers is startup-only. A missing socket marks a previously
+// registered session ended; transient errors preserve its registration.
 func (m *manager) recoverWorkers() {
+	present, err := m.scanWorkers(true)
+	if err != nil {
+		return
+	}
+	for uuid, e := range m.registry {
+		if e.EndedAt == nil && !present[uuid] {
+			m.registryEndLocked(uuid)
+		}
+	}
+}
+
+// scanWorkers discovers new IDs. Already managed workers are probed by list.
+func (m *manager) scanWorkers(recovering bool) (map[string]bool, error) {
 	entries, err := os.ReadDir(m.workersDir)
 	if err != nil {
 		log.Printf("扫描 worker 目录失败: %v", err)
-		return
+		return nil, err
 	}
-	present := map[string]bool{}
+	present := make(map[string]bool)
 	for _, e := range entries {
-		name := e.Name()
-		uuid, ok := strings.CutSuffix(name, ".sock")
-		if !ok || !uuidRe.MatchString(uuid) {
+		id, ok := strings.CutSuffix(e.Name(), ".sock")
+		if !ok || !uuidRe.MatchString(id) || e.Type()&os.ModeSocket == 0 {
 			continue
 		}
-		path := filepath.Join(m.workersDir, name)
-		ack, err := probeWorker(path, uuid)
+		present[id] = true
+		m.mu.Lock()
+		known := m.sessions[id] != nil
+		m.mu.Unlock()
+		if known {
+			continue
+		}
+		_, err := m.discover(id, "", recovering)
 		if staleSocket(err) {
-			_ = os.Remove(path)
-			continue
-		}
-		present[uuid] = true
-		reg := m.registry[uuid]
-		switch {
-		case err != nil:
-			log.Printf("[recover] 暂时无法探测 worker %s，保留 socket: %v", uuid, err)
-			if reg.CreatedAt.IsZero() || reg.EndedAt != nil {
-				continue
-			}
-		case ack.UUID != uuid || !ack.OK || ack.Op != "probe":
-			log.Printf("[recover] worker %s 握手不符（op=%q, uuid=%q, ok=%t），保留 socket", uuid, ack.Op, ack.UUID, ack.OK)
-			continue
-		}
-
-		created := reg.CreatedAt
-		if created.IsZero() {
-			created = time.Now()
-		}
-		nm := reg.Name
-		if nm == "" {
-			nm = uuid
-		}
-		h := &workerHandle{
-			uuid: uuid, name: nm, createdAt: created,
-			socketPath: path, logPath: filepath.Join(m.workersDir, uuid+".log"),
-			attached: ack.Busy,
-		}
-		m.sessions[uuid] = h
-		if err == nil {
-			log.Printf("[recover] 会话恢复: %s（%s，pid %d）", uuid, nm, ack.PID)
+			delete(present, id)
 		}
 	}
-	// 注册表里已无 socket 的会话，记下首次观察到的结束时间。
-	for uuid, e := range m.registry {
-		if e.EndedAt == nil && !present[uuid] {
-			now := time.Now()
-			e.EndedAt = &now
-			m.registry[uuid] = e
-		}
-	}
-	m.saveRegistry()
+	return present, nil
 }
 
+func (m *manager) discover(id, name string, recovering bool) (*workerHandle, error) {
+	path := filepath.Join(m.workersDir, id+".sock")
+	m.mu.Lock()
+	_, pending := m.pendingIDs[id]
+	ended := m.registry[id].EndedAt != nil
+	m.mu.Unlock()
+	if pending || ended {
+		return nil, errNotFound
+	}
+
+	ack, err := probeWorker(path, id)
+	if staleSocket(err) {
+		m.mu.Lock()
+		if _, pending := m.pendingIDs[id]; !pending && m.sessions[id] == nil {
+			if info, statErr := os.Lstat(path); statErr == nil && info.Mode()&os.ModeSocket != 0 {
+				_ = os.Remove(path)
+			}
+		}
+		m.mu.Unlock()
+		return nil, err
+	}
+	if err != nil && !recovering {
+		return nil, err
+	}
+	if err == nil && !ack.readyFor(id) {
+		return nil, errNotReady
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	reg, registered := m.registry[id]
+	if _, pending := m.pendingIDs[id]; pending || reg.EndedAt != nil {
+		return nil, errNotFound
+	}
+	if h := m.sessions[id]; h != nil {
+		return h, nil
+	}
+	if err != nil && (!registered || reg.CreatedAt.IsZero()) {
+		return nil, err
+	}
+	if reg.CreatedAt.IsZero() {
+		reg.CreatedAt = time.Now()
+		if ack.CreatedAt != 0 {
+			reg.CreatedAt = time.UnixMilli(ack.CreatedAt)
+		}
+	}
+	if reg.Name == "" {
+		if !nameValid(name) {
+			name = ack.Name
+		}
+		if !nameValid(name) {
+			name = id
+		}
+		reg.Name = name
+		base := []rune(name)
+		for n := 2; m.nameTakenLocked(reg.Name, id); n++ {
+			suffix := fmt.Sprintf("-%d", n)
+			reg.Name = string(base[:min(len(base), 100-len(suffix))]) + suffix
+		}
+	}
+	if err == nil {
+		if ack.Cwd != "" {
+			reg.Cwd = ack.Cwd
+		}
+		if ack.Cmd != "" {
+			reg.Cmd = ack.Cmd
+		}
+	}
+	if !registered || m.registry[id] != reg {
+		previous := m.registry[id]
+		m.registry[id] = reg
+		if err := m.saveRegistry(); err != nil {
+			if registered {
+				m.registry[id] = previous
+			} else {
+				delete(m.registry, id)
+			}
+			return nil, fmt.Errorf("登记会话失败: %w", err)
+		}
+	}
+	h := &workerHandle{
+		uuid: id, name: reg.Name, createdAt: reg.CreatedAt,
+		socketPath: path, logPath: filepath.Join(m.workersDir, id+".log"),
+		attached: ack.Busy,
+	}
+	m.sessions[id] = h
+	return h, nil
+}
 func (m *manager) nameTakenLocked(name, exceptID string) bool {
 	if _, exists := m.creating[name]; exists {
 		return true
@@ -231,8 +304,12 @@ func (m *manager) nameTakenLocked(name, exceptID string) bool {
 
 func (m *manager) get(id string) *workerHandle {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sessions[id]
+	h := m.sessions[id]
+	m.mu.Unlock()
+	if h == nil && uuidRe.MatchString(id) {
+		h, _ = m.discover(id, "", false)
+	}
+	return h
 }
 
 // create 启动 worker 进程并等它就绪（socket 可探测、自报 uuid 一致）。
@@ -251,10 +328,12 @@ func (m *manager) create(name string) (*workerHandle, error) {
 		return nil, errDuplicate
 	}
 	m.creating[name] = struct{}{}
+	m.pendingIDs[id] = struct{}{}
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
 		delete(m.creating, name)
+		delete(m.pendingIDs, id)
 		m.mu.Unlock()
 	}()
 
@@ -275,7 +354,7 @@ func (m *manager) create(name string) (*workerHandle, error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 		ack, err := probeWorker(sockPath, id)
-		if err == nil && ack.OK && ack.UUID == id && ack.Op == "probe" {
+		if err == nil && ack.readyFor(id) {
 			break
 		}
 	}
@@ -356,8 +435,29 @@ func (m *manager) dropStale(id string, h *workerHandle) {
 	m.registryEndLocked(id)
 }
 
-// list 活会话查询：快照按创建时间排序，对每个 worker 探测接入状态。
+type listedSession struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Created  string `json:"created"`
+	Attached bool   `json:"attached"`
+	Cwd      string `json:"cwd,omitempty"`
+	Cmd      string `json:"cmd,omitempty"`
+}
+
+// list keeps the existing HTTP representation and metadata boundary.
 func (m *manager) list() []map[string]any {
+	items := m.listSessions()
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"id": item.ID, "name": item.Name, "created": item.Created, "attached": item.Attached,
+		})
+	}
+	return out
+}
+
+func (m *manager) listSessions() []listedSession {
+	_, _ = m.scanWorkers(false)
 	type workerSnapshot struct {
 		handle *workerHandle
 		state  workerHandle
@@ -376,7 +476,7 @@ func (m *manager) list() []map[string]any {
 		return a.createdAt.Before(b.createdAt)
 	})
 
-	out := make([]map[string]any, 0, len(workers))
+	out := make([]listedSession, 0, len(workers))
 	for _, worker := range workers {
 		h, state := worker.handle, worker.state
 		ack, err := probeWorker(state.socketPath, state.uuid)
@@ -389,22 +489,23 @@ func (m *manager) list() []map[string]any {
 			m.mu.Unlock()
 			continue
 		}
-		if err == nil && ack.OK && ack.UUID == state.uuid && ack.Op == "probe" {
+		if err == nil && ack.readyFor(state.uuid) {
 			h.attached = ack.Busy
 		}
-		name, attached := h.name, h.attached
-		m.mu.Unlock()
-		out = append(out, map[string]any{
-			"id":       state.uuid,
-			"name":     name,
-			"created":  state.createdAt.Format(time.RFC3339),
-			"attached": attached,
+		reg := m.registry[state.uuid]
+		out = append(out, listedSession{
+			ID: state.uuid, Name: h.name, Attached: h.attached,
+			Created: state.createdAt.Format(time.RFC3339), Cwd: reg.Cwd, Cmd: reg.Cmd,
 		})
+		m.mu.Unlock()
 	}
 	return out
 }
 
 func (m *manager) renameSession(id, name string) error {
+	if m.get(id) == nil {
+		return errNotFound
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	h := m.sessions[id]
