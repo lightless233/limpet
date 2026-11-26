@@ -166,5 +166,5 @@
 }
 
 @media (pointer: coarse) {
-  .terminal-pan { min-block-size: 1.5rem; }
+  .terminal-pan { display: none; }
 }
