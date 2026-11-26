@@ -66,6 +66,7 @@ type sessionPaths struct {
 type session struct {
 	id        string
 	createdAt time.Time
+	cli       bool
 
 	cmd  *exec.Cmd
 	ptmx *os.File
@@ -80,50 +81,77 @@ type session struct {
 	rec        *recording
 	queryQueue chan []byte
 	inputMu    sync.Mutex
+	owner      *viewer // guarded by inputMu
 
 	fedBytes atomic.Int64 // 已喂入真实网格的字节数（读循环在网格临界区内维护）
 
 	viewersMu sync.Mutex
 	viewers   map[*viewer]struct{} // 全部接入中的 viewer
+	viewerWG  sync.WaitGroup
+	ending    atomic.Bool
+	end       exitMsg // published by closing each viewer queue
 
 	done      chan struct{}
 	closeOnce sync.Once
+	stop      chan struct{}
 }
 
-// startSession 启动 Shell（PTY）、双网格与录制；PTY 就绪才返回（创建即启动 Shell）。
-func startSession(paths sessionPaths, id string) (*session, error) {
-	home, _ := os.UserHomeDir()
+// startSession prepares both grids and registers the launching viewer before
+// starting the command. Only that viewer starts at byte zero without replay.
+func startSession(paths sessionPaths, id string, config *workerConfig, first *viewer) (*session, error) {
+	cwd, _ := os.UserHomeDir()
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = loginShell()
+	}
+	argv := []string{shell, "-i"}
+	env := append(os.Environ(), "TERM=xterm-256color")
+	dims := viewerDims{Cols: gridCols, Rows: gridRows}
+	if config != nil {
+		argv, cwd, dims = config.Argv, config.Cwd, config.Dims
+		env = cliEnv()
+		if os.Getenv("TERM") == "" {
+			env = append(env, "TERM=xterm-256color")
+		}
+	}
 	s := &session{
-		id:         id,
-		createdAt:  time.Now(),
+		id: id, createdAt: time.Now(), cli: config != nil,
+		curCols: dims.Cols, curRows: dims.Rows, owner: first,
 		queryQueue: make(chan []byte, queryQueueSize),
-		viewers:    map[*viewer]struct{}{},
-		done:       make(chan struct{}),
+		viewers:    make(map[*viewer]struct{}), done: make(chan struct{}),
+		stop: make(chan struct{}),
 	}
-	s.curCols, s.curRows = gridCols, gridRows
+	if first != nil {
+		s.viewers[first] = struct{}{}
+		s.viewerWG.Add(1)
+	}
 
-	lf, err := os.OpenFile(filepath.Join(paths.histDir, id+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	logPath := filepath.Join(paths.histDir, id+".log")
+	metaPath := filepath.Join(paths.histDir, id+".meta")
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, err
-	}
-	mf, err := os.OpenFile(filepath.Join(paths.histDir, id+".meta"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		lf.Close()
 		return nil, err
 	}
 	started := false
 	defer func() {
 		if !started {
-			lf.Close()
-			mf.Close()
+			_ = lf.Close()
+			_ = os.Remove(logPath)
+		}
+	}()
+	mf, err := os.OpenFile(metaPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !started {
+			_ = mf.Close()
+			_ = os.Remove(metaPath)
 		}
 	}()
 
-	// 网格。写回回调：查询应答路由（spec 003/004）——多视图下程序查询随字节流
-	// 到达所有 viewer，可能收到重复应答；worker 只在「没有任何 viewer
-	// 持有实时流」时代答（全离线，程序不因无人接入而卡等）。
 	s.grid, err = libghostty.NewTerminal(
-		libghostty.WithSize(gridCols, gridRows),
+		libghostty.WithSize(dims.Cols, dims.Rows),
 		libghostty.WithMaxScrollbackLines(gridScrollback),
 		libghostty.WithContinuationMaxBytes(1<<20),
 		libghostty.WithWritePty(func(_ *libghostty.Terminal, data []byte) {
@@ -134,7 +162,7 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		return nil, err
 	}
 	s.shadow, err = libghostty.NewTerminal(
-		libghostty.WithSize(gridCols, gridRows),
+		libghostty.WithSize(dims.Cols, dims.Rows),
 		libghostty.WithMaxScrollbackLines(gridScrollback),
 	)
 	if err != nil {
@@ -142,37 +170,24 @@ func startSession(paths sessionPaths, id string) (*session, error) {
 		return nil, err
 	}
 
-	// Shell：$SHELL 优先，交互模式，起始目录 $HOME，TERM 显式设置（不信任默认环境）。
-	// pty.StartWithSize 强制 Setsid+Setctty：Shell 自成会话与进程组，随 worker 存活；
-	// 不能预设 Setpgid：creack/pty 合并而非替换 SysProcAttr，子进程先成组长再
-	// setsid 会 EPERM（实测踩过）。
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = loginShell()
-	}
-	cmd := exec.Command(shell, "-i")
-	cmd.Dir = home
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: gridCols, Rows: gridRows})
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir, cmd.Env = cwd, env
+	// pty.StartWithSize sets Setsid and Setctty, then applies size before exec.
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: dims.Cols, Rows: dims.Rows})
 	if err != nil {
 		s.grid.Close()
 		s.shadow.Close()
-		return nil, fmt.Errorf("启动 Shell 失败: %w", err)
+		return nil, fmt.Errorf("启动 %s 失败: %w", filepath.Base(argv[0]), err)
 	}
 	s.cmd, s.ptmx = cmd, ptmx
-	cwdPath := fmt.Sprintf("/proc/%d/cwd", cmd.Process.Pid)
 	s.rec = &recording{
-		queue:     make(chan recordingEvent, recordingQueueSize),
-		done:      make(chan struct{}),
-		finalDims: viewerDims{Cols: gridCols, Rows: gridRows},
+		queue: make(chan recordingEvent, recordingQueueSize),
+		done:  make(chan struct{}), finalDims: dims,
 	}
 	started = true
-	go s.rec.write(lf, mf, s.createdAt, home, cwdPath)
+	go s.rec.write(lf, mf, s.createdAt, dims, cwd, fmt.Sprintf("/proc/%d/cwd", cmd.Process.Pid))
 	go s.writeQueryReplies()
-	go s.readLoop()
+	go s.run()
 	return s, nil
 }
 
@@ -238,7 +253,6 @@ func (s *session) readLoop() {
 			break
 		}
 	}
-	s.finish("shell-exit")
 }
 
 // handleOutput：喂双网格 → 录制 → 广播给所有 viewer（各自有界队列，满则仅丢弃该 viewer）。
@@ -270,6 +284,9 @@ func (s *session) handleOutput(batch []byte) {
 	// （Shell 回显长行时逐段重绘），按块计会把几 KB 的积压误判成慢消费者。
 	s.viewersMu.Lock()
 	defer s.viewersMu.Unlock()
+	if s.end.Reason != "" {
+		return
+	}
 	for v := range s.viewers {
 		if v.closed.Load() {
 			continue
@@ -303,7 +320,7 @@ func (s *session) handleOutput(batch []byte) {
 func (s *session) resize(cols, rows uint16) {
 	s.gridMu.Lock()
 	defer s.gridMu.Unlock()
-	if s.grid == nil || (s.curCols == cols && s.curRows == rows) {
+	if s.ending.Load() || s.grid == nil || (s.curCols == cols && s.curRows == rows) {
 		return
 	}
 	if err := pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows}); err != nil {
@@ -380,23 +397,101 @@ func (s *session) attached() bool {
 	return false
 }
 
-// shutdown 显式关闭：回收会话进程树、关闭 PTY 并等待读循环收尾。
 func (s *session) shutdown() {
-	s.reap()
+	s.closeOnce.Do(func() { close(s.stop) })
 	<-s.done
 }
 
-func (s *session) reap() {
-	s.closeOnce.Do(func() {
-		reapTree(s.cmd.Process.Pid)
-		s.gridMu.Lock()
-		_ = s.ptmx.Close()
-		s.gridMu.Unlock()
-	})
+func (s *session) run() {
+	mainDone := make(chan *int, 1)
+	base := s.cmd.Process.Pid
+	go func() {
+		err := s.cmd.Wait()
+		var code *int
+		if state := s.cmd.ProcessState; state != nil {
+			status := state.Sys().(syscall.WaitStatus)
+			switch {
+			case status.Exited():
+				value := status.ExitStatus()
+				code = &value
+			case status.Signaled():
+				value := 128 + int(status.Signal())
+				code = &value
+			}
+		} else {
+			log.Printf("等待目标进程失败: %v", err)
+		}
+		mainDone <- code
+	}()
+
+	outputDone := make(chan struct{})
+	go func() {
+		s.readLoop()
+		close(outputDone)
+	}()
+
+	reason := "shell-exit"
+	if s.cli {
+		reason = "command-exit"
+	}
+	var code *int
+	select {
+	case code = <-mainDone:
+		if code == nil {
+			reason = "worker-error"
+		}
+	case <-s.stop:
+		reason = "killed"
+		_ = s.cmd.Process.Signal(syscall.SIGHUP)
+		signalDescendants(base, syscall.SIGTERM)
+		select {
+		case code = <-mainDone:
+		case <-time.After(killGrace):
+			_ = s.cmd.Process.Kill()
+			code = <-mainDone
+		}
+	}
+	s.ending.Store(true)
+
+	// The main child has already been waited for. Any remaining children
+	// are adopted descendants, including jobs that still hold the slave PTY.
+	select {
+	case <-outputDone:
+	case <-time.After(100 * time.Millisecond):
+	}
+	reapTree(base)
+	_ = s.ptmx.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	<-outputDone
+	_ = s.ptmx.Close()
+	s.finish(exitMsg{Reason: reason, ExitCode: code})
 }
 
-// finish 由 PTY 读循环调用。先关闭网格与队列，再回收进程并通知 viewer。
-func (s *session) finish(reason string) {
+func (s *session) finish(end exitMsg) {
+	s.ending.Store(true)
+
+	s.viewersMu.Lock()
+	s.end = end
+	for v := range s.viewers {
+		close(v.queue)
+	}
+	s.viewersMu.Unlock()
+
+	flushed := make(chan struct{})
+	go func() {
+		s.viewerWG.Wait()
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+	case <-time.After(frameBudget + exitWriteBudget):
+		s.viewersMu.Lock()
+		for v := range s.viewers {
+			_ = v.conn.close()
+		}
+		s.viewersMu.Unlock()
+		<-flushed
+	}
+
 	s.gridMu.Lock()
 	s.grid.Close()
 	s.shadow.Close()
@@ -404,37 +499,16 @@ func (s *session) finish(reason string) {
 	close(s.rec.queue)
 	close(s.queryQueue)
 	s.gridMu.Unlock()
-
-	s.reap()
-
-	s.viewersMu.Lock()
-	viewers := make([]*viewer, 0, len(s.viewers))
-	for v := range s.viewers {
-		viewers = append(viewers, v)
-	}
-	clear(s.viewers)
-	s.viewersMu.Unlock()
-
-	var notifications sync.WaitGroup
-	for _, v := range viewers {
-		notifications.Go(func() {
-			if !v.closed.Load() {
-				_ = v.conn.writeFrameTimeout(ftExit, mustJSON(exitMsg{Reason: reason}), exitWriteBudget)
-			}
-			v.closeWith(0, "")
-			v.conn.close()
-		})
-	}
-	notifications.Wait()
 	<-s.rec.done
 	close(s.done)
 }
 
-// removeViewer 从集合移除一个 viewer。
 func (s *session) removeViewer(v *viewer) {
 	s.viewersMu.Lock()
 	delete(s.viewers, v)
 	s.viewersMu.Unlock()
+	// The reader clears the owner after its last input. The output pump
+	// never waits on the PTY input lock when dropping a viewer.
 }
 
 // ---- 进程树回收 ----
@@ -456,21 +530,21 @@ const (
 )
 
 // Shell 退出时，过继的作业归 worker。进程组是快速路径，worker 后代才是回收范围。
-func reapTree(base int) {
-	root := os.Getpid()
-	signalTree := func(sig syscall.Signal) {
-		tree := descendants(root)
-		// Shell 可能已被回收，仅在会话后代仍属于原进程组时给该组发信号。
-		for _, pid := range tree {
-			if group, err := syscall.Getpgid(pid); err == nil && group == base {
-				_ = syscall.Kill(-base, sig)
-				break
-			}
-		}
-		for _, pid := range tree {
-			_ = syscall.Kill(pid, sig)
+func signalDescendants(base int, sig syscall.Signal) {
+	tree := descendants(os.Getpid())
+	for _, pid := range tree {
+		if group, err := syscall.Getpgid(pid); err == nil && group == base {
+			_ = syscall.Kill(-base, sig)
+			break
 		}
 	}
+	for _, pid := range tree {
+		_ = syscall.Kill(pid, sig)
+	}
+}
+
+// reapTree is called after the main waiter returns.
+func reapTree(base int) {
 	wait := func(deadline time.Time, killing bool) bool {
 		for time.Now().Before(deadline) {
 			pid, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
@@ -483,19 +557,18 @@ func reapTree(base int) {
 				log.Printf("回收会话子进程失败: %v", err)
 			case killing:
 				// 继续覆盖等待期间过继到 worker 的后代。
-				signalTree(syscall.SIGKILL)
+				signalDescendants(base, syscall.SIGKILL)
 			}
 			time.Sleep(reapPoll)
 		}
 		return false
 	}
 
-	_ = syscall.Kill(base, syscall.SIGHUP) // 交互式 Shell 可能忽略 TERM。
-	signalTree(syscall.SIGTERM)
+	signalDescendants(base, syscall.SIGTERM)
 	if wait(time.Now().Add(killGrace), false) {
 		return
 	}
-	signalTree(syscall.SIGKILL)
+	signalDescendants(base, syscall.SIGKILL)
 	if !wait(time.Now().Add(reapAfterKill), true) {
 		log.Printf("会话子进程未能在 SIGKILL 后 %v 内全部回收", reapAfterKill)
 	}

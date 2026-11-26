@@ -297,7 +297,7 @@ func (m *manager) spawnWorker(id, logPath string) (killHard func(), err error) {
 	if m.launch == launchSystemdRun {
 		return spawnWorkerSystemdRun(m.exePath, id, logPath)
 	}
-	return spawnWorkerDirect(m.exePath, id, logPath)
+	return spawnWorkerDirect(m.exePath, id, logPath, nil)
 }
 
 // closeSession 等 worker 回收进程、完成通知并自行移除 socket。超时后保留会话，允许重试。

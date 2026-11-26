@@ -4,7 +4,7 @@ package main
 //
 // 帧格式：[type:1][len:4 BE][payload]。握手帧是连接上的第一帧，双方各发一帧。
 //
-// ftResize 只申报窗口尺寸，实际调整由输入触发（spec 004）。
+// ftResize 申报窗口尺寸。CLI 会话的活跃 viewer 可以立即调整尺寸。
 
 import (
 	"encoding/binary"
@@ -53,7 +53,7 @@ const (
 	ftHandshakeAck frameType = 0x11 // 握手应答（worker → server）
 )
 
-// handshakeReq 是连接首帧。op：probe（探测，不占位）/ attach（成为 viewer）/ kill（回收会话）。
+// handshakeReq 是连接首帧。start 由启动 CLI 认领，attach 接入已运行的会话。
 type handshakeReq struct {
 	Op   string `json:"op"`
 	UUID string `json:"uuid"`
@@ -61,13 +61,22 @@ type handshakeReq struct {
 
 // handshakeAck 自报操作与 UUID，Busy 表示存在接入中的 viewer。
 type handshakeAck struct {
-	Op     string `json:"op"`
-	OK     bool   `json:"ok"`
-	UUID   string `json:"uuid"`
-	PID    int    `json:"pid"`
-	Busy   bool   `json:"busy"`
-	Alive  bool   `json:"alive"`
-	Reason string `json:"reason,omitempty"`
+	Op        string `json:"op"`
+	OK        bool   `json:"ok"`
+	UUID      string `json:"uuid"`
+	PID       int    `json:"pid"`
+	Busy      bool   `json:"busy"`
+	Alive     bool   `json:"alive"`
+	Reason    string `json:"reason,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	Cmd       string `json:"cmd,omitempty"`
+	CreatedAt int64  `json:"createdAt,omitempty"`
+	Ready     *bool  `json:"ready,omitempty"`
+}
+
+func (a handshakeAck) readyFor(id string) bool {
+	return a.Op == "probe" && a.OK && a.UUID == id && (a.Ready == nil || *a.Ready)
 }
 
 // resizeMsg 是 ftResize 的窗口尺寸申报。
@@ -78,7 +87,8 @@ type resizeMsg struct {
 
 // exitMsg 是 ftExit 的载荷。
 type exitMsg struct {
-	Reason string `json:"reason"`
+	Reason   string `json:"reason"`
+	ExitCode *int   `json:"exitCode,omitempty"`
 }
 
 // detachMsg 是 ftDetach 的载荷，Code 是期望的 WS 关闭码（如 4001）。

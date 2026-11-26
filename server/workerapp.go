@@ -1,219 +1,333 @@
 package main
 
-// worker 子命令的入口：`limpet-server worker <uuid>`。
-//
-// worker 进程持有 PTY 与双网格，独立于 server 进程存活——server 被杀（含 Ctrl+C
-// 与 kill -9）时它继续运行，PTY 不随 server 关闭（spec 003 验收 9 的机制，
-// 与 systemd 无关）。启动方式有两种（spec 005，见 launch.go）：前台开发时由 server
-// 以 Setsid 直接 spawn，天然脱离 server 的进程组与会话；服务部署时经 systemd-run
-// 进入自己的临时单元，不在 server 的控制组里——server 单元停止或重启时不被一并清理。
-//
-// 多视图（spec 004）：每条 attach 连接 = 一个 viewer，各自有界队列与切点；
-// PTY 输出广播给全部 viewer，输入来自任意 viewer。
-
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
+
+const (
+	workerConfigEnv = "LIMPET_WORKER_CONFIG"
+	firstViewerWait = 10 * time.Second
+)
+
+type workerConfig struct {
+	Argv            []string
+	Cwd             string
+	Dims            viewerDims
+	Name            string
+	WaitFirstViewer bool
+}
+
+func readWorkerConfig() (*workerConfig, error) {
+	if os.Getenv(workerConfigEnv) == "" {
+		return nil, nil
+	}
+	in := os.NewFile(3, "worker-startup")
+	defer in.Close()
+	var config workerConfig
+	if err := json.NewDecoder(in).Decode(&config); err != nil {
+		return nil, fmt.Errorf("读取 worker 启动配置: %w", err)
+	}
+	if len(config.Argv) == 0 || config.Argv[0] == "" || !filepath.IsAbs(config.Cwd) ||
+		!config.Dims.valid() || !nameValid(config.Name) || !config.WaitFirstViewer {
+		return nil, fmt.Errorf("worker 启动配置不合法")
+	}
+	return &config, nil
+}
+
+type workerHost struct {
+	id       string
+	paths    sessionPaths
+	config   *workerConfig
+	mu       sync.Mutex
+	session  *session
+	claimed  bool
+	stopping bool
+	done     chan struct{}
+}
 
 func runWorker(uuid string, paths sessionPaths) error {
 	if !uuidRe.MatchString(uuid) {
 		return fmt.Errorf("uuid 不合法: %q", uuid)
 	}
-	// 子进程收割者：Shell 死后脱离进程组的后台作业收养到 worker，显式关闭时按树回收。
+	config, err := readWorkerConfig()
+	if err != nil {
+		return err
+	}
 	if err := setSubreaper(); err != nil {
 		log.Printf("setSubreaper 失败（已孤儿化的任务可能无法回收）: %v", err)
 	}
-	if err := os.MkdirAll(paths.socketDir, 0o700); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(paths.histDir, 0o700); err != nil {
-		return err
+	for _, path := range []string{paths.socketDir, paths.histDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return err
+		}
 	}
 
-	s, err := startSession(paths, uuid)
-	if err != nil {
-		return err
+	w := &workerHost{id: uuid, paths: paths, config: config, done: make(chan struct{})}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM)
+	defer signal.Stop(sig)
+
+	if config == nil {
+		// Web create still starts the shell before publishing the socket.
+		s, err := startSession(paths, uuid, nil, nil)
+		if err != nil {
+			return err
+		}
+		w.claimed = true
+		w.session = s
+		go w.waitSession(s)
 	}
 
 	sockPath := filepath.Join(paths.socketDir, uuid+".sock")
-	_ = os.Remove(sockPath) // 同名 socket 残留只可能是 stale（worker 只在新建时被 spawn）
 	l, err := net.Listen("unix", sockPath)
+	if err == nil {
+		defer l.Close()
+		err = os.Chmod(sockPath, 0o600)
+	}
 	if err != nil {
-		s.shutdown()
+		w.stop(false)
+		<-w.done
 		return err
 	}
-	_ = os.Chmod(sockPath, 0o600)
+	log.Printf("worker %s 监听 (pid %d, socket %s)", uuid, os.Getpid(), sockPath)
 
-	// SIGTERM（server 关闭的兜底信号）：按显式关闭回收。
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM)
-	go func() {
-		<-sig
-		s.shutdown()
-	}()
-
-	log.Printf("worker %s 就绪 (pid %d, socket %s)", uuid, os.Getpid(), sockPath)
-
-	// accept 循环：探测/kill 连接各自短生命周期处理；attach 连接成为 viewer。
 	go func() {
 		for {
 			c, err := l.Accept()
 			if err != nil {
 				return
 			}
-			go s.handleWorkerConn(newFrameConn(c))
+			go w.handleConn(newFrameConn(c))
 		}
 	}()
 
-	// 会话结束（Shell 退出 / 显式关闭）→ 清理 socket → 进程退出。
-	<-s.done
-	_ = l.Close()
-	_ = os.Remove(sockPath)
-	log.Printf("worker %s 退出", uuid)
-	return nil
+	var timeout <-chan time.Time
+	if config != nil {
+		timer := time.NewTimer(firstViewerWait)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	for {
+		select {
+		case <-timeout:
+			w.stop(true)
+			timeout = nil
+		case <-sig:
+			w.stop(false)
+		case <-w.done:
+			log.Printf("worker %s 退出", uuid)
+			return nil
+		}
+	}
 }
 
-// handleWorkerConn 处理一条到 worker 的连接：握手分流 probe / kill / attach。
-func (s *session) handleWorkerConn(fc *frameConn) {
-	defer fc.close()
+func (w *workerHost) waitSession(s *session) {
+	<-s.done
+	close(w.done)
+}
 
+func (w *workerHost) stop(onlyUnclaimed bool) {
+	w.mu.Lock()
+	if w.stopping || (onlyUnclaimed && w.claimed) {
+		w.mu.Unlock()
+		return
+	}
+	w.stopping = true
+	s := w.session
+	if !w.claimed {
+		close(w.done)
+	}
+	w.mu.Unlock()
+	if s != nil {
+		s.shutdown()
+	}
+}
+
+func (w *workerHost) handleConn(fc *frameConn) {
+	defer fc.close()
+	_ = fc.c.SetReadDeadline(time.Now().Add(frameBudget))
 	t, payload, err := fc.readFrame()
 	if err != nil || t != ftHandshake {
 		return
 	}
+	_ = fc.c.SetReadDeadline(time.Time{})
 	var req handshakeReq
-	if err := jsonUnmarshal(payload, &req); err != nil {
+	if jsonUnmarshal(payload, &req) != nil {
 		return
 	}
-	// 身份核对（spec 验收 18）：请求的 uuid 必须与 worker 自报一致。
-	if req.UUID != s.id {
-		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: req.Op, OK: false, UUID: s.id,
-			Reason: fmt.Sprintf("uuid 不符: 请求 %q，worker %q", req.UUID, s.id),
-		}))
+	ack := handshakeAck{Op: req.Op, UUID: w.id, PID: os.Getpid()}
+	reply := func() error { return fc.writeFrame(ftHandshakeAck, mustJSON(ack)) }
+	if req.UUID != w.id {
+		ack.Reason = fmt.Sprintf("uuid 不符: 请求 %q，worker %q", req.UUID, w.id)
+		_ = reply()
 		return
 	}
-
+	w.mu.Lock()
+	s, stopping := w.session, w.stopping
 	switch req.Op {
 	case "probe":
-		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: "probe", OK: true, UUID: s.id,
-			PID: os.Getpid(), Busy: s.attached(), Alive: true,
-		}))
-
-	case "kill":
-		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: "kill", OK: true, UUID: s.id, PID: os.Getpid(),
-		}))
-		// 回收整棵会话进程树（subreaper），然后收尾退出（done 关闭 → 主函数清理）。
-		s.shutdown()
-
-	case "attach":
-		// 多视图：每条连接独立成为 viewer，互不排斥（spec 004 修订一）。
-		v := &viewer{
-			conn:  fc,
-			queue: make(chan []byte, queueChunks),
-			done:  make(chan struct{}),
-			// 切点初值 = 无穷大：重建完成前一切字节只进重建画面、不进实时流，
-			// 否则接入到重建之间的输出会被「实时发一遍 + 重建再发一遍」
-			// （验收 15 实测抓到过整段双份）。
+		ready := s != nil && !stopping && !s.ending.Load()
+		ack.OK, ack.Alive, ack.Ready = true, true, &ready
+		if ready {
+			ack.Busy = s.attached()
+			ack.CreatedAt = s.createdAt.UnixMilli()
+			if w.config != nil {
+				ack.Name, ack.Cwd = w.config.Name, w.config.Cwd
+				ack.Cmd = filepath.Base(w.config.Argv[0])
+			}
 		}
-		v.cutOffset.Store(1 << 62) // 接近无穷大的安全初值（atomic.Int64 零值是 0）
-		s.viewersMu.Lock()
-		s.viewers[v] = struct{}{}
-		s.viewersMu.Unlock()
-		if err := fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: "attach", OK: true, UUID: s.id, PID: os.Getpid(),
-		})); err != nil {
-			s.removeViewer(v)
+		w.mu.Unlock()
+		_ = reply()
+	case "kill":
+		// Linearize the stop with start before acknowledging. Keep the
+		// waiting worker alive until the bounded acknowledgement completes.
+		alreadyStopping := w.stopping
+		w.stopping = true
+		unclaimed := !w.claimed
+		w.mu.Unlock()
+		ack.OK = true
+		_ = reply()
+		if !alreadyStopping {
+			if unclaimed {
+				close(w.done)
+			} else if s != nil {
+				s.shutdown()
+			}
+		}
+	case "start":
+		if w.config == nil || w.claimed || stopping {
+			w.mu.Unlock()
+			ack.Reason = "会话不能再次启动"
+			_ = reply()
 			return
 		}
-		s.serveViewerConn(fc, v)
-
+		w.claimed = true
+		w.mu.Unlock()
+		v := newViewer(fc, 0)
+		v.dims = w.config.Dims
+		s, err := startSession(w.paths, w.id, w.config, v)
+		if err != nil {
+			ack.Reason = err.Error()
+			_ = reply()
+			close(w.done)
+			return
+		}
+		w.mu.Lock()
+		w.session, stopping = s, w.stopping
+		w.mu.Unlock()
+		go w.waitSession(s)
+		if stopping {
+			go s.shutdown()
+		}
+		ack.OK = true
+		s.serveViewer(v, ack, false)
+	case "attach":
+		w.mu.Unlock()
+		v := newViewer(fc, 1<<62)
+		if s == nil || stopping || !s.addViewer(v) {
+			ack.Reason = "会话尚未就绪或已经结束"
+			_ = reply()
+			return
+		}
+		ack.OK = true
+		s.serveViewer(v, ack, true)
 	default:
-		_ = fc.writeFrame(ftHandshakeAck, mustJSON(handshakeAck{
-			Op: req.Op, UUID: s.id, Reason: "未知 worker 操作",
-		}))
+		w.mu.Unlock()
+		ack.Reason = "未知 worker 操作"
+		_ = reply()
 	}
 }
 
-// serveViewerConn 服务一个 viewer：接入即重建（按网格当前尺寸，不等尺寸——
-// spec 004 修订三），此后窗口申报存档、输入晋升尺寸并直写 PTY、实时流广播。
-func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
+func newViewer(fc *frameConn, cut int64) *viewer {
+	v := &viewer{conn: fc, queue: make(chan []byte, queueChunks), done: make(chan struct{})}
+	v.cutOffset.Store(cut)
+	return v
+}
+
+func (s *session) addViewer(v *viewer) bool {
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	if s.ending.Load() {
+		return false
+	}
+	s.viewers[v] = struct{}{}
+	s.viewerWG.Add(1)
+	return true
+}
+
+// serveViewer is the sole writer from handshake to the final frame. A closed
+// queue signals graceful end after buffered output, while done drops a viewer.
+func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
+	fc := v.conn
+	defer s.viewerWG.Done()
+	defer s.removeViewer(v)
+	defer fc.close()
+	defer v.closeWith(0, "")
 	defer func() {
-		s.removeViewer(v)
-		v.closeWith(0, "") // 让输出泵退出（不发 DETACH）
-		fc.close()
-	}()
-
-	// 接入即重建。
-	out, cont, err := s.rebuildFor(v)
-	if err != nil {
-		// 重建失败：断开连接（server 侧映射为 WS 1011 + 原因）。
-		fc.close()
-		return
-	}
-	// ready 先于任何输出帧（spec 003 帧协议）。
-	if err := fc.writeFrame(ftReady, nil); err != nil {
-		return
-	}
-	for i := 0; i < len(out); i += wsChunk {
-		end := min(i+wsChunk, len(out))
-		if err := fc.writeFrame(ftOutput, out[i:end]); err != nil {
-			return
-		}
-	}
-	if len(cont) > 0 {
-		// 切点落在序列中间：未完成序列的字节作为实时流前缀（U0-8a 兜底）。
-		if err := fc.writeFrame(ftOutput, cont); err != nil {
-			return
-		}
-	}
-
-	// 输出泵：切点之后的实时流。它是这条连接在重建之后唯一的写者——丢弃 viewer 时的
-	// DETACH 与关闭也在这里做（见 closeWith）。
-	// 已经排队的块合并成一帧发出：下游按帧处理，逐块发的单块开销在碎块突发时跟不上
-	// PTY 读取，会把队列顶满。
-	go func() {
-		defer fc.close()
-		// 先尽力通知被丢弃的原因，再关闭 socket。
-		defer func() {
+		if v.closed.Load() {
 			<-v.done
 			if v.dropCode != 0 {
 				_ = fc.writeFrameTimeout(ftDetach, mustJSON(detachMsg{Code: v.dropCode, Reason: v.dropReason}), 300*time.Millisecond)
 			}
-		}()
-		buf := make([]byte, 0, wsChunk)
-		take := func(c []byte) {
-			buf = append(buf, c...)
-			v.queued.Add(-int64(len(c)))
 		}
-		for {
-			select {
-			case <-v.done:
+	}()
+	if fc.writeFrame(ftHandshakeAck, mustJSON(ack)) != nil {
+		return
+	}
+
+	var out, cont []byte
+	if replay {
+		var err error
+		out, cont, err = s.rebuildFor(v)
+		if err != nil {
+			return
+		}
+	}
+	if fc.writeFrame(ftReady, nil) != nil {
+		return
+	}
+	for i := 0; i < len(out); i += wsChunk {
+		if v.closed.Load() || fc.writeFrame(ftOutput, out[i:min(i+wsChunk, len(out))]) != nil {
+			return
+		}
+	}
+	if len(cont) != 0 && fc.writeFrame(ftOutput, cont) != nil {
+		return
+	}
+	go s.readViewer(v)
+
+	buf := make([]byte, 0, wsChunk)
+	for !v.closed.Load() {
+		select {
+		case <-v.done:
+			return
+		case chunk, ok := <-v.queue:
+			if !ok {
+				if !v.closed.Load() {
+					_ = fc.writeFrameTimeout(ftExit, mustJSON(s.end), exitWriteBudget)
+				}
 				return
-			default:
 			}
-			var chunk []byte
-			select {
-			case chunk = <-v.queue:
-			case <-v.done:
-				return
-			}
-			buf = buf[:0]
-			take(chunk)
+			buf = append(buf[:0], chunk...)
+			v.queued.Add(-int64(len(chunk)))
 		drain:
 			for len(buf) < wsChunk {
 				select {
-				case c := <-v.queue:
-					take(c)
+				case chunk, ok := <-v.queue:
+					if !ok {
+						break drain
+					}
+					buf = append(buf, chunk...)
+					v.queued.Add(-int64(len(chunk)))
 				default:
 					break drain
 				}
@@ -221,16 +335,26 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 			if v.closed.Load() {
 				return
 			}
-			if err := fc.writeFrame(ftOutput, buf); err != nil {
-				// 写失败只终止这条 viewer 连接。
+			if fc.writeFrame(ftOutput, buf) != nil {
 				v.closeWith(4001, "too slow")
 				return
 			}
 		}
-	}()
+	}
+}
 
-	for {
-		t, payload, err := fc.readFrame()
+func (s *session) readViewer(v *viewer) {
+	defer func() {
+		v.closeWith(0, "")
+		_ = v.conn.close()
+		s.inputMu.Lock()
+		if s.owner == v {
+			s.owner = nil
+		}
+		s.inputMu.Unlock()
+	}()
+	for !v.closed.Load() {
+		t, payload, err := v.conn.readFrame()
 		if err != nil {
 			return
 		}
@@ -241,15 +365,27 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 				continue
 			}
 			dims := viewerDims{Cols: rm.Cols, Rows: rm.Rows}
-			if dims.valid() {
-				v.dims = dims
+			if !dims.valid() {
+				continue
 			}
+			s.inputMu.Lock()
+			v.dims = dims
+			if s.owner == v && !v.closed.Load() {
+				s.resize(dims.Cols, dims.Rows)
+			}
+			s.inputMu.Unlock()
 		case ftInput:
 			if len(payload) == 0 {
 				continue
 			}
-			// 将尺寸晋升和该批输入一起串行化，查询应答也使用同一个写锁。
 			s.inputMu.Lock()
+			if v.closed.Load() || s.ending.Load() {
+				s.inputMu.Unlock()
+				return
+			}
+			if s.cli {
+				s.owner = v
+			}
 			if v.dims.valid() {
 				s.resize(v.dims.Cols, v.dims.Rows)
 			}
@@ -258,9 +394,6 @@ func (s *session) serveViewerConn(fc *frameConn, v *viewer) {
 			if err != nil {
 				return
 			}
-
-		default:
-			// 未知帧忽略（加法演进的前向兼容）。
 		}
 	}
 }

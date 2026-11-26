@@ -37,7 +37,7 @@ func (r *recording) enqueue(dims viewerDims, data []byte, at int64) {
 	}
 }
 
-func (r *recording) write(raw, meta *os.File, at time.Time, cwd, cwdPath string) {
+func (r *recording) write(raw, meta *os.File, at time.Time, dims viewerDims, cwd, cwdPath string) {
 	defer close(r.done)
 	defer raw.Close()
 	defer meta.Close()
@@ -52,12 +52,8 @@ func (r *recording) write(raw, meta *os.File, at time.Time, cwd, cwdPath string)
 			}
 		}
 	}
-	dims := viewerDims{Cols: gridCols, Rows: gridRows}
 	writeMeta("T", 0, at.UnixMilli())
 	writeMeta("S", 0, fmt.Sprintf("%dx%d", dims.Cols, dims.Rows))
-	if actual, err := os.Readlink(cwdPath); err == nil {
-		cwd = actual
-	}
 	if cwd != "" {
 		writeMeta("C", 0, cwd)
 	}

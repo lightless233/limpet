@@ -55,9 +55,7 @@ func TestSessionConcurrentOutputResizeAndFinish(t *testing.T) {
 			finalDims: viewerDims{Cols: gridCols, Rows: gridRows},
 		},
 	}
-	// 这里的 PTY 无子进程，测试只执行网格、录制和 viewer 的收尾。
-	s.closeOnce.Do(func() {})
-	go s.rec.write(raw, meta, time.Now(), "", "")
+	go s.rec.write(raw, meta, time.Now(), viewerDims{Cols: gridCols, Rows: gridRows}, "", "")
 	s.resize(91, 31)
 	size, err := pty.GetsizeFull(master)
 	if err != nil || size.Cols != 91 || size.Rows != 31 {
@@ -92,7 +90,7 @@ func TestSessionConcurrentOutputResizeAndFinish(t *testing.T) {
 	for range cap(ready) {
 		<-ready
 	}
-	s.finish("test")
+	s.finish(exitMsg{Reason: "test"})
 	close(stop)
 	routines.Wait()
 

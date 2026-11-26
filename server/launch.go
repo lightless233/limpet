@@ -9,6 +9,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -77,8 +78,8 @@ func ownServiceUnit() string {
 
 // spawnWorkerDirect 直接 spawn（前台开发）：worker 自成会话——server 的 Ctrl+C 所在的进程组
 // 够不到它，终端关闭的挂断信号也不会波及。返回的 killHard 供 worker 迟迟不就绪时兜底。
-func spawnWorkerDirect(exe, id, logPath string) (killHard func(), err error) {
-	lf, err := os.Create(logPath)
+func spawnWorkerDirect(exe, id, logPath string, config *workerConfig) (killHard func(), err error) {
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -88,12 +89,42 @@ func spawnWorkerDirect(exe, id, logPath string) (killHard func(), err error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = lf
 	cmd.Stderr = lf
+	var configIn *os.File
+	if config != nil {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		defer writer.Close()
+		cmd.ExtraFiles = []*os.File{reader}
+		cmd.Env = append(cliEnv(), workerConfigEnv+"=1")
+		configIn = writer
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	process := cmd.Process
 	go func() { _ = cmd.Wait() }()
+	if configIn != nil {
+		_ = cmd.ExtraFiles[0].Close()
+		if err := json.NewEncoder(configIn).Encode(config); err != nil {
+			_ = process.Kill()
+			return nil, fmt.Errorf("传递 worker 启动配置: %w", err)
+		}
+	}
 	return func() { _ = process.Kill() }, nil
+}
+
+func cliEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(key, "LIMPET_") || key == "LIMPET_HOME" {
+			env = append(env, kv)
+		}
+	}
+	return env
 }
 
 // spawnWorkerSystemdRun 让 systemd 在独立的临时单元里启动 worker。systemd-run 不继承调用方的
