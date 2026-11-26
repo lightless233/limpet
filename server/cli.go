@@ -299,14 +299,7 @@ func cliStart(base, name string, explicit bool, argv []string) (int, error) {
 		_, err := cliControl(ctx, base, 500*time.Millisecond, controlRequest{
 			Op: "register", UUID: id, Name: name, ExplicitName: explicit,
 		})
-		var timeout net.Error
-		if ctx.Err() != nil || staleSocket(err) || (errors.As(err, &timeout) && timeout.Timeout()) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("通知本机 server 登记会话 %s: %w", id, err)
-		}
-		return nil
+		return err
 	})
 }
 

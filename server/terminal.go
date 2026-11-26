@@ -150,11 +150,10 @@ func (t *cliTerminal) run(replay bool, connect func(context.Context) (*frameConn
 		return 1, err
 	}
 	defer fc.close()
-	var registered <-chan error
 	if register != nil {
-		result := make(chan error, 1)
-		registered = result
-		go func() { result <- register(ctx) }()
+		// Registration is best effort. The server can discover the worker
+		// later, and a short command may already have exited.
+		go register(ctx)
 	}
 
 	ready := make(chan struct{})
@@ -233,9 +232,6 @@ func (t *cliTerminal) run(replay bool, connect func(context.Context) (*frameConn
 	_ = t.out.SetWriteDeadline(time.Now())
 	<-outDone
 	<-inDone
-	if registered != nil {
-		result.err = errors.Join(result.err, <-registered)
-	}
 	reset = result.reset
 	return result.code, result.err
 }

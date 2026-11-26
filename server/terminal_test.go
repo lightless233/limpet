@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ func TestCLITerminalExit(t *testing.T) {
 		reset bool
 	}{
 		{"normal", `{"reason":"command-exit","exitCode":42}`, 42, false},
+		{"fast-exit-register", `{"reason":"command-exit","exitCode":0}`, 0, false},
 		{"target-signal", `{"reason":"command-exit","exitCode":143}`, 143, true},
 		{"remote-close", `{"reason":"killed","exitCode":0}`, 0, true},
 		{"legacy", `{"reason":"shell-exit"}`, 1, true},
@@ -63,6 +65,16 @@ func TestCLITerminalExit(t *testing.T) {
 			defer cancel()
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCLITerminalChild$")
 			cmd.Env = append(os.Environ(), "LIMPET_TEST_TTY_SOCKET="+path)
+			var control *net.UnixListener
+			if tc.name == "fast-exit-register" {
+				control, err = net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "server.sock"), Net: "unix"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer control.Close()
+				_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+				cmd.Env = append(cmd.Env, "LIMPET_TEST_TTY_REGISTER=1")
+			}
 			cmd.Stdin, cmd.Stdout = slave, slave
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
@@ -91,6 +103,26 @@ func TestCLITerminalExit(t *testing.T) {
 				}
 			}
 			var output bytes.Buffer
+			if control != nil {
+				peer, err := control.AcceptUnix()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer peer.Close()
+				_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+				var req controlRequest
+				if err := json.NewDecoder(peer).Decode(&req); err != nil || req.Op != "register" {
+					t.Fatalf("控制请求 = %+v, %v", req, err)
+				}
+				// The command has already ended by the time the server probes
+				// it. Let the CLI consume the rejection before reading ftExit.
+				if err := json.NewEncoder(peer).Encode(controlReply{Error: errNotReady.Error()}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+					t.Fatalf("登记连接未关闭: %v", err)
+				}
+			}
 			if tc.name == "blocked-output" {
 				go func() {
 					_ = writeFrame(c, ftOutput, bytes.Repeat([]byte{'x'}, 1<<20))
@@ -139,6 +171,9 @@ func TestCLITerminalExit(t *testing.T) {
 			if code != tc.code {
 				t.Fatalf("退出码 = %d，期待 %d，stderr=%s", code, tc.code, stderr.String())
 			}
+			if control != nil && stderr.Len() != 0 {
+				t.Fatalf("短命令正常退出时 stderr 应为空，实际 %q", stderr.String())
+			}
 			var restored syscall.Termios
 			if err := terminalIOCTL(slave, syscall.TCGETS, &restored); err != nil || restored != original {
 				t.Fatalf("termios 未恢复: %+v，%v", restored, err)
@@ -157,6 +192,13 @@ func TestCLITerminalChild(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	var register func(context.Context) error
+	if os.Getenv("LIMPET_TEST_TTY_REGISTER") == "1" {
+		register = func(ctx context.Context) error {
+			_, err := cliControl(ctx, filepath.Dir(path), controlBudget, controlRequest{Op: "register", UUID: newID()})
+			return err
+		}
+	}
 	code, err := tty.run(true, func(ctx context.Context) (*frameConn, error) {
 		var d net.Dialer
 		c, err := d.DialContext(ctx, "unix", path)
@@ -164,7 +206,7 @@ func TestCLITerminalChild(t *testing.T) {
 			return nil, err
 		}
 		return newFrameConn(c), nil
-	}, nil)
+	}, register)
 	tty.close()
 	if err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintln(os.Stderr, err)
