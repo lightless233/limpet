@@ -274,3 +274,105 @@ func TestCLIWorkerActiveSize(t *testing.T) {
 	send(peer, ftInput, []byte("\n"))
 	waitOutput("36 51")
 }
+
+func TestIsTerminalReportOnly(t *testing.T) {
+	reports := []string{
+		"\x1b[?0u",
+		"\x1b[?5u",
+		"\x1b[?62;22c",
+		"\x1b[>1;10;0c",
+		"\x1b[?2026;2$y",
+		"\x1b[7;9R",
+		"\x1b[0n",
+		"\x1b[4;600;800t",
+		"\x1b[6;16;8t",
+		"\x1b]11;rgb:1212/1414/1717\x07",
+		"\x1b]10;rgb:e6e6/eaea/f0f0\x1b\\",
+		"\x1b[I",
+		"\x1b[O",
+		"\x1bP>|ghostty\x1b\\",
+		"\x1b_Gi=1;OK\x1b\\",
+		"\x1b[?5u\x1b[?2026;2$y",
+	}
+	for _, in := range reports {
+		if !isTerminalReportOnly([]byte(in)) {
+			t.Errorf("isTerminalReportOnly(%q) = false, want true", in)
+		}
+	}
+
+	userInputs := []string{
+		"",
+		"a",
+		"\r",
+		"\n",
+		"\x1b",
+		"\x1b[A",
+		"\x1b[13u",
+		"\x1b[97;5u",
+		"\x1b[<0;10;5M",
+		"\x1b[200~hello\x1b[201~",
+		"\x1b[?5ua",
+	}
+	for _, in := range userInputs {
+		if isTerminalReportOnly([]byte(in)) {
+			t.Errorf("isTerminalReportOnly(%q) = true, want false", in)
+		}
+	}
+}
+
+func TestTerminalReportDoesNotPingPongSize(t *testing.T) {
+	_, id, socket := cliTestWorker(t, "/bin/sh", "-c",
+		"trap 'stty size' WINCH; stty -echo; printf 'READY\\n'; chunk=$(stty -icanon min 1 time 0; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'); stty icanon; printf 'REPORT:%s\\n' \"$chunk\"; stty size; while :; do if IFS= read -r line; then stty size; fi; done")
+	fc, ack, err := openWorker(socket, id, "start", frameBudget)
+	if err != nil || !ack.OK {
+		t.Fatalf("start = %+v, %v", ack, err)
+	}
+	defer fc.close()
+	_ = fc.c.SetReadDeadline(time.Now().Add(frameBudget))
+	if typ, _, err := fc.readFrame(); err != nil || typ != ftReady {
+		t.Fatalf("ready = %v, %v", typ, err)
+	}
+	waitOutput := func(want string) {
+		t.Helper()
+		var b strings.Builder
+		for !strings.Contains(b.String(), want) {
+			kind, body, err := fc.readFrame()
+			if err != nil {
+				t.Fatalf("等待 %q，已见 %q，帧 %v，错误 %v", want, b.String(), kind, err)
+			}
+			switch kind {
+			case ftOutput:
+				b.Write(body)
+			case ftSize:
+			default:
+				t.Fatalf("等待 %q 时收到意外帧 %v", want, kind)
+			}
+		}
+	}
+	send := func(c *frameConn, typ frameType, data []byte) {
+		t.Helper()
+		if err := c.writeFrame(typ, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	waitOutput("READY")
+	peer, ack, err := attachWorker(socket, id)
+	if err != nil || !ack.OK {
+		t.Fatalf("attach = %+v, %v", ack, err)
+	}
+	defer peer.close()
+
+	send(peer, ftResize, mustJSON(resizeMsg{Cols: 184, Rows: 62}))
+	send(peer, ftInput, []byte("\x1b[?5u"))
+	waitOutput("REPORT:E[?5u")
+	waitOutput("40 140")
+
+	// fc remains owner without re-sending input; its resize takes effect immediately.
+	send(fc, ftResize, mustJSON(resizeMsg{Cols: 110, Rows: 31}))
+	waitOutput("31 110")
+
+	// Real user input from peer still promotes peer's size.
+	send(peer, ftInput, []byte("x\n"))
+	waitOutput("62 184")
+}

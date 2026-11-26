@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -438,7 +439,7 @@ func (s *session) readViewer(v *viewer) {
 				s.inputMu.Unlock()
 				return
 			}
-			if !v.locked {
+			if !v.locked && !isTerminalReportOnly(payload) {
 				if s.cli {
 					s.owner = v
 				}
@@ -453,4 +454,151 @@ func (s *session) readViewer(v *viewer) {
 			}
 		}
 	}
+}
+
+// isTerminalReportOnly reports whether b consists exclusively of automatic
+// terminal query responses/focus notifications rather than user keystrokes.
+func isTerminalReportOnly(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for i := 0; i < len(b); {
+		n := consumeTerminalReport(b[i:])
+		if n == 0 {
+			return false
+		}
+		i += n
+	}
+	return true
+}
+
+func consumeTerminalReport(b []byte) int {
+	if len(b) < 3 || b[0] != 0x1b {
+		return 0
+	}
+	switch b[1] {
+	case '[':
+		return consumeCSIReport(b)
+	case ']':
+		return consumeOSCReport(b)
+	case 'P':
+		return consumeSTTerminated(b, 2)
+	case '_':
+		if len(b) >= 5 && b[2] == 'G' {
+			return consumeSTTerminated(b, 3)
+		}
+	}
+	return 0
+}
+
+func consumeCSIReport(b []byte) int {
+	if b[2] == 'I' || b[2] == 'O' {
+		return 3
+	}
+	i := 2
+	var prefix byte
+	if b[i] == '?' || b[i] == '>' {
+		prefix = b[i]
+		i++
+	}
+	if i >= len(b) || b[i] < '0' || b[i] > '9' {
+		return 0
+	}
+	groups := 0
+	firstStart, firstEnd := i, i
+	for {
+		dStart := i
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+		if i == dStart {
+			return 0
+		}
+		if groups == 0 {
+			firstStart, firstEnd = dStart, i
+		}
+		groups++
+		if i < len(b) && b[i] == ';' {
+			i++
+			continue
+		}
+		break
+	}
+	if i >= len(b) {
+		return 0
+	}
+	if b[i] == '$' {
+		if i+1 < len(b) && b[i+1] == 'y' && (prefix == 0 || prefix == '?') && groups == 2 {
+			return i + 2
+		}
+		return 0
+	}
+	switch b[i] {
+	case 'u':
+		if prefix == '?' && groups == 1 {
+			return i + 1
+		}
+	case 'c':
+		if prefix == '?' || prefix == '>' {
+			return i + 1
+		}
+	case 'R':
+		if (prefix == 0 || prefix == '?') && groups == 2 {
+			return i + 1
+		}
+	case 'n':
+		if (prefix == 0 || prefix == '?') && groups >= 1 {
+			return i + 1
+		}
+	case 't':
+		if prefix == 0 && groups == 3 && firstEnd-firstStart == 1 &&
+			(b[firstStart] == '4' || b[firstStart] == '6' || b[firstStart] == '8') {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func consumeOSCReport(b []byte) int {
+	rest := b[2:]
+	offset := 0
+	for _, p := range [][]byte{[]byte("4;"), []byte("10;"), []byte("11;"), []byte("12;")} {
+		if bytes.HasPrefix(rest, p) {
+			offset = 2 + len(p)
+			break
+		}
+	}
+	if offset == 0 {
+		return 0
+	}
+	for j := offset; j < len(b); j++ {
+		if b[j] == 0x07 {
+			return j + 1
+		}
+		if b[j] == 0x1b {
+			if j+1 < len(b) && b[j+1] == '\\' {
+				return j + 2
+			}
+			return 0
+		}
+		if b[j] < 0x20 || b[j] == 0x7f {
+			return 0
+		}
+	}
+	return 0
+}
+
+func consumeSTTerminated(b []byte, start int) int {
+	for j := start; j < len(b); j++ {
+		if b[j] == 0x1b {
+			if j+1 < len(b) && b[j+1] == '\\' {
+				return j + 2
+			}
+			return 0
+		}
+		if b[j] < 0x20 || b[j] == 0x7f {
+			return 0
+		}
+	}
+	return 0
 }
