@@ -1,5 +1,52 @@
 @import "tailwindcss";
 
+:root {
+  color-scheme: dark;
+  accent-color: #34d399;
+  scrollbar-color: #696f7b #181b20;
+  --limpet-canvas: #121417;
+  --limpet-surface: #181b20;
+  --limpet-control: #22262e;
+  --limpet-pressed: #2d333e;
+  --limpet-line: #262b34;
+  --limpet-text: #e6eaf0;
+  --limpet-muted: #8b94a3;
+  --limpet-accent: #34d399;
+  --limpet-warn: #fbbf24;
+  --limpet-danger: #f87171;
+  --limpet-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", Menlo,
+    Consolas, "Noto Sans Mono CJK SC", monospace;
+  background: var(--limpet-canvas);
+  color: var(--limpet-text);
+  font-family: "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans CJK SC",
+    system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.control {
+  display: inline-flex;
+  min-inline-size: 32px;
+  min-block-size: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border-radius: 0.375rem;
+  padding-inline: 0.5rem;
+  background: var(--limpet-control);
+}
+
+.control:is(:hover, :active), .control[aria-pressed="true"] {
+  background: var(--limpet-pressed);
+}
+
+.control:disabled { opacity: 0.5; }
+.control:focus-visible { outline: 2px solid var(--limpet-accent); outline-offset: -2px; }
+.control-primary, .control-primary:is(:hover, :active) { background: var(--limpet-accent); color: var(--limpet-canvas); }
+.control-danger, .control-danger:is(:hover, :active) { background: var(--limpet-danger); color: var(--limpet-canvas); }
+
+@media (pointer: coarse) {
+  .control { min-inline-size: 44px; min-block-size: 44px; }
+}
+
 /* wterm 滚动修复：库默认给 .wterm 设 overflow:hidden，只支持程序化
    scrollTop；用户滚轮/触摸在 hidden 下不产生原生滚动（应用未开启鼠标
    跟踪时 wterm 也不处理滚轮，直接放行）。放开为 auto 后：
@@ -10,4 +57,10 @@
    加载顺序晚于本文件，单类选择器会被简写覆盖回去 */
 .wterm.wterm {
   overflow-y: auto;
+  --term-bg: var(--limpet-canvas);
+  --term-fg: var(--limpet-text);
+  --term-font-family: var(--limpet-mono);
+  padding: 4px 6px;
+  border-radius: 0;
+  box-shadow: none;
 }
