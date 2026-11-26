@@ -150,7 +150,7 @@ function fmtTime(iso: string) {
 
     <div v-if="authExpired" class="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
       <p role="alert" class="text-sm text-[var(--limpet-danger)]">登录已失效</p>
-      <button v-if="!activeId" class="control text-sm" @click="reloadPage">刷新页面</button>
+      <button class="control text-sm" @click="reloadPage">刷新页面</button>
     </div>
 
     <div v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2">

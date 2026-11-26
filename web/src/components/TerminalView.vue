@@ -467,7 +467,7 @@ function reloadPage() {
       <button class="control shrink-0" aria-label="返回会话列表" title="返回会话列表" @click="emit('back')">
         <AppIcon name="back" />
       </button>
-      <button class="control min-w-0 flex-1 justify-start bg-transparent text-left" popovertarget="quick-switch"
+      <button class="control min-w-0 flex-1 justify-start bg-transparent text-left hover:bg-[var(--limpet-pressed)] active:bg-[var(--limpet-pressed)]" popovertarget="quick-switch"
         aria-label="切换会话" :title="sessionName">
         <span class="min-w-0 truncate font-semibold">{{ sessionName }}</span><AppIcon name="down" class="shrink-0" />
       </button>
