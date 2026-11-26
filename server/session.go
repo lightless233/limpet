@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/creack/pty"
 	"go.mitchellh.com/libghostty"
@@ -98,7 +99,8 @@ type session struct {
 
 // startSession prepares both grids and registers the launching viewer before
 // starting the command. Only that viewer starts at byte zero without replay.
-func startSession(paths sessionPaths, id string, config *workerConfig, first *viewer) (*session, error) {
+func startSession(paths sessionPaths, id string, config *workerConfig, first *viewer,
+	reportStartFailure func(error)) (_ *session, err error) {
 	cwd, _ := os.UserHomeDir()
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -126,29 +128,29 @@ func startSession(paths sessionPaths, id string, config *workerConfig, first *vi
 		s.viewerWG.Add(1)
 	}
 
-	logPath := filepath.Join(paths.histDir, id+".log")
-	metaPath := filepath.Join(paths.histDir, id+".meta")
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	var recordingFiles []*os.File
+	defer func() {
+		if err == nil {
+			return
+		}
+		if reportStartFailure != nil {
+			reportStartFailure(err)
+		}
+		for _, file := range recordingFiles {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+		}
+	}()
+	lf, err := os.OpenFile(filepath.Join(paths.histDir, id+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	started := false
-	defer func() {
-		if !started {
-			_ = lf.Close()
-			_ = os.Remove(logPath)
-		}
-	}()
-	mf, err := os.OpenFile(metaPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	recordingFiles = append(recordingFiles, lf)
+	mf, err := os.OpenFile(filepath.Join(paths.histDir, id+".meta"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if !started {
-			_ = mf.Close()
-			_ = os.Remove(metaPath)
-		}
-	}()
+	recordingFiles = append(recordingFiles, mf)
 
 	s.grid, err = libghostty.NewTerminal(
 		libghostty.WithSize(dims.Cols, dims.Rows),
@@ -172,8 +174,7 @@ func startSession(paths sessionPaths, id string, config *workerConfig, first *vi
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir, cmd.Env = cwd, env
-	// pty.StartWithSize sets Setsid and Setctty, then applies size before exec.
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: dims.Cols, Rows: dims.Rows})
+	ptmx, err := startSessionPTY(cmd, dims)
 	if err != nil {
 		s.grid.Close()
 		s.shadow.Close()
@@ -184,11 +185,64 @@ func startSession(paths sessionPaths, id string, config *workerConfig, first *vi
 		queue: make(chan recordingEvent, recordingQueueSize),
 		done:  make(chan struct{}), finalDims: dims,
 	}
-	started = true
 	go s.rec.write(lf, mf, s.createdAt, dims, cwd, fmt.Sprintf("/proc/%d/cwd", cmd.Process.Pid))
 	go s.writeQueryReplies()
 	go s.run()
 	return s, nil
+}
+
+func startSessionPTY(cmd *exec.Cmd, dims viewerDims) (*os.File, error) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer slave.Close()
+	defer func() {
+		if err != nil {
+			_ = master.Close()
+		}
+	}()
+	// creack/pty uses File.Fd during Open, which puts the master back in
+	// blocking mode. Restore nonblocking I/O before starting the child.
+	fd, err := master.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var setErr error
+	if err = fd.Control(func(fd uintptr) { setErr = syscall.SetNonblock(int(fd), true) }); err != nil {
+		return nil, err
+	}
+	if err = setErr; err != nil {
+		return nil, err
+	}
+	if err = master.SetReadDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	if err = setSessionPTYSize(master, dims.Cols, dims.Rows); err != nil {
+		return nil, err
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	if err = cmd.Start(); err != nil {
+		return nil, err
+	}
+	return master, nil
+}
+
+func setSessionPTYSize(file *os.File, cols, rows uint16) error {
+	size := pty.Winsize{Cols: cols, Rows: rows}
+	fd, err := file.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var errno syscall.Errno
+	err = fd.Control(func(fd uintptr) {
+		_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&size)))
+	})
+	if errno != 0 {
+		return errno
+	}
+	return err
 }
 
 func loginShell() string {
@@ -323,7 +377,7 @@ func (s *session) resize(cols, rows uint16) {
 	if s.ending.Load() || s.grid == nil || (s.curCols == cols && s.curRows == rows) {
 		return
 	}
-	if err := pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows}); err != nil {
+	if err := setSessionPTYSize(s.ptmx, cols, rows); err != nil {
 		log.Printf("设置 PTY 尺寸失败: %v", err)
 		return
 	}

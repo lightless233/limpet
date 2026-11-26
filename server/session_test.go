@@ -177,3 +177,25 @@ func checkReaperInChild(t *testing.T) {
 		t.Errorf("仍有未收割的子进程，Wait4 = %v", err)
 	}
 }
+
+func TestSessionPTYResizePreservesReadDeadline(t *testing.T) {
+	cmd := exec.Command("/bin/sleep", "3")
+	master, err := startSessionPTY(cmd, viewerDims{Cols: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	if err := setSessionPTYSize(master, 91, 31); err != nil {
+		t.Fatal(err)
+	}
+	if err := master.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := master.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("调整尺寸后的空闲 PTY 读未在期限内返回: %v", err)
+	}
+}

@@ -78,7 +78,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 
 	if config == nil {
 		// Web create still starts the shell before publishing the socket.
-		s, err := startSession(paths, uuid, nil, nil)
+		s, err := startSession(paths, uuid, nil, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -214,10 +214,11 @@ func (w *workerHost) handleConn(fc *frameConn) {
 		w.mu.Unlock()
 		v := newViewer(fc, 0)
 		v.dims = w.config.Dims
-		s, err := startSession(w.paths, w.id, w.config, v)
-		if err != nil {
+		s, err := startSession(w.paths, w.id, w.config, v, func(err error) {
 			ack.Reason = err.Error()
 			_ = reply()
+		})
+		if err != nil {
 			close(w.done)
 			return
 		}
