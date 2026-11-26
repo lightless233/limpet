@@ -52,8 +52,13 @@ func workerOp(path, uuid, op string, readBudget time.Duration) (handshakeAck, er
 	return ack, err
 }
 
-func openWorker(path, uuid, op string, readBudget time.Duration) (_ *frameConn, ack handshakeAck, err error) {
-	conn, err := net.DialTimeout("unix", path, 2*time.Second)
+func openWorker(path, uuid, op string, readBudget time.Duration) (*frameConn, handshakeAck, error) {
+	return openWorkerContext(context.Background(), path, uuid, op, readBudget)
+}
+
+func openWorkerContext(ctx context.Context, path, uuid, op string, readBudget time.Duration) (_ *frameConn, ack handshakeAck, err error) {
+	dialer := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
 		return nil, ack, err
 	}
@@ -64,6 +69,8 @@ func openWorker(path, uuid, op string, readBudget time.Duration) (_ *frameConn, 
 	}()
 
 	fc := newFrameConn(conn)
+	stop := context.AfterFunc(ctx, func() { _ = fc.close() })
+	defer stop()
 	if err := fc.writeFrame(ftHandshake, mustJSON(handshakeReq{Op: op, UUID: uuid})); err != nil {
 		return nil, ack, err
 	}

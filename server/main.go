@@ -59,6 +59,13 @@ func main() {
 		return
 	}
 
+	if filepath.Base(os.Args[0]) == "limpet" {
+		code, err := runCLI(args)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		os.Exit(code)
+	}
 	if err := runServer(); err != nil {
 		log.Fatal(err)
 	}
