@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -88,16 +90,14 @@ func runWorker(uuid string, paths sessionPaths) error {
 	}
 
 	sockPath := filepath.Join(paths.socketDir, uuid+".sock")
-	l, err := net.Listen("unix", sockPath)
-	if err == nil {
-		defer l.Close()
-		err = os.Chmod(sockPath, 0o600)
-	}
+	l, err := listenWorker(sockPath)
 	if err != nil {
 		w.stop(false)
 		<-w.done
 		return err
 	}
+	defer os.Remove(sockPath)
+	defer l.Close()
 	log.Printf("worker %s 监听 (pid %d, socket %s)", uuid, os.Getpid(), sockPath)
 
 	go func() {
@@ -128,6 +128,35 @@ func runWorker(uuid string, paths sessionPaths) error {
 			return nil
 		}
 	}
+}
+
+func listenWorker(path string) (_ *net.UnixListener, err error) {
+	// The pathname exists after bind but before listen. Publish the
+	// discoverable name only once a probe can connect.
+	staged := strings.TrimSuffix(path, ".sock") + ".tmp"
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: staged, Net: "unix"})
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			_ = l.Close()
+		}
+	}()
+	if err := os.Chmod(staged, 0o600); err != nil {
+		return nil, err
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			err = fmt.Errorf("worker socket 路径已存在: %s", path)
+		}
+		return nil, err
+	}
+	if err := os.Rename(staged, path); err != nil {
+		return nil, err
+	}
+	l.SetUnlinkOnClose(false)
+	return l, nil
 }
 
 func (w *workerHost) waitSession(s *session) {
