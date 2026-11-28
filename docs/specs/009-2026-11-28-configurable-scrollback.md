@@ -1,7 +1,7 @@
 # Spec 009：前端可配置回滚行数（含 0 = 近似无限）与前后端联动
 
 - 日期：2026-11-28
-- 状态：已修订（完成 GPT 预审修订，待复审）
+- 状态：已修订（完成 GPT 终轮复审前收口，待最终放行）
 - 来源：用户在 Web 端希望将终端回滚（scrollback）行数做到前端配置中直接修改，自由填写数字（不设固定档位按钮），默认保持 `10000`，填写 `0` 代表近似无限滚动（界面小字提示可能卡顿），并使后端 worker 与前端实时联动、重启不丢；同时排查 `server/session.go` 时发现既有缺陷——`libghostty.NewTerminal` 仅传了 `WithMaxScrollbackLines(10000)` 而未解除默认字节上限 `10,000` 字节，导致实际历史仅保留约 1 页即被字节上限截断，本 Spec 一并修复。
 - 关联：延续并更新 [Spec 003](003-2026-11-23-libghostty-worker-host.md)、[Spec 006](006-2026-11-26-local-cli-attach.md) 与 [Spec 008](008-2026-11-28-xtermjs-webgl-frontend.md)；不改录制 `.log`/`.meta` 格式，不改 WebSocket 终端 I/O 与控制帧协议。
 
@@ -9,7 +9,7 @@
 
 1. **Web 端直改全局回滚行数**：在前端终端工具弹窗提供自由数字输入框（默认 `10000`，`0` 表示近似无限，无固定档位按钮），提交后持久化到服务端，并同步更新当前终端、运行中的新版 worker 及后续新建会话。
 2. **修复 `libghostty` 字节上限隐式截断**：在 `grid` 与 `shadow` 双网格创建及运行期更新时同步显式解除 `MaxScrollbackBytes` 默认 `10,000` 字节上限，使配置的行数上限或无限模式真实生效。
-3. **无损兼容在线旧版 worker**：部署升级后仍存活的旧版 worker 进程不重启、不断线、不报错，能够准确统计并如实向用户反馈。
+3. **无损兼容在线旧版 worker**：设置的保存与广播不重启在线旧版 worker，也不断开它们正在承载的其他 viewer 连接（当前页面仅在回滚数值实际变更时按统一契约重连），并能准确统计与如实反馈旧版会话数量。
 
 ## 一、回滚行数语义与前后端映射契约
 
@@ -30,7 +30,7 @@
   - 解除字节上限：同上，创建 `WithMaxScrollbackBytes(math.MaxUint)` / 运行期 `SetScrollbackMaxBytes(&unlimited)`。
   - 解除行数上限：创建时不传 `WithMaxScrollbackLines`（`nil` 默认无行数上限）；运行期更新时调用 `SetScrollbackMaxLines(nil)`。
 - **页粒度与运行期变更边界**：
-  - `libghostty` 按整页（page）粒度裁剪物理历史行，且至少保留一标准页，跨活动区边界的历史页也会保留；因此设定行数为近似物理上限而非精确逐行硬截断。
+  - `libghostty` 按整页（page）粒度裁剪物理历史行，有效上限至少允许一标准页（历史不足时库不会额外补齐空页），跨活动区边界的历史页也会保留；因此设定行数为近似物理上限而非精确逐行硬截断。
   - 调大上限（含设为 `0`）仅对后续新滚动出去的输出生效，**不能**找回此前已被 `libghostty` 回收丢弃的历史行。
   - 调小上限会按整页粒度立即回收符合条件的超限历史页。
 
@@ -86,21 +86,26 @@
 ### 3.1 启动读取与 Web / CLI 竞态闭合
 
 - 新版 worker 启动（同时覆盖 Web `direct` / `systemd-run` 与 `limpet` CLI `start` 路径）创建 `grid` 与 `shadow` 时，直接以只读方式读取 `<LIMPET_HOME>/settings.json` 获取初始 `scrollback`（不新增环境变量污染用户 Shell，也不依赖 `systemd-run` 传额外 fd）。
-- **Web 创建登记与重同步顺序**：`manager.create()` 在拉起 worker 前先记录当时的内存生效值 `before`；待 worker `probe` 就绪后，先加短锁将新 handle 写入 `m.sessions` 并清除 `pendingIDs[id]`（使后续并发 `PUT` 广播能发现该会话），随后在 `m.mu` 外读取当前最新生效值；若当前值与 `before` 不同，向该 worker 补发一次 `set_scrollback`。
-- **CLI `start` 启动窗口闭合（无未认领暂存）**：CLI `start` 在 `startSession()` 创建双网格时读取 `settings.json`；当 `w.session` 已发布使 `probe` 可见后、且向首个 viewer 发送 `ftReady` 之前，再只读核对一次 `<LIMPET_HOME>/settings.json`，若与网格创建时读到的值不同则立即更新双网格，从而闭合创建到发布之间的配置竞态窗口。
+- **Web 创建登记与同步顺序**：`manager.create()` 在 worker `probe` 就绪后，先加短锁将新 handle 写入 `m.sessions` 并清除 `pendingIDs[id]`（使后续并发 `PUT` 广播能发现该会话），随后在 `m.mu` 外读取当前最新生效值并**无条件**向该 worker 补发一次 `set_scrollback`（彻底闭合启动期间 `A → B → A` 改回原值时的漏同步）。
+- **CLI `start` 启动窗口闭合（无未认领暂存）**：CLI `start` 在 `startSession()` 创建双网格时读取 `settings.json`；当 `w.session` 已发布使 `probe` 可见后、且向首个 viewer 发送 `ftReady` 之前，在**与 RPC 共用的 `s.gridMu` 临界区内**连续完成「只读重检 `<LIMPET_HOME>/settings.json` → 与双网格当前生效值比较 → 若不同则更新双网格」，彻底消除重检与并发 `PUT` 之间的交错窗口。
 
 ### 3.2 Worker 握手扩展（`op: "set_scrollback"`）、迟到 RPC 防护与旧版兼容
 
 - 在既有 `handshakeReq` JSON 中增加可选字段 `scrollback`（`*int` + `omitempty`），不影响既有 `probe` / `kill` / `start` / `attach` 报文兼容性。
 - 新增操作 `op: "set_scrollback"`（单次短连接请求—应答，沿用 `2s` 读超时，不占 viewer）：
-  - **未就绪与停止态拒绝**：若 `w.session == nil`（尚在等待 CLI `start` 认领或创建中）或 `w.stopping == true`，立即释放 `w.mu` 并回复 `OK: false`（如 `"会话尚未就绪"` / `"会话正在结束"`），不再做复杂暂存；server 对该类应答归为 `failed`（不误记为 `unsupported`）。
-  - **锁序安全与迟到防回滚**：在 `w.mu` 下取得 `session` 引用后立即释放 `w.mu`，再获取 `s.gridMu`；在 `s.gridMu` 内重查 `s.ending.Load() || s.grid == nil || s.shadow == nil`（若已结束或已释放回复 `OK: false`）。为防止前端/server 超时后的迟到旧 `set_scrollback` RPC 在晚于更新的 `PUT` 时把 worker 盖回旧值：在 `s.gridMu` 串行临界区内只读检查 `<LIMPET_HOME>/settings.json`，当存在合法配置且磁盘最新 `scrollback != *req.Scrollback` 时拒绝覆盖并回复 `OK: false`（原因 `"配置已过期"`）；否则同步更新 `grid` 与 `shadow` 并按双网格实际更新结果回复 `OK: true`（或错误详情）。
+  - **入口参数校验**：在加锁与解引用指针之前，先校验 `req.UUID == w.id` 且 `req.Scrollback != nil && *req.Scrollback >= 0 && *req.Scrollback <= 1000000`；缺失、`null` 或越界请求直接回复 `OK: false`（如 `"回滚行数不合法"`），严禁空指针解引用。
+  - **未就绪与停止态拒绝**：若 `w.session == nil`（尚在等待 CLI `start` 认领或创建中）或 `w.stopping == true`，立即释放 `w.mu` 并回复 `OK: false`（如 `"会话尚未就绪"` / `"会话正在结束"`），不做未认领暂存；server 对该类应答归为 `failed`（不误记为 `unsupported`）。
+  - **锁序安全与迟到防回滚**：在 `w.mu` 下取得 `session` 引用后立即释放 `w.mu`，再获取 `s.gridMu`；在 `s.gridMu` 内重查 `s.ending.Load() || s.grid == nil || s.shadow == nil`（若已结束或已释放回复 `OK: false`）。为防止前端/server 超时后的迟到旧 `set_scrollback` RPC 在晚于更新的 `PUT` 时把 worker 盖回旧值：在 `s.gridMu` 串行临界区内只读核对 `<LIMPET_HOME>/settings.json`：
+    - 文件存在且合法时：若磁盘值 `!= *req.Scrollback`，拒绝覆盖并回复 `OK: false`（原因 `"配置已过期"`）；
+    - 文件不存在（`os.ErrNotExist`）时：按默认值 `10000` 核对（`*req.Scrollback != 10000` 拒绝）；
+    - 文件损坏或不可读（其他读取/解析错误）时：同样回复 `OK: false` 拒绝盲目覆盖；
+    - 核对通过后同步更新 `grid` 与 `shadow` 并按双网格实际更新结果回复 `OK: true`（或错误详情）。
   - **旧版 worker 兼容**：运行中的旧版 worker 收到 `op: "set_scrollback"` 会走入既有 `default` 分支回复 `OK: false`、`Reason: "未知 worker 操作"` 并关闭探测连接，对运行中终端零影响。server 仅对此精确应答归类为 `unsupported`，**绝不能**当成 `staleSocket` 删除会话，也**不能**导致 `PUT /api/settings` 返回 `500`。
 
 ### 3.3 大快照重放与前端 `WriteBuffer` 背压边界
 
-- `serveViewer` 重放 `formatVT(grid/shadow)` 快照已按 `wsChunk`（`64 KiB`）分块写入 `ftOutput`，不受 `readFrame` `8 MiB` 单帧上限阻断；后端不在快照流中途截断或直接拒绝重连（因为 VT 流从旧到新输出，中途截断会砍掉底部当前活动屏），极端大历史带来的服务端序列化等待、重连传输耗时与内存占用由前端界面提示用户自行权衡。
-- **前端 `WriteBuffer` 背压**：`xterm.js` 的 `WriteBuffer` 在未解析积压超过 `50,000,000` 字节（`DISCARD_WATERMARK`）时会直接抛错触发终端进入 `fatalError`；因此前端 `drain()` 交付循环必须维护在途写字节水位（高水位 `16 MiB`）：向 `terminal.write(chunk, cb)` 提交的字节累计达到水位时暂停继续投喂后续待处理输出块，待写回调释放字节后再继续排空队列（回调内严格核对连接代数与活跃终端实例一致）。
+- `serveViewer` 重放 `formatVT(grid/shadow)` 快照已按 `wsChunk`（`64 KiB`）分块写入 `ftOutput`，不受 `readFrame` `8 MiB` 单帧上限阻断。按用户明确的产品决策：设定 `0`（近似无限）时将内存与重连耗时权衡完全交由用户自行决定，**不在**服务端中途截断 VT 快照、增设重连拒绝预算或新增自定义 WS 流控子协议（VT 流由旧到新输出，中途截断会砍掉底部当前活动屏）；极端大历史带来的服务端序列化等待、重连传输耗时与内存占用由前端界面提示告知用户。
+- **前端 `WriteBuffer` 背压**：`xterm.js` 的 `WriteBuffer` 在未解析积压超过 `50,000,000` 字节（`DISCARD_WATERMARK`）时会直接抛错触发终端进入 `fatalError`；因此前端 `drain()` 交付循环必须维护在途写字节水位（高水位 `16 MiB`）：向 `terminal.write(chunk, cb)` 提交的字节累计达到水位时暂停继续投喂后续待处理输出块（WS 接收侧的待写数据暂留在 `Connection.queue`），待写回调释放字节后再继续排空队列（回调内严格核对连接代数与活跃终端实例一致），使其始终安全低于 `50,000,000` 字节硬阈值。
 
 ## 四、前端交互与状态同步契约
 
@@ -119,11 +124,11 @@
 - **唯一真相与回放前加载**：
   - 回滚配置仅以服务端为唯一真相，**不使用** `localStorage` 双份缓存。
   - 应用启动挂载时通过与会话列表一致的 `request()` 封装拉取 `GET /api/settings`（自动兼容 Cloudflare Access `opaqueredirect` → `authExpired`）。
-  - 终端 `connect()` 在建立 WebSocket、接收 `ready` 与回放历史之前，必须先完成一次有界 `GET /api/settings` 读取（例如 `2s` 超时，失败/超时则回退页面最近一次成功加载值或默认 `10000`），从而保证：1）不会先按 `10000` 吃完大历史回放再丢掉本应保留的旧行；2）另一标签页修改设置后，新开或重连终端可立即拿到最新值。
-  - 每次打开 `#terminal-tools` 弹窗时也刷新一次最新服务端设置；所有 `GET` 与 `PUT` 更新通过单调递增版本序号防乱序，过期 `GET` 响应不得覆盖已生效值，也不得覆盖用户正在编辑/未保存的草稿。
+  - 终端 `connect()` 在建立 WebSocket、接收 `ready` 与回放历史之前，必须先完成一次有界 `GET /api/settings` 读取（例如 `2s` 超时，失败/超时则回退页面最近一次成功加载值或默认 `10000`）；**`await GET` 返回后必须复查组件未卸载（`!unmounted`）且当前连接代次 `gen` 未变更**，才创建 WebSocket，防止切换会话或卸载期间迟到醒来的 `connect()` 建出孤儿连接。由此保证：1）不会先按 `10000` 吃完大历史回放再丢掉本应保留的旧行；2）另一标签页修改设置后，新开或重连终端可立即拿到最新值。
+  - 每次打开 `#terminal-tools` 弹窗时也刷新一次最新服务端设置；所有 `GET` 与 `PUT` 更新通过单调递增版本序号防乱序——过期 `GET` 响应不得覆盖已生效值，也不得覆盖用户正在编辑/未保存的草稿；**`PUT` 保存成功时同步推进版本序号使仍在途的旧 `GET` 失效**，并以保存确认的值发起后续重连。
 - **提交校验与变更重连生效（保留 VT 状态与滚动条同步）**：
   - 直接修改活跃 `xterm.js` 的 `term.options.scrollback` 会触发 `BufferSet.resize()`，从而重置 `DECSTBM` 滚动区与部分 Tab stops 且需手工同步滚动条；因此前端**不在运行中的 `Terminal` 上热改 `options.scrollback`**。
-  - 提交前校验空值、非整数、`< 0` 或 `> 1000000`（并处理输入框 `invalid` 兜底）展示内联错误且不发请求；提交中禁用提交按钮防重入。
+  - 提交前在 `submit` 处理中直接校验空值、`validity.badInput`、`valueAsNumber`、非整数、`< 0` 或 `> 1000000` 并展示内联错误，不发请求；提交中禁用提交按钮防重入。
   - `PUT /api/settings` 成功更新生效值后：若生效值与当前活跃 `Terminal` 使用的配置**发生变化**，触发一次完整的 `connect()` 重建当前终端实例（与「锁定原宽」切换一致），以新配置重放完整 `libghostty` 快照并保持 `DECSTBM`/Tab stops 与滚动条完全正确；若提交后的生效值与当前已应用值**相同**，不触发无意义重连。
 - **内联结果反馈**：
   - 保存成功展示简短状态文案：全部成功时显示 `已保存`；若存在 `unsupported > 0` 或 `failed > 0`（两者均大于 0 时必须**同时**展示），如实附带提示（如 `已保存（N 个旧版会话需新建后生效、M 个会话未同步）`）。
@@ -153,11 +158,11 @@
    - `PUT /api/settings` 拒绝负数、小数、`> 1000000`、缺失字段与 `null`（`400`），写盘失败返回 `500` 且不改内存值。
 5. **并发串行化、创建竞态与迟到 RPC 防护**：
    - 并发 `PUT` 串行化后磁盘最终值与在线 worker 生效值严格一致；
-   - 验证 `manager.create()` 在 `pendingIDs` 期间被 `PUT` 扫描跳过、登记完成后补发并对齐新配置的确定性交错；
-   - 验证落后于当前磁盘 `settings.json` 的迟到 `set_scrollback` RPC 被 worker 拒绝（不把已更新的 worker 改回旧值）。
+   - 验证 `manager.create()` 在 `pendingIDs` 期间被 `PUT` 扫描跳过、登记并清除 `pendingIDs` 后无条件补发并对齐新配置的确定性交错（包含 `A → B → A` 改回原值场景）；
+   - 验证 worker `set_scrollback` 对 `Scrollback == nil` 与越界请求安全回复 `OK: false`（无 panic），且在 `gridMu` 内对落后于磁盘合法值、缺文件（按 `10000` 核对）或不可读/损坏 `settings.json` 的迟到 RPC 均准确拒绝。
 6. **新旧 worker 混合与 CLI 启动继承**：
    - 混合接入支持的新版 worker、模拟仅回复 `"未知 worker 操作"` 的旧版 worker、回复其他拒绝理由的新版 worker（如未就绪/停止中）以及身份/操作不符的异常应答，验证 `PUT /api/settings` 返回 `200`，`applied`/`unsupported`/`failed` 精确分类且旧版与正常拒绝句柄均保留；
-   - 验证 Web 新建与 CLI `start`（含发布前配置变更后的 `ftReady` 前重检，以及未就绪前收到 `set_scrollback` 返回非 `unsupported` 拒绝）均正确继承最新 `scrollback`。
+   - 验证 Web 新建与 CLI `start`（含发布后、`ftReady` 前在 `gridMu` 内重检并与并发 `PUT` 交错，以及未就绪前收到 `set_scrollback` 返回非 `unsupported` 拒绝）均正确继承最新 `scrollback`。
 
 ### 6.2 前端构建与真实内嵌二进制 Playwright 验收（独立临时 `LIMPET_HOME` 与独立端口）
 
@@ -165,5 +170,5 @@
 2. **UI、默认提示与 `360px` 布局**：打开「终端工具」弹窗，默认值为 `10000`，输入框下方显示 `0` = 近似无限（含浏览器上限 `100 万行` 与内存/重连卡顿风险）小字，无预设档位按钮；`360px` 视口下整页与弹窗无横向溢出。
 3. **回放前读配置与防丢历史**：将服务端预先设为 `20000` 并注入超 `12,000` 行带编号（`> 10,000` 字节）历史；新开会话连接并刻意延迟 `GET /api/settings` 响应，验证客户端等待设置到位后再消费回放，最终编号历史完整且每行仅出现一次。
 4. **改值重连保 VT 状态 & 未改值不重连**：在活跃终端先写入 `DECSTBM` 滚动区与自定义 Tab stops 标记，修改回滚行数并提交成功后，验证重建重连仍保有正确滚动区、Tab stops 行为及准确滚动条；再次提交相同数值时验证不触发重连；期间模拟迟到 `GET` 返回旧值时不覆盖当前生效值或编辑中草稿。
-5. **设为 `0`、跨重启持久化与 `WriteBuffer` 背压**：在界面保存 `0`，确认小字高亮 `--limpet-warn` 且终端映射 `scrollback === 1000000`；真实重启 test server 后重新访问，`GET /api/settings` 仍返回 `0`；写入并回放超过 `8 MiB` 与前端 `16 MiB` 水位的超大带编号历史，验证平滑分流交付不触发 `WriteBuffer` 50 MB 崩溃且可回滚查看。
+5. **设为 `0`、跨重启持久化与 `WriteBuffer` 水位验证**：在界面保存 `0`，确认小字高亮 `--limpet-warn` 且终端映射 `scrollback === 1000000`；真实重启 test server 后重新访问，`GET /api/settings` 仍返回 `0`；写入并回放超过 `8 MiB` 与前端 `16 MiB` 水位的大带编号历史，在测试中主动放慢/观测解析节奏，断言水位确实触发暂停与恢复、不触发 `WriteBuffer` 50 MB 崩溃、所有编号行有序完整且各出现一次。
 6. **校验阻断、混合提示与焦点保护**：输入空值、`-1`、`1000001` 时内联报错阻断提交；模拟同时返回 `unsupported > 0 && failed > 0` 时两项计数均明确展示；在 `#terminal-tools` 弹窗打开及输入框聚焦填写期间触发 WS 重连，验证重连后焦点未抢回画布且输入框草稿保留。
