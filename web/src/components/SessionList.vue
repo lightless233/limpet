@@ -490,11 +490,11 @@ function fmtTime(iso: string) {
 
 <template>
   <aside aria-label="会话列表" class="session-list min-h-0 min-w-0 flex-col bg-[var(--limpet-surface)] lg:border-r lg:border-[var(--limpet-line)]">
-    <header class="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--limpet-line)] px-3 py-2">
-      <h1 class="flex items-center gap-2 text-lg font-semibold tracking-tight">
+    <header class="flex min-h-[44px] shrink-0 items-center justify-between gap-2 border-b border-[var(--limpet-line)] px-2.5 py-1">
+      <h1 class="flex shrink-0 items-center gap-1.5 text-base font-semibold tracking-tight">
         <AppIcon name="terminal" class="text-[var(--limpet-accent)]" /> Limpet
       </h1>
-      <div v-if="!authExpired" class="flex items-center gap-1">
+      <div v-if="!authExpired" class="flex shrink-0 items-center gap-1">
         <button class="control" aria-label="刷新列表" title="刷新列表" :disabled="refreshing" @click="refresh()">
           <AppIcon name="refresh" :class="{ 'animate-spin': refreshing }" />
         </button>
@@ -503,10 +503,10 @@ function fmtTime(iso: string) {
           <AppIcon :name="resolvedTheme === 'dark' ? 'sun' : 'moon'" />
         </button>
         <div class="inline-flex gap-px">
-          <button class="control rounded-e-none text-sm" @click="openCreate()">
+          <button class="control whitespace-nowrap rounded-e-none px-1.5 text-sm" @click="openCreate()">
             <AppIcon name="add" /> 新建
           </button>
-          <button class="control rounded-s-none" aria-label="更多新建选项" :popovertarget="presetMenuId"
+          <button class="control rounded-s-none px-1.5" aria-label="更多新建选项" :popovertarget="presetMenuId"
             @click="preparePresetMenu(null)">
             <AppIcon name="down" />
           </button>
