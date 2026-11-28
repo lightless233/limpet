@@ -401,6 +401,9 @@ function openTerminal(current: Connection, remoteSize?: Dimensions) {
   })
   term.value = terminal
   try {
+    // 拦截老 worker 快照里的 OSC 4 调色板覆写，守住前端深/浅色 ANSI 16 色主题；
+    // 返回 true 吞掉调色板写入，含 ? 的查询放行给 xterm 默认处理。
+    terminal.parser.registerOscHandler(4, (data) => !data.includes('?'))
     terminal.loadAddon(current.fit)
     terminal.loadAddon(new Unicode11Addon())
     terminal.unicode.activeVersion = '11'

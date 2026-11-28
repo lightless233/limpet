@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -293,5 +294,30 @@ func TestSessionPTYResizePreservesReadDeadline(t *testing.T) {
 	}
 	if _, err := master.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("调整尺寸后的空闲 PTY 读未在期限内返回: %v", err)
+	}
+}
+
+// 快照序列化不得携带 OSC 4 调色板：它会覆盖浏览器侧深/浅色主题配好的
+// ANSI 16 色。正文与样式序列必须照常保留。
+func TestFormatVTExcludesPalette(t *testing.T) {
+	term, err := libghostty.NewTerminal(libghostty.WithSize(gridCols, gridRows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	term.VTWrite([]byte("\x1b[32mgreen\x1b[1;36mcyan\x1b[0m plain"))
+	out, err := formatVT(term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "\x1b]4;") {
+		t.Fatalf("快照包含 OSC 4 调色板: %q", s)
+	}
+	if !strings.Contains(s, "green") || !strings.Contains(s, "cyan") || !strings.Contains(s, "plain") {
+		t.Fatalf("快照丢失正文: %q", s)
+	}
+	if !regexp.MustCompile(`\x1b\[[0-9;]*m`).MatchString(s) {
+		t.Fatalf("快照丢失 SGR 样式序列: %q", s)
 	}
 }

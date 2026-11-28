@@ -795,10 +795,13 @@ func feedGround(t *libghostty.Terminal, batch []byte) {
 }
 
 // formatVT 用全量 extras 把一台网格的当前屏（含其滚动历史）序列化为 VT。
+// 调色板除外：extras 里的 OSC 4 会把 libghostty 内置深色调色板下发进浏览器，
+// 覆盖前端深/浅色主题配好的 ANSI 16 色；老 worker 的快照仍带 OSC 4，
+// 由前端 parser 拦截兜底（见 TerminalView.vue）。
 func formatVT(t *libghostty.Terminal) ([]byte, error) {
 	f, err := libghostty.NewFormatter(t,
 		libghostty.WithFormatterFormat(libghostty.FormatterFormatVT),
-		libghostty.WithFormatterExtras(libghostty.FormatterExtrasAll),
+		libghostty.WithFormatterExtras(libghostty.FormatterExtrasAll &^ libghostty.FormatterExtraPalette),
 	)
 	if err != nil {
 		return nil, err
