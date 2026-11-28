@@ -13,22 +13,48 @@ const activeName = computed(() => store.sessions.value.find((s) => s.id === acti
 let stopAutoRefresh: (() => void) | undefined
 
 function open(id: string, name: string) {
+  const entering = !activeId.value
+  const switching = activeId.value !== undefined && activeId.value !== id
   activeId.value = id
   initialName.value = name
+  // PWA/浏览器的返回手势依赖历史栈：进终端压一条记录；终端间切换原地替换，
+  // 保证无论切过几个会话，一次返回都直接回到会话列表。不改 URL 路径。
+  if (entering) history.pushState({ limpetSession: id, limpetName: name }, '')
+  else if (switching) history.replaceState({ limpetSession: id, limpetName: name }, '')
 }
 
 function back() {
+  // 有本页压入的历史记录时交给 popstate 回列表（弹掉该记录，避免残留前进项）。
+  if (history.state?.limpetSession) {
+    history.back()
+    return
+  }
+  activeId.value = undefined
+  void store.refresh()
+}
+
+function onPopState(e: PopStateEvent) {
+  const state = e.state as { limpetSession?: string; limpetName?: string } | null
+  if (state?.limpetSession) {
+    activeId.value = state.limpetSession
+    initialName.value = state.limpetName ?? ''
+    return
+  }
   activeId.value = undefined
   void store.refresh()
 }
 
 onMounted(() => {
+  // 刷新/重载后历史条目可能残留上一轮的会话标记：清掉，让返回手势仍等价于回列表。
+  if (history.state?.limpetSession) history.replaceState(null, '')
+  window.addEventListener('popstate', onPopState)
   void store.refresh()
   void store.loadScrollback()
   stopAutoRefresh = store.startAutoRefresh(() => !activeId.value)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('popstate', onPopState)
   stopAutoRefresh?.()
 })
 </script>
