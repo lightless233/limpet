@@ -22,8 +22,9 @@
   --limpet-shadow: 0 8px 24px rgb(0 0 0 / 45%);
   --limpet-backdrop: rgb(0 0 0 / 65%);
   --limpet-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", Menlo,
-    Consolas, "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei",
-    "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans Mono CJK SC", monospace;
+    Consolas, "Roboto Mono", "Droid Sans Mono", "DejaVu Sans Mono", "Liberation Mono",
+    monospace, "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei",
+    "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans Mono CJK SC";
   background: var(--limpet-canvas);
   color: var(--limpet-text);
   font-family: "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Noto Sans",
