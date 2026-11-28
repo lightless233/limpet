@@ -186,6 +186,7 @@ const actionTitle = computed(() => {
 type DirEntry = { name: string; path: string }
 type DirListing = { path: string; parent: string; dirs: DirEntry[] }
 const dirOpen = ref(false)
+const dirInput = ref('')
 const dirPath = ref('')
 const dirParent = ref('')
 const dirEntries = ref<DirEntry[]>([])
@@ -193,37 +194,13 @@ const dirLoading = ref(false)
 const dirError = ref('')
 const dirFilter = ref('')
 const showHiddenDirs = ref(false)
-const dirCrumbBox = useTemplateRef<HTMLDivElement>('dirCrumbBox')
+const dirAddrInput = useTemplateRef<HTMLInputElement>('dirAddrInput')
 const newDirOpen = ref(false)
 const newDirName = ref('')
 const newDirBusy = ref(false)
 const newDirError = ref('')
 const newDirInput = useTemplateRef<HTMLInputElement>('newDirInput')
 let dirReqSeq = 0
-
-const dirBreadcrumbs = computed(() => {
-  const raw = dirPath.value
-  if (!raw) return [] as DirEntry[]
-  if (raw === '~') return [{ name: '~', path: '~' }]
-  if (raw.startsWith('~/')) {
-    const parts = raw.slice(2).split('/').filter(Boolean)
-    const out: DirEntry[] = [{ name: '~', path: '~' }]
-    let acc = '~'
-    for (const part of parts) {
-      acc += '/' + part
-      out.push({ name: part, path: acc })
-    }
-    return out
-  }
-  const parts = raw.split('/').filter(Boolean)
-  const out: DirEntry[] = [{ name: '/', path: '/' }]
-  let acc = ''
-  for (const part of parts) {
-    acc += '/' + part
-    out.push({ name: part, path: acc })
-  }
-  return out
-})
 
 const filteredDirEntries = computed(() => {
   const q = dirFilter.value.trim().toLowerCase()
@@ -241,6 +218,7 @@ function cancelNewDir() {
 function resetDirBrowser() {
   dirReqSeq++
   dirOpen.value = false
+  dirInput.value = ''
   dirPath.value = ''
   dirParent.value = ''
   dirEntries.value = []
@@ -251,7 +229,7 @@ function resetDirBrowser() {
   cancelNewDir()
 }
 
-async function browseDir(target: string, syncCwd: boolean) {
+async function browseDir(target: string) {
   const seq = ++dirReqSeq
   dirLoading.value = true
   dirError.value = ''
@@ -272,16 +250,9 @@ async function browseDir(target: string, syncCwd: boolean) {
       cancelNewDir()
     }
     dirPath.value = data.path
+    dirInput.value = data.path
     dirParent.value = data.parent
     dirEntries.value = data.dirs
-    if (syncCwd && action.value?.mode === 'create') {
-      action.value.cwd = data.path
-    }
-    void nextTick(() => {
-      if (seq === dirReqSeq && dirCrumbBox.value) {
-        dirCrumbBox.value.scrollLeft = dirCrumbBox.value.scrollWidth
-      }
-    })
   } catch (e) {
     if (seq !== dirReqSeq) return
     dirError.value = e instanceof Error ? e.message : String(e)
@@ -290,23 +261,39 @@ async function browseDir(target: string, syncCwd: boolean) {
   }
 }
 
-function toggleDirBrowser() {
-  if (dirOpen.value) {
-    dirReqSeq++
-    dirOpen.value = false
-    dirLoading.value = false
-    cancelNewDir()
-    return
-  }
+function openDirPicker() {
+  if (action.value?.mode !== 'create') return
+  const initial = action.value.cwd.trim() || '~'
   dirOpen.value = true
-  const currentCwd = action.value?.mode === 'create' ? action.value.cwd.trim() : ''
-  void browseDir(currentCwd || '~', false)
+  dirInput.value = initial
+  dirFilter.value = ''
+  cancelNewDir()
+  void browseDir(initial)
+  void nextTick(() => dirAddrInput.value?.focus())
+}
+
+function closeDirPicker() {
+  dirReqSeq++
+  dirOpen.value = false
+  dirLoading.value = false
+  cancelNewDir()
+}
+
+function jumpDir() {
+  void browseDir(dirInput.value.trim() || '~')
+}
+
+function confirmDirPicker() {
+  if (action.value?.mode === 'create') {
+    const chosen = dirInput.value.trim() || dirPath.value
+    if (chosen) action.value.cwd = chosen
+  }
+  closeDirPicker()
 }
 
 function toggleHiddenDirs() {
   showHiddenDirs.value = !showHiddenDirs.value
-  const currentCwd = action.value?.mode === 'create' ? action.value.cwd.trim() : ''
-  void browseDir(dirPath.value || currentCwd || '~', false)
+  void browseDir(dirPath.value || dirInput.value.trim() || '~')
 }
 
 function toggleNewDir() {
@@ -343,7 +330,7 @@ async function submitNewDir() {
     }
     const created: DirEntry = await res.json()
     cancelNewDir()
-    await browseDir(created.path, true)
+    await browseDir(created.path)
   } catch (e) {
     newDirError.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -357,10 +344,14 @@ function onNewDirEnter(e: KeyboardEvent) {
   void submitNewDir()
 }
 
-function pickWorkspaceHistory(path: string) {
-  if (action.value?.mode !== 'create') return
-  action.value.cwd = path
-  if (dirOpen.value) void browseDir(path, false)
+function onDialogCancel(e: Event) {
+  if (!dirOpen.value) return
+  e.preventDefault()
+  if (newDirOpen.value) {
+    cancelNewDir()
+    return
+  }
+  closeDirPicker()
 }
 
 function reloadPage() {
@@ -595,8 +586,115 @@ function fmtTime(iso: string) {
     </div>
 
     <dialog ref="dialog" closedby="any" class="session-dialog" aria-labelledby="session-action-title"
-      @close="onDialogClose" v-on="lightDismiss">
-      <form v-if="action" class="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3" @submit.prevent="submitAction">
+      @cancel="onDialogCancel" @close="onDialogClose" v-on="lightDismiss">
+      <div v-if="action?.mode === 'create' && dirOpen" class="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
+        <div class="flex min-w-0 items-center justify-between gap-2">
+          <div class="flex min-w-0 items-center gap-1.5">
+            <button type="button" class="control shrink-0" aria-label="返回新建会话" title="返回" @click="closeDirPicker">
+              <AppIcon name="back" class="size-4" />
+            </button>
+            <h2 id="session-action-title" class="truncate text-base font-semibold">选择文件夹</h2>
+          </div>
+          <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:text-[var(--limpet-text)]"
+            aria-label="关闭窗口" title="关闭" @click="dialog?.close()">
+            <AppIcon name="close" class="size-4" />
+          </button>
+        </div>
+
+        <form class="flex min-w-0 gap-1.5" @submit.prevent="jumpDir">
+          <input ref="dirAddrInput" v-model="dirInput" autocomplete="off" spellcheck="false" enterkeyhint="go"
+            aria-label="文件夹路径" placeholder="~"
+            class="min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-1.5 text-sm [font-family:var(--limpet-mono)] focus-visible:outline-[var(--limpet-accent)]"
+            @keydown.enter="preventComposingSubmit" />
+          <button type="submit" class="control shrink-0 text-sm" :disabled="dirLoading">跳转</button>
+        </form>
+
+        <div class="flex min-w-0 items-center gap-1.5">
+          <div class="flex min-w-0 flex-1 items-center gap-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-2 py-1">
+            <input v-model="dirFilter" type="search" autocomplete="off" spellcheck="false"
+              aria-label="筛选当前目录" placeholder="筛选当前目录…"
+              class="min-w-0 flex-1 bg-transparent text-xs focus-visible:outline-none"
+              @keydown.enter.prevent="preventComposingSubmit" />
+            <button v-if="dirFilter" type="button" class="shrink-0 text-[var(--limpet-muted)] hover:text-[var(--limpet-text)]"
+              aria-label="清空筛选" @click="dirFilter = ''">
+              <AppIcon name="close" class="size-3.5" />
+            </button>
+          </div>
+          <button type="button" class="control shrink-0 text-xs" :aria-expanded="newDirOpen"
+            :disabled="dirLoading || !dirPath" @click="toggleNewDir">
+            <AppIcon name="folderPlus" class="size-4" /> 新建
+          </button>
+          <button type="button" class="control shrink-0 text-xs"
+            :class="{ 'text-[var(--limpet-accent)]': showHiddenDirs }"
+            :aria-pressed="showHiddenDirs" :disabled="dirLoading" @click="toggleHiddenDirs">
+            显示隐藏
+          </button>
+        </div>
+
+        <form v-if="newDirOpen" class="space-y-1.5 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] p-2"
+          @submit.prevent="submitNewDir">
+          <div class="flex min-w-0 gap-1.5">
+            <input ref="newDirInput" v-model="newDirName" autocomplete="off" spellcheck="false"
+              aria-label="新文件夹名称" placeholder="输入新文件夹名称…"
+              class="min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-surface)] px-2.5 py-1.5 text-sm focus-visible:outline-[var(--limpet-accent)]"
+              :disabled="newDirBusy" @keydown.enter="onNewDirEnter" @keydown.escape.stop.prevent="cancelNewDir" />
+            <button type="submit" class="control control-primary shrink-0 text-xs" :disabled="newDirBusy">
+              {{ newDirBusy ? '创建中…' : '创建' }}
+            </button>
+            <button type="button" class="control shrink-0 text-xs" :disabled="newDirBusy" @click="cancelNewDir">
+              取消
+            </button>
+          </div>
+          <p v-if="newDirError" role="alert" class="wrap-anywhere text-xs text-[var(--limpet-danger)]">{{ newDirError }}</p>
+        </form>
+
+        <div class="h-72 max-h-[45dvh] overflow-y-auto overscroll-contain rounded-lg border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] p-1">
+          <div v-if="dirError" role="alert" class="space-y-2 p-3 text-xs text-[var(--limpet-danger)]">
+            <p class="wrap-anywhere">{{ dirError }}</p>
+            <div class="flex gap-1.5">
+              <button type="button" class="control text-xs text-[var(--limpet-text)]"
+                @click="browseDir(dirInput.trim() || dirPath || '~')">重试</button>
+              <button type="button" class="control text-xs text-[var(--limpet-text)]"
+                @click="browseDir('~')">回到 ~</button>
+            </div>
+          </div>
+          <p v-else-if="dirLoading && !dirEntries.length && !dirParent" class="p-4 text-center text-xs text-[var(--limpet-muted)]">加载中…</p>
+          <ul v-else class="grid min-w-0 gap-0.5">
+            <li v-if="dirParent && !dirFilter.trim()" class="min-w-0">
+              <button type="button"
+                class="dir-entry flex min-h-8 w-full min-w-0 items-center gap-2 rounded px-2.5 py-1 text-left text-sm hover:bg-[var(--limpet-pressed)] active:bg-[var(--limpet-pressed)]"
+                :disabled="dirLoading" @click="browseDir(dirParent)">
+                <AppIcon name="folder" class="size-4 shrink-0 text-[var(--limpet-muted)]" />
+                <span class="min-w-0 flex-1 font-medium [font-family:var(--limpet-mono)]">..</span>
+              </button>
+            </li>
+            <li v-for="entry in filteredDirEntries" :key="entry.path" class="min-w-0">
+              <button type="button"
+                class="dir-entry group flex min-h-8 w-full min-w-0 items-center gap-2 rounded px-2.5 py-1 text-left text-sm hover:bg-[var(--limpet-pressed)] active:bg-[var(--limpet-pressed)]"
+                :disabled="dirLoading" @click="browseDir(entry.path)">
+                <AppIcon name="folder" class="size-4 shrink-0 text-[var(--limpet-muted)] group-hover:text-[var(--limpet-accent)]" />
+                <bdi class="min-w-0 flex-1 truncate" dir="ltr">{{ entry.name }}</bdi>
+                <AppIcon name="right" class="size-3.5 shrink-0 text-[var(--limpet-muted)] opacity-0 transition-opacity group-hover:opacity-100" />
+              </button>
+            </li>
+            <li v-if="!dirEntries.length" class="p-4 text-center text-xs text-[var(--limpet-muted)]">
+              当前目录下没有子目录
+            </li>
+            <li v-else-if="!filteredDirEntries.length" class="p-4 text-center text-xs text-[var(--limpet-muted)]">
+              没有匹配的子目录
+            </li>
+          </ul>
+        </div>
+
+        <div class="flex justify-end gap-2 text-sm">
+          <button type="button" class="control" @click="closeDirPicker">取消</button>
+          <button type="button" class="control control-primary" :disabled="dirLoading" @click="confirmDirPicker">
+            选择文件夹
+          </button>
+        </div>
+      </div>
+
+      <form v-else-if="action" class="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3" @submit.prevent="submitAction">
         <h2 id="session-action-title" class="text-base font-semibold">{{ actionTitle }}</h2>
         <p v-if="action.mode === 'close'" class="min-w-0 wrap-anywhere text-sm text-[var(--limpet-muted)]">
           关闭「{{ action.name }}」会终止其中的进程。
@@ -613,113 +711,13 @@ function fmtTime(iso: string) {
             <input v-model="action.cwd" autocomplete="off" spellcheck="false" aria-label="工作目录" placeholder="~"
               class="min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-2 text-base focus-visible:outline-[var(--limpet-accent)]"
               @keydown.enter="preventComposingSubmit" />
-            <button type="button" class="control shrink-0 text-sm" :aria-expanded="dirOpen" @click="toggleDirBrowser">
-              <AppIcon :name="dirOpen ? 'folderOpen' : 'folder'" class="size-4" /> 浏览
+            <button type="button" class="control shrink-0 text-sm" @click="openDirPicker">
+              <AppIcon name="folder" class="size-4" /> 选择
             </button>
-          </div>
-          <div v-if="dirOpen" class="min-w-0 overflow-hidden rounded-lg border border-[var(--limpet-line)] bg-[var(--limpet-canvas)]">
-            <div class="flex min-w-0 items-center gap-1 border-b border-[var(--limpet-line)] bg-[var(--limpet-surface)]/50 px-1.5 py-1.5">
-              <button type="button" class="control shrink-0" aria-label="上一级" title="上一级"
-                :disabled="!dirParent || dirLoading" @click="browseDir(dirParent, true)">
-                <AppIcon name="arrowUp" class="size-4" />
-              </button>
-              <div ref="dirCrumbBox" dir="ltr" aria-label="当前路径"
-                class="dir-breadcrumbs flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto px-1 text-xs [font-family:var(--limpet-mono)]">
-                <span v-if="!dirBreadcrumbs.length" class="px-1 text-[var(--limpet-muted)]">{{ dirPath || '~' }}</span>
-                <template v-for="(crumb, index) in dirBreadcrumbs" :key="crumb.path">
-                  <AppIcon v-if="index > 0" name="right" class="size-3 shrink-0 text-[var(--limpet-muted)]" />
-                  <button type="button"
-                    class="shrink-0 rounded px-1.5 py-1 transition-colors hover:bg-[var(--limpet-control)] hover:text-[var(--limpet-text)]"
-                    :class="index === dirBreadcrumbs.length - 1 ? 'font-medium text-[var(--limpet-text)]' : 'text-[var(--limpet-muted)]'"
-                    :disabled="dirLoading" @click="browseDir(crumb.path, true)">
-                    {{ crumb.name }}
-                  </button>
-                </template>
-              </div>
-              <button type="button" class="control shrink-0" aria-label="新建文件夹" title="新建文件夹"
-                :aria-expanded="newDirOpen" :disabled="dirLoading || !dirPath" @click="toggleNewDir">
-                <AppIcon name="folderPlus" class="size-4" />
-              </button>
-              <button type="button" class="control shrink-0 text-xs"
-                :class="{ 'text-[var(--limpet-accent)]': showHiddenDirs }"
-                :aria-pressed="showHiddenDirs" title="显示隐藏目录" :disabled="dirLoading" @click="toggleHiddenDirs">
-                隐藏
-              </button>
-            </div>
-
-            <div v-if="newDirOpen" class="space-y-1.5 border-b border-[var(--limpet-line)] bg-[var(--limpet-surface)]/30 p-2">
-              <div class="flex min-w-0 gap-1.5">
-                <input ref="newDirInput" v-model="newDirName" autocomplete="off" spellcheck="false"
-                  aria-label="新文件夹名称" placeholder="输入新文件夹名称…"
-                  class="min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-surface)] px-2.5 py-1.5 text-sm focus-visible:outline-[var(--limpet-accent)]"
-                  :disabled="newDirBusy" @keydown.enter="onNewDirEnter" @keydown.escape.stop.prevent="cancelNewDir" />
-                <button type="button" class="control control-primary shrink-0 text-xs" :disabled="newDirBusy"
-                  @click="submitNewDir">
-                  {{ newDirBusy ? '创建中…' : '创建' }}
-                </button>
-                <button type="button" class="control shrink-0 text-xs" :disabled="newDirBusy" @click="cancelNewDir">
-                  取消
-                </button>
-              </div>
-              <p v-if="newDirError" role="alert" class="wrap-anywhere text-xs text-[var(--limpet-danger)]">{{ newDirError }}</p>
-            </div>
-
-            <div v-if="!dirError && dirEntries.length" class="flex items-center gap-1.5 border-b border-[var(--limpet-line)] px-2 py-1.5">
-              <input v-model="dirFilter" type="search" autocomplete="off" spellcheck="false"
-                aria-label="筛选当前目录" placeholder="筛选当前目录…"
-                class="min-w-0 flex-1 rounded border border-[var(--limpet-line)] bg-[var(--limpet-surface)] px-2 py-1 text-xs focus-visible:outline-[var(--limpet-accent)]"
-                @keydown.enter.prevent="preventComposingSubmit" />
-              <button v-if="dirFilter" type="button" class="control shrink-0 text-xs" aria-label="清空筛选"
-                @click="dirFilter = ''">
-                <AppIcon name="close" class="size-3.5" />
-              </button>
-            </div>
-
-            <div class="max-h-60 overflow-y-auto overscroll-contain p-1">
-              <div v-if="dirError" role="alert" class="space-y-2 p-2 text-xs text-[var(--limpet-danger)]">
-                <p class="wrap-anywhere">{{ dirError }}</p>
-                <div class="flex gap-1.5">
-                  <button type="button" class="control text-xs text-[var(--limpet-text)]"
-                    @click="browseDir(dirPath || action.cwd.trim() || '~', false)">重试</button>
-                  <button type="button" class="control text-xs text-[var(--limpet-text)]"
-                    @click="browseDir('~', true)">回到 ~</button>
-                </div>
-              </div>
-              <p v-else-if="dirLoading && !dirEntries.length" class="p-3 text-center text-xs text-[var(--limpet-muted)]">加载中…</p>
-              <p v-else-if="!dirEntries.length" class="p-3 text-center text-xs text-[var(--limpet-muted)]">
-                当前目录下没有子目录（可直接点右上角新建文件夹，或点「确定」在此目录启动）
-              </p>
-              <p v-else-if="!filteredDirEntries.length" class="p-3 text-center text-xs text-[var(--limpet-muted)]">
-                没有匹配的子目录
-              </p>
-              <ul v-else class="grid min-w-0 gap-0.5">
-                <li v-for="entry in filteredDirEntries" :key="entry.path" class="min-w-0">
-                  <button type="button"
-                    class="dir-entry group flex min-h-8 w-full min-w-0 items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-[var(--limpet-pressed)] active:bg-[var(--limpet-pressed)]"
-                    :disabled="dirLoading" @click="browseDir(entry.path, true)">
-                    <AppIcon name="folder" class="size-4 shrink-0 text-[var(--limpet-muted)] group-hover:text-[var(--limpet-accent)]" />
-                    <bdi class="min-w-0 flex-1 truncate" dir="ltr">{{ entry.name }}</bdi>
-                    <AppIcon name="right" class="size-3.5 shrink-0 text-[var(--limpet-muted)] opacity-0 transition-opacity group-hover:opacity-100" />
-                  </button>
-                </li>
-              </ul>
-            </div>
-
-            <div class="flex min-w-0 items-center justify-between gap-2 border-t border-[var(--limpet-line)] bg-[var(--limpet-surface)]/40 px-2.5 py-1.5 text-xs text-[var(--limpet-muted)]">
-              <span class="flex min-w-0 items-center gap-1">
-                <span class="shrink-0">已选：</span>
-                <bdi class="min-w-0 truncate text-[var(--limpet-text)] [font-family:var(--limpet-mono)]" dir="ltr">
-                  {{ action.cwd.trim() || '~' }}
-                </bdi>
-              </span>
-              <span class="shrink-0 tabular-nums">
-                {{ dirFilter.trim() ? `${filteredDirEntries.length} / ${dirEntries.length}` : dirEntries.length }} 个目录
-              </span>
-            </div>
           </div>
           <div v-if="workspaceHistory.length" class="flex min-w-0 flex-wrap gap-1">
             <button v-for="path in workspaceHistory" :key="path" type="button"
-              class="control max-w-full justify-start text-xs" @click="pickWorkspaceHistory(path)">
+              class="control max-w-full justify-start text-xs" @click="action.cwd = path">
               <bdi class="min-w-0 truncate" dir="ltr">{{ path }}</bdi>
             </button>
           </div>
@@ -853,8 +851,6 @@ function fmtTime(iso: string) {
   word-break: break-all;
   box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
 }
-.dir-breadcrumbs { scrollbar-width: none; }
-.dir-breadcrumbs::-webkit-scrollbar { display: none; }
 @media (pointer: coarse) {
   .dir-entry { min-height: 2.75rem; }
 }
