@@ -183,6 +183,82 @@ const actionTitle = computed(() => {
   }
 })
 
+type DirEntry = { name: string; path: string }
+type DirListing = { path: string; parent: string; dirs: DirEntry[] }
+const dirOpen = ref(false)
+const dirPath = ref('')
+const dirParent = ref('')
+const dirEntries = ref<DirEntry[]>([])
+const dirLoading = ref(false)
+const dirError = ref('')
+const showHiddenDirs = ref(false)
+let dirReqSeq = 0
+
+function resetDirBrowser() {
+  dirReqSeq++
+  dirOpen.value = false
+  dirPath.value = ''
+  dirParent.value = ''
+  dirEntries.value = []
+  dirLoading.value = false
+  dirError.value = ''
+  showHiddenDirs.value = false
+}
+
+async function browseDir(target: string, syncCwd: boolean) {
+  const seq = ++dirReqSeq
+  dirLoading.value = true
+  dirError.value = ''
+  const params = new URLSearchParams()
+  if (target) params.set('path', target)
+  if (showHiddenDirs.value) params.set('hidden', '1')
+  try {
+    const res = await request('/api/dirs?' + params.toString())
+    if (seq !== dirReqSeq || !res) return
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error ?? 'HTTP ' + res.status)
+    }
+    const data: DirListing = await res.json()
+    if (seq !== dirReqSeq) return
+    dirPath.value = data.path
+    dirParent.value = data.parent
+    dirEntries.value = data.dirs
+    if (syncCwd && action.value?.mode === 'create') {
+      action.value.cwd = data.path
+    }
+  } catch (e) {
+    if (seq !== dirReqSeq) return
+    dirError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    if (seq === dirReqSeq) dirLoading.value = false
+  }
+}
+
+function toggleDirBrowser() {
+  if (dirOpen.value) {
+    dirReqSeq++
+    dirOpen.value = false
+    dirLoading.value = false
+    return
+  }
+  dirOpen.value = true
+  const currentCwd = action.value?.mode === 'create' ? action.value.cwd.trim() : ''
+  void browseDir(currentCwd || '~', false)
+}
+
+function toggleHiddenDirs() {
+  showHiddenDirs.value = !showHiddenDirs.value
+  const currentCwd = action.value?.mode === 'create' ? action.value.cwd.trim() : ''
+  void browseDir(dirPath.value || currentCwd || '~', false)
+}
+
+function pickWorkspaceHistory(path: string) {
+  if (action.value?.mode !== 'create') return
+  action.value.cwd = path
+  if (dirOpen.value) void browseDir(path, false)
+}
+
 function reloadPage() {
   location.reload()
 }
@@ -190,6 +266,7 @@ function reloadPage() {
 async function openAction(next: Action) {
   hideCwdTip()
   if (busy.value || authExpired.value || ('id' in next && closing.value.has(next.id))) return
+  resetDirBrowser()
   action.value = next
   actionError.value = ''
   await nextTick()
@@ -234,6 +311,7 @@ function onDialogClose() {
   if (!el || el.open) return
   el.returnValue = ''
   outsidePointer = null
+  resetDirBrowser()
   action.value = null
 }
 
@@ -427,12 +505,55 @@ function fmtTime(iso: string) {
               {{ preset.label }}
             </label>
           </fieldset>
-          <input v-model="action.cwd" autocomplete="off" spellcheck="false" aria-label="工作目录" placeholder="~"
-            class="min-w-0 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-2 text-base focus-visible:outline-[var(--limpet-accent)]"
-            @keydown.enter="preventComposingSubmit" />
+          <div class="flex min-w-0 gap-1.5">
+            <input v-model="action.cwd" autocomplete="off" spellcheck="false" aria-label="工作目录" placeholder="~"
+              class="min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-2 text-base focus-visible:outline-[var(--limpet-accent)]"
+              @keydown.enter="preventComposingSubmit" />
+            <button type="button" class="control shrink-0 text-sm" :aria-expanded="dirOpen" @click="toggleDirBrowser">
+              <AppIcon :name="dirOpen ? 'folderOpen' : 'folder'" class="size-4" /> 浏览
+            </button>
+          </div>
+          <div v-if="dirOpen" class="min-w-0 overflow-hidden rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)]">
+            <div class="flex min-w-0 items-center gap-1 border-b border-[var(--limpet-line)] px-2 py-1.5">
+              <button type="button" class="control shrink-0" aria-label="上一级" title="上一级"
+                :disabled="!dirParent || dirLoading" @click="browseDir(dirParent, true)">
+                <AppIcon name="arrowUp" class="size-4" />
+              </button>
+              <bdi class="min-w-0 flex-1 truncate px-1 text-xs text-[var(--limpet-muted)] [font-family:var(--limpet-mono)]" dir="ltr">
+                {{ dirPath || '~' }}
+              </bdi>
+              <button type="button" class="control shrink-0 text-xs" :aria-pressed="showHiddenDirs" title="显示隐藏目录"
+                :disabled="dirLoading" @click="toggleHiddenDirs">
+                隐藏
+              </button>
+            </div>
+            <div class="max-h-48 overflow-y-auto overscroll-contain p-1">
+              <div v-if="dirError" role="alert" class="space-y-2 p-2 text-xs text-[var(--limpet-danger)]">
+                <p class="wrap-anywhere">{{ dirError }}</p>
+                <div class="flex gap-1.5">
+                  <button type="button" class="control text-xs text-[var(--limpet-text)]"
+                    @click="browseDir(dirPath || action.cwd.trim() || '~', false)">重试</button>
+                  <button type="button" class="control text-xs text-[var(--limpet-text)]"
+                    @click="browseDir('~', true)">回到 ~</button>
+                </div>
+              </div>
+              <p v-else-if="dirLoading && !dirEntries.length" class="p-2 text-xs text-[var(--limpet-muted)]">加载中…</p>
+              <p v-else-if="!dirEntries.length" class="p-2 text-xs text-[var(--limpet-muted)]">当前目录下没有子目录</p>
+              <ul v-else class="grid min-w-0 gap-0.5">
+                <li v-for="entry in dirEntries" :key="entry.path" class="min-w-0">
+                  <button type="button"
+                    class="flex min-h-8 w-full min-w-0 items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-[var(--limpet-pressed)] active:bg-[var(--limpet-pressed)]"
+                    :disabled="dirLoading" @click="browseDir(entry.path, true)">
+                    <AppIcon name="folder" class="size-3.5 shrink-0 text-[var(--limpet-muted)]" />
+                    <bdi class="min-w-0 flex-1 truncate" dir="ltr">{{ entry.name }}</bdi>
+                  </button>
+                </li>
+              </ul>
+            </div>
+          </div>
           <div v-if="workspaceHistory.length" class="flex min-w-0 flex-wrap gap-1">
             <button v-for="path in workspaceHistory" :key="path" type="button"
-              class="control max-w-full justify-start text-xs" @click="action.cwd = path">
+              class="control max-w-full justify-start text-xs" @click="pickWorkspaceHistory(path)">
               <bdi class="min-w-0 truncate" dir="ltr">{{ path }}</bdi>
             </button>
           </div>

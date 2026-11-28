@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -132,6 +133,81 @@ func workspaceDir(cwd string) (string, error) {
 
 func (m *manager) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m.workspaces())
+}
+
+type dirEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+type dirListing struct {
+	Path   string     `json:"path"`
+	Parent string     `json:"parent"`
+	Dirs   []dirEntry `json:"dirs"`
+}
+
+// handleListDirs GET /api/dirs。只读列出指定目录下的子目录与目录符号链接，供新建会话浏览路径。
+func (m *manager) handleListDirs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	dir, err := workspaceDir(q.Get("path"))
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errHome) {
+			status = http.StatusInternalServerError
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	hiddenParam := q.Get("hidden")
+	showHidden := hiddenParam == "1" || hiddenParam == "true"
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrPermission) {
+			status = http.StatusForbidden
+		}
+		writeJSON(w, status, map[string]string{"error": "读取目录失败：" + err.Error()})
+		return
+	}
+
+	home, _ := os.UserHomeDir()
+	dirs := make([]dirEntry, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !showHidden && strings.HasPrefix(name, ".") {
+			continue
+		}
+		fullPath := filepath.Join(dir, name)
+		isDir := entry.IsDir()
+		if !isDir && entry.Type()&os.ModeSymlink != 0 {
+			info, err := os.Stat(fullPath)
+			isDir = err == nil && info.IsDir()
+		}
+		if !isDir {
+			continue
+		}
+		dirs = append(dirs, dirEntry{
+			Name: name,
+			Path: displayCwd(fullPath, home),
+		})
+	}
+	slices.SortFunc(dirs, func(a, b dirEntry) int {
+		if d := strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)); d != 0 {
+			return d
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+
+	parent := ""
+	if p := filepath.Dir(dir); p != dir {
+		parent = displayCwd(p, home)
+	}
+	writeJSON(w, http.StatusOK, dirListing{
+		Path:   displayCwd(dir, home),
+		Parent: parent,
+		Dirs:   dirs,
+	})
 }
 
 // handleList GET /api/term。活会话实时查询（逐 worker 探测）。

@@ -5,6 +5,7 @@ const paths = {
   close: 'm6 6 12 12M18 6 6 18',
   terminal: 'm5 7 5 5-5 5m8 0h6',
   back: 'm12 6-6 6 6 6M6 12h13',
+  arrowUp: 'M12 19V5m-6 6 6-6 6 6',
   down: 'm6 9 6 6 6-6',
   lock: 'M8 11V8a4 4 0 1 1 8 0v3M7 11h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2Z',
   more: 'M5 12h.01M12 12h.01M19 12h.01',
