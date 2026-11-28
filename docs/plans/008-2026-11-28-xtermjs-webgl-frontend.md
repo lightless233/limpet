@@ -4,7 +4,7 @@
 - 对应 Spec：`docs/specs/008-2026-11-28-xtermjs-webgl-frontend.md`（已同步 GPT 预审修订）
 - 执行方式：DELEGATED（适合直接转交 GPT / Codex 实施与验收，按 `U1 → U2 → U3` 顺序推进）
 - 约束基线：
-  - **后端零改动**：严禁修改 `server/`、`go.mod`、`go.sum` 任何文件；若执行 `git diff server/` 必须为空，后端单测沿用已在 `69d7d59` 通过的 `-race` 基准。
+  - **后端零改动**：严禁修改 `server/`、`go.mod`、`go.sum` 任何文件；必须保持 `git diff 69d7d59 -- server/ go.mod go.sum` 为空且工作树无后端变更，后端单测沿用已在 `69d7d59` 通过的 `-race` 基准。
   - **环境隔离与上线红线**：所有开发 server 与浏览器回归必须设置 `LIMPET_HOME=~/.limpet-dev`；**严禁**执行 `deploy/install.sh`、**严禁**触碰 `/opt/limpet` 与正式 `~/.limpet`；不要加入仅服务于测试的生产开关后门。
   - **进程清理安全**：停掉自己起的临时测试 server 只用普通 `kill`（绝不使用按进程树整棵清理的方式，也不要影响已有其他会话或用户进程）；`pgrep -f`/`pkill -f` 若使用需遵循 `[x]yz` 形式。
   - **Git 规范**：遵循 `AGENTS.md`，每完成一个可提交单元自动 commit（英文 Conventional Commits，`Co-authored-by` 尾注按实际执行的 agent / 模型填写，拿不准先向用户确认，**不主动 push**）。
@@ -39,7 +39,7 @@ U1（替换 @wterm/* 为 xterm.js v6 + WebGL/Fit/Unicode11/WebLinks，重写核�
   5. **输入、查询隔离与剪贴板归属**：
      - `term.onData` 与移动按键栏、输入条共用返回 `boolean` 的 `sendInput()`（失败保草稿）；以 `\x1b` 开头的自动查询/状态回包原样发送，**严禁**触发或消耗 `ctrlSticky`；`term.onBinary` 按 Latin-1（`charCodeAt(i) & 0xff`）逐字节转 `Uint8Array`。
      - `attachCustomKeyEventHandler`：当 `term.hasSelection()` 且按下 `Ctrl+C`、`Cmd+C` 或（浏览器下发至页面的）`Ctrl+Shift+C` 时，`preventDefault()`、复制选区并返回 `false`（不发 `\x03`）；无选区放行 `\x03`。普通粘贴由 xterm 内置 `paste` 事件独占处理，禁止 `keydown` 与 `paste` 双重发送；仅当额外接管 `Ctrl+Shift+V` 等不触发原生粘贴的键位时，`preventDefault()` 并调用一次 `term.paste()`。
-     - 保留 Spec 005 重连状态机（`data-status`、`inert`、20s `ping`/60s `checkLiveness`、Access 检测、重连不抢 `composerInput`/`<dialog open>` 焦点），并记录主用 TUI（`agy`/`codex`）在 `6.0.0` 下无 Kitty 键盘协议时的实际回退情况以供核对。
+     - 保留 Spec 005 重连状态机（`data-status`、`inert`、20s `ping`/60s `checkLiveness`、Access 检测、重连不抢 `composerInput`/`<dialog open>` 焦点），标准查询回包在合成测试下与 `isTerminalReportOnly()` 对齐（真实主用 CLI 无 Kitty 键盘协议时的实际交互表现归 Spec §6.3 真机验收）。
 - **完成证据**：`cd web && pnpm build`（`vue-tsc -b` + `vite build`）通过；接入本地开发服能正常挂载、输入及触发 WebGL/DOM 回退且无生命周期报错。
 
 ### U2：自适应约束、锁宽双轴滚动布局、触摸纵滚修复（`#5489`）与样式收敛
@@ -66,7 +66,7 @@ U1（替换 @wterm/* 为 xterm.js v6 + WebGL/Fit/Unicode11/WebLinks，重写核�
 - **涉及文件**：仅在确需适配定位/补充移动输入条断言时更新 `tests/limet-reconnect-browser-test.mjs`（不弱化原有断言）；专项 Playwright 测试可写入临时校验脚本并在清理阶段移除或按需精简保留。
 - **关键改动与验收执行**：
   1. **零改动核对与内嵌构建**：
-     - 校验 `git diff server/ go.mod go.sum` 为空（后端沿用 `69d7d59` 通过的 `go test -race -count=1 ./server` 基准，不机械重跑）；
+     - 校验 `git diff 69d7d59 -- server/ go.mod go.sum` 为空且工作树无后端变更（后端沿用 `69d7d59` 通过的 `go test -race -count=1 ./server` 基准，不机械重跑）；
      - 执行 `cd web && pnpm build`；
      - 带 `PKG_CONFIG_PATH="$HOME/.local/opt/limpet-toolchain/install-1.0.1/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"` 编译 `go build -tags limpet_embed -o .runtime/limpet-server-008 ./server`。
   2. **既有浏览器回归（`LIMPET_HOME=~/.limpet-dev`）**：
@@ -74,11 +74,11 @@ U1（替换 @wterm/* 为 xterm.js v6 + WebGL/Fit/Unicode11/WebLinks，重写核�
   3. **Spec 008 专项 Playwright 验收**（均带 `LIMPET_HOME=~/.limpet-dev`，禁止引入生产后门）：
      - **WebGL 探测与上下文回退**：默认 SwiftShader 验证生产探测安全拒绝并回退 DOM；测试侧用 `page.addInitScript` 放行探测加载真实 `WebglAddon`，分别实测触发 `webglcontextlost` 在恢复窗口后卸载回退 DOM 并可继续读写，以及模拟挂载抛出失败异常后安全留在 DOM。
      - **经典滚动条与 60fps 负载拖选**：`ignoreDefaultArgs: ["--hide-scrollbars"]` 下有 scrollback 溢出静止及持续输出零 `resize` 振荡；校验计算 `fontFamily` 含中文无衬线回退；60fps 中文彩色输出负载进行中鼠标拖选，确认选区准确非空、过程零尺寸抖动、零报错。
-     - **确定性 WS 路由保序与降级**：用 Playwright WebSocket 路由驱动 `ready → 输出 A → size → 输出 B`（A、B 行宽/光标依赖各自尺寸），验证终态屏与历史标记恰好出现一次、自适应首报 `cols×rows`、旧连接未完成屏障在重连后被忽略、无尺寸 `ready` 正确降级禁用锁宽开关。
+     - **确定性 WS 路由保序与降级**：用 Playwright WebSocket 路由区分验证两种模式（A、B 行宽/光标依赖各自尺寸，终态屏与历史标记恰好出现一次、旧连接未完成屏障在重连后被忽略、无尺寸 `ready` 正确降级禁用锁宽开关）：锁宽测 `ready → 输出 A → 远端 size → 输出 B`；自适应测 `ready → 输出 A → 容器变化触发本地 fit() → 输出 B`（并确认自适应显式首报 `cols×rows` 且远端 `size` 不改变本地网格）。
      - **锁宽可达性、mouse-tracking 校对、查询与触摸滚动**：验证锁宽 `160` 列 × 超高网格在 `375px` 视口下整页无横向溢出且最右列与最底行皆可达，mouse-tracking TUI 横移后点击列坐标准确，调字号不改远端尺寸；通过合成输入与查询回包验证锁宽输入/回包不改 PTY、自适应回包不抢 `s.owner`、`\x1b` 查询回包不消耗 `ctrlSticky`；验证单指触摸拖动可改变历史 `viewportY`。
      - **剪贴板语义与实例释放**：校验选区 `Ctrl+C` 复制成功且 PTY 无 `\x03`、无选区 `Ctrl+C` 发送 `\x03`、普通粘贴与 bracketed paste 各仅送达一份，以及多次会话切换/切锁宽重连后无报错或连接泄漏。
   4. **收尾清理**：
-     - 关闭并仅删除本轮验收创建的临时 dev 会话 UUID，保留原有 `~/.limpet-dev` 会话；用普通 `kill` 停掉本轮临时测试 server；删除 `.runtime/limpet-server-008` 与本轮临时脚本/截图（注意保留用户原有 `.runtime/` 文件），确认工作区干净（或仅含预期提交）且 `git diff server/` 仍为空。
+     - 关闭并仅删除本轮验收创建的临时 dev 会话 UUID，保留原有 `~/.limpet-dev` 会话；用普通 `kill` 停掉本轮临时测试 server；删除 `.runtime/limpet-server-008` 与本轮临时脚本/截图（注意保留用户原有 `.runtime/` 文件），确认工作区干净且 `git diff 69d7d59 -- server/ go.mod go.sum` 仍为空。
 
 ---
 

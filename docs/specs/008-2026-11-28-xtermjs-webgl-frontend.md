@@ -74,7 +74,7 @@
 - 仍以当前连接 `ready` 帧是否携带合法整数尺寸（`cols ∈ [2, 500]`、`rows ∈ [2, 200]`）作为 `supportsLockWidth` 的权威依据（每次重连重新判定）；旧版 worker 下维持自适应并禁用顶栏「锁定原宽」按钮且给出明确提示。
 - 「自适应 ↔ 锁定原宽」双方向切换继续持久化偏好到 `localStorage` 并触发一次完整重连重建实例。
 - **锁定原宽模式尺寸门禁**：`onopen` 时立即发送 `{"type":"resize","cols":0,"rows":0}`（严格先于任何 `ready` 后输入）；此后在连接周期内，无论初始就绪、容器尺寸变化、字体缩放还是重连，**严禁**向后端发送任何有效 `(cols, rows)` 申报，也绝不因本端按键或自动查询回包抢占 `s.owner` 或改变远端 PTY 尺寸。
-- **自动查询覆盖边界**：`@xterm/xterm@6.0.0` 默认应答 DA/DSR/DECRPM/DECRQSS/颜色/焦点等标准查询（后端 `isTerminalReportOnly()` 已完整覆盖），但**不支持** Kitty 键盘协议（`CSI ? u`），依赖 Kitty 键盘扩展的 TUI 将回退标准 xterm 输入模式；多 viewer 并发接入下的重复查询应答仍沿用 Spec 004 已知边界。
+- **自动查询覆盖边界**：`@xterm/xterm@6.0.0` 默认应答 DA/DSR/DECRPM/DECRQSS/颜色/焦点等标准查询（后端 `isTerminalReportOnly()` 已完整覆盖），但**不支持** Kitty 键盘协议（`CSI ? u`），`xterm 6.0.0` 不响应或启用该协议，具体降级表现由终端应用自行决定，主用 CLI（如 `agy` / `codex`）的实际交互表现归入 §6.3 真机验收；多 viewer 并发接入下的重复查询应答仍沿用 Spec 004 已知边界。
 
 ### 3.2 自适应模式（替代 Spec 007 第 1.2 节的 `.term-size-probe` 约定）
 
@@ -116,7 +116,7 @@
 
 ### 6.1 构建与后端零变动基线
 
-1. **后端零侵入与基准复用**：`git diff server/`、`go.mod`、`go.sum` 均为空；沿用已在 `69d7d59`（与当前 `HEAD` 后端完全一致）通过的 `go test -race -count=1 ./server` 验证基准（仅当改动触及 `server/` 时才需重新运行）。
+1. **后端零侵入与基准复用**：`git diff 69d7d59 -- server/ go.mod go.sum` 为空且工作区无未提交的后端变更；沿用已在 `69d7d59` 通过的 `go test -race -count=1 ./server` 验证基准（仅当改动触及 `server/` 时才需重新运行）。
 2. **依赖与构建通过**：`web/package.json` 不再包含 `@wterm/*`；`cd web && pnpm build`（含 `vue-tsc -b` 与 `vite build`）通过；`PKG_CONFIG_PATH="$HOME/.local/opt/limpet-toolchain/install-1.0.1/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" go build -tags limpet_embed` 内嵌编译成功且可正常服务。
 
 ### 6.2 自动化浏览器回归与专项验收（`LIMPET_HOME=~/.limpet-dev`）
@@ -128,7 +128,9 @@
      - 在测试侧通过 `page.addInitScript` 显式放行探测（不引入生产后门）挂载真实 `WebglAddon`，分别验证：触发 `webglcontextlost` 并在上游恢复窗口后自动卸载 `WebglAddon` 回退 DOM 且继续正常读写；以及挂载期抛出上下文创建失败异常时捕获并安全留在 DOM。
    - **防经典滚动条尺寸振荡**：在禁用 `--hide-scrollbars` 且终端已有 scrollback 溢出时，静止及持续输出期间无 `ResizeObserver` / `resize` 来回振荡。
    - **中文字体与 60fps 负载输出拖选**：检查计算 `fontFamily` 含中文无衬线回退；在每秒 60 帧中文彩色输出负载持续下鼠标拖拽选中终端文本，选区文本准确、无报错、过程不发生尺寸抖动。
-   - **确定性时序保序与降级（可控 WS 路由）**：使用确定性 Playwright WebSocket 路由模拟 `ready → 输出 A（含行/光标依赖当前宽度的内容） → size → 输出 B`（分别覆盖自适应与锁宽流），断言 A、B 各自按对应尺寸排版、屏幕与历史标记恰好出现一次、锁宽与重连初始尺寸申报符合 §2.3/§3.1 契约、旧连接屏障未完成时重连回调被忽略、以及无尺寸 `ready` 触发旧 worker 降级与禁用开关。
+   - **确定性时序保序与降级（可控 WS 路由）**：使用确定性 Playwright WebSocket 路由区分验证两种模式（均验证 A、B 各自按对应尺寸排版、屏幕与历史标记恰好出现一次、旧连接屏障未完成时重连回调被忽略、以及无尺寸 `ready` 触发旧 worker 降级与禁用开关）：
+     - **锁宽模式**：`ready → 输出 A → 远端 size → 输出 B`（行宽/光标依赖各自远端尺寸，锁宽全程不发有效 `resize`）；
+     - **自适应模式**：`ready → 输出 A → 容器尺寸变化触发本地 fit() → 输出 B`（验证本地改尺不越过前序待解析字节、自适应显式首报 `cols×rows`，且收到远端 `size` 帧**不**改变本地网格）。
    - **锁宽跨端纵横可达性、鼠标跟踪与查询隔离**：在锁定原宽模式下验证 `160` 列 × 超视口行数（如小视口/大字号或模拟键盘高度）在窄屏（如 `375px`）下整页无横向溢出，最右列与最底行均可通过滚到底部/外层横纵滚动触及，鼠标跟踪 TUI 横移后点击落点列坐标准确，调节字号不改远端尺寸；通过合成查询与输入验证锁宽按键/自动查询回包均不改 PTY、自适应自动回包不抢 `s.owner`、且 `\x1b` 查询回包不消耗移动端 `ctrlSticky`。
    - **触摸纵滚回归验证**：在 5,000+ 行 scrollback 的终端上通过 Playwright 单指垂直触摸拖动验证历史视口位置确实向回滚动。
    - **剪贴板语义闭环**：结合实际剪贴板内容与 PTY 实收字节验证：有选区时 `Ctrl+C` 复制选区且 PTY 未收到 `\x03`；无选区时 `Ctrl+C` 发送 `\x03`；普通粘贴与 bracketed paste 各仅送达一份。
