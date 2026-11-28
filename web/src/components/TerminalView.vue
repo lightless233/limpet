@@ -515,7 +515,8 @@ function observeLayout(current: Connection, terminal: Terminal, host: HTMLElemen
       lastHeight = clientHeight
       if (following) frame.scrollTop = frame.scrollHeight
     }
-    const range = frame.scrollWidth - frame.clientWidth
+    const overflow = frame.scrollWidth - frame.clientWidth
+    const range = overflow > 1 ? overflow : 0
     if (horizontalRange.value !== range) {
       horizontalRange.value = range
       void nextTick(() => {
