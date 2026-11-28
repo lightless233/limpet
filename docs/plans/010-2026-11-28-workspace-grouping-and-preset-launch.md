@@ -1,63 +1,64 @@
 # Plan 010：侧边栏工作区聚合、预设快捷新建与列表样式优化
 
 - 日期：2026-11-28
-- 对应 Spec：`docs/specs/010-2026-11-28-workspace-grouping-and-preset-launch.md`（待 GPT 预审）
+- 对应 Spec：`docs/specs/010-2026-11-28-workspace-grouping-and-preset-launch.md`（已同步 GPT 预审修订，待复审）
 - 执行方式：DELEGATED（适合转交 GPT / Codex 实施与验收，按 `U1 → U2` 顺序推进）
 - 约束基线：
-  - **环境隔离与上线红线**：Go 单测用 `t.TempDir()`，U2 浏览器验收使用**本轮专用隔离临时目录**（如 `.runtime/dev-home-010`）与独立空闲端口，避免污染或改写 `~/.limpet-dev` 既有会话；**严禁**执行 `deploy/install.sh`、**严禁**触碰 `/opt/limpet` 与正式 `~/.limpet`；不要加入仅服务于测试的生产开关后门。
+  - **环境隔离与上线红线**：Go 单测用 `t.TempDir()`；U2 浏览器与 `systemd-run` 专项验收因涉及不同 `cwd` 会话与临时 `PATH` shim，作为本轮对 `AGENTS.md` 通用 `~/.limpet-dev` 约定的显式隔离例外，统一使用**本轮专用隔离临时目录**（`.runtime/dev-home-010`）与独立空闲端口对（`PORT` 与 `PORT+2` 空闲），避免污染 `~/.limpet-dev` 既有会话；**严禁**执行 `deploy/install.sh`、**严禁**触碰 `/opt/limpet` 与正式 `~/.limpet`；不要加入仅服务于测试的生产开关后门。
   - **工具链环境变量**：编译与运行 Go 测试需带 `PKG_CONFIG_PATH="$HOME/.local/opt/limpet-toolchain/install-1.0.1/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"`。
-  - **进程清理安全**：停掉自己起的临时测试 server 只用普通 `kill`（绝不使用按进程树整棵清理的方式）；`pgrep -f`/`pkill -f` 若使用需遵循 `[x]yz` 形式。
+  - **进程清理安全**：清理时先逐一通过接口按本轮创建的会话 UUID 关闭会话，再用普通 `kill` 停掉自己起的临时测试 server（绝不使用按进程树整棵清理的方式），最后删除 `.runtime/dev-home-010`、`.runtime/limpet-server-010` 与本轮临时脚本；`pgrep -f`/`pkill -f` 若使用需遵循 `[x]yz` 形式。
   - **Git 规范**：遵循 `AGENTS.md`，每完成一个可提交单元自动 commit（英文 Conventional Commits，`Co-authored-by` 尾注按实际执行的 agent / 模型填写，拿不准先向用户确认，**不主动 push**）。
 
 ## 总体顺序与依赖关系
 
 ```text
-U1（后端 preset/cwd 校验与自动命名、一次性 .launch.json 启动配置、probe/registry 保留与 GET /api/workspaces）
-  └──▶ U2（前端 workspace 聚合与样式优化、顶栏/组头快捷新建与自动进入、隔离环境 limpet_embed 验收与清理）
+U1（后端 preset/cwd 校验与可执行预检、--web-launch + .launch.json 生命周期、显式 cmd 与注册表回滚、GET /api/workspaces）
+  └──▶ U2（前端 workspace 聚合与样式优化、非阻塞快捷新建与 S10 DOM 契约、隔离 direct + systemd-run 验收与清理）
 ```
 
 ## 实施单元
 
 ### U1：后端预设启动、目录校验、`launch.json` 传递与 `GET /api/workspaces`
 
-- **目标**：扩展 `POST /api/term` 支持 `cwd` 与闭合预设 `shell` / `codex` / `agy`，打通 `direct` 与 `systemd-run` 两种 worker 拉起路径的参数传递与重启恢复元数据，并新增 `GET /api/workspaces` 历史工作区接口。
+- **目标**：扩展 `POST /api/term` 支持 `cwd` 与闭合预设 `shell` / `codex` / `agy`，补齐登录 Shell 支持判断、命令可执行预检、`--web-launch` 严格失败关闭与注册表错误回滚，并新增 `GET /api/workspaces` 历史工作区接口。
 - **涉及文件**：`server/main.go`、`server/handlers.go`、`server/manager.go`、`server/proto.go`、`server/launch.go`、`server/workerapp.go`、`server/session.go` 及 `server/*_test.go`。
 - **关键改动与防坑点**：
-  1. **闭合预设枚举与无别名泄漏启动（`server/handlers.go` / `server/manager.go`）**：
+  1. **闭合预设枚举、登录 Shell 检查与预检（`server/handlers.go`、`server/manager.go`、`server/session.go`）**：
      - 仅允许 `""` / `"shell"`、`"codex"`、`"agy"`；未知 `preset` 返回 `400`。
-     - `"shell"` 沿用 `[shell, "-i"]`；`"codex"` 转为 `[shell, "-lc", "exec \"$@\"", shell, "codex", "--yolo"]`；`"agy"` 转为 `[shell, "-lc", "exec \"$@\"", shell, "agy", "--dangerously-skip-permissions"]`（既绕过 `systemd --user` 精简 `PATH` 问题，又不读 `.zshrc` 交互别名，避免 `alias codex='limpet codex'` 自递归）。
-     - **严禁**将 `cwd` 拼接到命令行字符串中；`cwd` 仅通过 `cmd.Dir` 设置。
-  2. **`cwd` 校验与自动命名去重（`server/handlers.go`、`server/manager.go`）**：
-     - 解析并规范化 `cwd`：空→`$HOME`、`~`/`~/...` 展开并 `filepath.Clean`（不做 `EvalSymlinks`）；非绝对路径、含 NUL、不存在或非目录（`os.Stat`）一律 `400`。
-     - 显式 `name` 沿用 `nameValid` 与 `409` 重名检查；留空时在 `m.mu` 临界区内按 `<目录末段>-<cmd>`（主目录则为 `<cmd>`）生成基准名，清洗 `:` `.` `/` 与控制字符、截断至 96 rune、自动递增 `-2`/`-3` 去重并用 `m.creating` 占位，保证高频连点秒建绝不重名报错。
-  3. **Web 一次性 `.launch.json` 与元数据保留（`server/manager.go`、`server/workerapp.go`、`server/session.go`）**：
-     - Web `manager.create()` 在 `workers/` 下通过原子写写入 `0600` 的 `<uuid>.launch.json`（含 `argv`、`cwd`、`cmd`、`name`），worker 启动读取后立即删除，并在 `manager.create()` 用 `defer` 清理兜底失败路径；若 `.launch.json` 存在却损坏则 worker 报错退出。
-     - 区分于 CLI 的 `workerConfig.WaitFirstViewer`：Web 会话继续保持 `s.cli == false` 与立即可探测就绪语义，仅从启动配置接收 `argv`/`cwd`/`cmd`/`name`。
-     - worker 在 `workerHost` 持有 `cwd`/`cmd`/`name` 并在 `probe` 应答返回，创建完成即把 `cwd`（原始绝对路径）与 `cmd` 写入 `sessions.json`；`POST /api/term` 返回兼容超集 `{ id, name, cwd, cmd }`。
+     - `"shell"` 沿用 `[shell, "-i"]`；`"codex"` 与 `"agy"` 要求登录 Shell 属于 POSIX 兼容集合（`sh`、`bash`、`zsh`、`dash`、`ksh`，否则如 `fish` 返回 `500` 明确错误），并映射为 `[shell, "-lc", "exec \"$@\"", shell, "codex", "--yolo"]` / `[shell, "-lc", "exec \"$@\"", shell, "agy", "--dangerously-skip-permissions"]`（既通过登录启动文件获取完整 `PATH`，又跳过 `.zshrc` 防 `alias codex='limpet codex'` 套娃）。
+     - **目标可执行预检**：启动 `codex`/`agy` 前，在 `workerEnv()`（或等价运行环境）与目标 `cwd` 下执行 `2s` 超时的 `shell -lc 'p=$(command -v -- "$1") && [ -n "$p" ] && [ -x "$p" ]' shell <bin>` 预检；缺失或不可执行时立即失败返回 `500`，绝不拉起注定失败的 worker。
+     - **严禁**将 `cwd` 拼接到任何 Shell 命令行字符串中；`cwd` 仅通过 `cmd.Dir` 设置。
+  2. **`cwd` 校验、旧 POST 兼容与自动命名去重（`server/handlers.go`、`server/manager.go`）**：
+     - 规范化 `cwd`：空/纯空白→`$HOME`；`~`/`~/...` 展开并 `filepath.Clean`（不做 `EvalSymlinks`，保留非空有效空格）；非绝对路径、含 NUL、不存在或非目录（`os.Stat`）一律 `400`。
+     - 显式 `name` 沿用 `nameValid` 与 `409` 重名检查；当 `name`、`cwd`、`preset` 全空/省略时保持既有 UUID 显示名兼容旧脚本；当 `name` 为空且 `preset != ""` 或 `cwd != ""` 时按 `<目录末段>-<cmd>`（主目录为 `<cmd>`）在 `m.mu` 内自动去重（`-2`/`-3`… 且截断保证总长 ≤ 100 rune）并用 `m.creating` 占位。
+  3. **显式 `--web-launch`、清理顺序、显式 `cmd` 与回滚（`server/launch.go`、`server/manager.go`、`server/workerapp.go`、`server/session.go`）**：
+     - `spawnWorkerDirect`（Web 路径）与 `spawnWorkerSystemdRun` 均传递 `worker <uuid> --web-launch`（保留 CLI fd 3 `LIMPET_WORKER_CONFIG` 与无参调用不变）。
+     - `manager.create()` 原子写 `0600` `<uuid>.launch.json` 后再 spawn；启动失败或超时时**先调 `killHard()` 再 `os.Remove` 该文件**。
+     - `--web-launch` worker 必须成功读取、删除并校验 `.launch.json` 才启动 PTY，缺失或损坏直接报错退出（不降级默认 Shell）；同时保留 `s.cli == false` 且无 viewer 即可 `probe` 就绪。
+     - worker 显式保存并由 `probe` 返回 `ack.Name`/`ack.Cwd`/`ack.Cmd`（不从 `argv[0]` 误推 shell 名）；`manager.create()` 必须检查 `saveRegistry()` 错误，失败则撤销 `m.sessions`/`m.registry`、关闭本次 worker 并返回 `500`；`discover()` 恢复时保留已有的 `reg.Name` 并用 `probe` 补齐缺失字段；`POST /api/term` 返回兼容超集 `{ id, name, cwd, cmd }`。
   4. **`GET /api/workspaces`（`server/main.go`、`server/handlers.go`、`server/manager.go`）**：
-     - 在短持 `m.mu` 读取 `m.registry` 快照（按 `CreatedAt` 汇总各非 `$HOME` 目录的最近使用时间）后，在锁外执行磁盘 `os.Stat` 校验与 `~/` 格式化，返回倒序去重的 `string[]`。
-- **完成证据**：带 `PKG_CONFIG_PATH` 执行 `go test -race -count=1 ./server` 全部通过，覆盖 Spec 010 §5.1 全部单测项。
+     - 短持 `m.mu` 汇总 `m.registry` 中非空且非 `$HOME` 的 `cwd`（按规范化路径取最大 `CreatedAt`），锁外 `os.Stat` 校验存在目录并按时间倒序（同时间按路径升序）输出 `~/` 缩写数组。
+- **完成证据**：带 `PKG_CONFIG_PATH` 执行 `go test -race -count=1 ./server` 全部通过，覆盖 Spec 010 §5.1 全部单测项（含精简 PATH + 登录文件 shim + `.zshrc` 陷阱隔离、unsupported shell、缺失命令 500、`--web-launch` 失败关闭、`saveRegistry` 失败回滚、无 registry 条目恢复显式 `cmd`、旧空体 POST 兼容与去重、`GET /api/workspaces`）。
 
-### U2：前端工作区聚合、快捷新建、样式升级与隔离 `limpet_embed` 验收
+### U2：前端工作区聚合、快捷新建、样式升级与隔离端到端验收
 
-- **目标**：完成工作区聚合与消歧展示、侧边栏紧凑两行卡片与快速切换分组、顶栏组合「新建」与组头 `+` 一键秒建、建完自动打开进入终端，并在隔离环境完成真实内嵌二进制回归与专项验收。
-- **涉及文件**：`web/src/sessions.ts`、`web/src/components/SessionList.vue`、`web/src/components/TerminalView.vue`、`web/src/components/AppIcon.vue`（如需补充极简线性图标）、`web/src/App.vue`、`web/src/style.css`（不修改 `server/`，复用 U1 Go `-race` 基准）。
+- **目标**：完成工作区聚合与消歧展示、侧边栏紧凑两行卡片与快速切换分组、顶栏组合「新建」与组头 `+` 一键秒建、非阻塞直开新终端，并在隔离环境完成真实 `direct` 与 `systemd-run --user` 端到端验收。
+- **涉及文件**：`web/src/sessions.ts`、`web/src/components/SessionList.vue`、`web/src/components/TerminalView.vue`、`web/src/components/AppIcon.vue`（按需）、`web/src/App.vue`、`web/src/style.css`（不修改 `server/`，复用 U1 Go `-race` 基准）。
 - **关键改动与防坑点**：
-  1. **共享工作区聚合与 DOM 选择器兼容（`web/src/sessions.ts` / `SessionList.vue` / `TerminalView.vue`）**：
-     - 抽出一份纯前端分组辅助函数供 `SessionList.vue` 与 `TerminalView.vue` 的 `#quick-switch` 共用：无 `cwd` 或 `"~"` 归「主目录」排末尾；具名工作区按组内最新会话 `created` 倒序；同末段名自动向上逐级消歧，完整路径由 `cwdTip` 悬停展示。
-     - 侧边栏分组外层必须用 `<section>`，保持会话行仍是组内 `<ul><li>`，不破坏既有浏览器测试的 `li` / `li button` 定位；桌面细指针下操作按钮用 `opacity: 0 → 1`（`:hover`/`:focus-within`/`.session-row-active`）而非 `display: none`，确保键盘可达且不破坏现有点击测试；粗指针保持常显与 `≥44px` 热区。
-     - 折叠状态持久化 `limpet.collapsed-workspaces`，新建或打开会话时自动展开所属工作区。
-  2. **顶栏组合「新建」、弹窗与组头 `+` 一键秒建（`SessionList.vue`、`App.vue`）**：
-     - 顶栏左主按钮精确保持可访问名 `新建`（直接打开默认 `Shell` 弹窗），右侧紧邻 `更多新建选项` 菜单列出 `Shell` / `Codex` / `Agy`；新建弹窗内可切预设、选 `GET /api/workspaces` 返回的近期项目路径或手输路径，保留原会话名占位符 `会话名（留空自动生成）`。
-     - 工作区组头右侧 `+` 按钮打开共享的轻量预设菜单（无确认弹窗），点选即直调 `POST /api/term` 自动命名并去重，每组请求进行中防连点，失败明确提示错误；顶栏与组头新建成功后均刷新列表并立即 `emit('open', created.id, created.name)` 进入新终端。
-     - 验证 `360px` 窄屏下无横向溢出。
-  3. **隔离 `limpet_embed` 构建、回归验收与清理**：
+  1. **共享工作区聚合与 S10 DOM 兼容（`web/src/sessions.ts` / `SessionList.vue` / `TerminalView.vue`）**：
+     - 抽出纯前端分组辅助函数供 `SessionList.vue` 与 `#quick-switch` 共用：无 `cwd` 或 `"~"` 归「主目录」排末尾；具名工作区按组内最新会话 `created` 倒序（同时间按路径稳定排序）；同末段名自动向上逐级消歧，完整路径由 `cwdTip` 悬停展示；`localStorage`（`limpet.collapsed-workspaces`）记忆折叠态并在新建/打开时自动展开。
+     - 保持工作区组外层用 `<section>`、会话行用 `<ul><li>`，保留精确唯一 `新建` 按钮、`title="重命名"`、`title="关闭"` 及关闭中单行禁用；桌面细指针下操作按钮用 `opacity: 0 → 1`（`:hover`/`:focus-within`/`.session-row-active`），**禁止**配合 `pointer-events: none`、`display: none` 或 `visibility: hidden`；粗指针保持常显与 `≥44px` 热区。
+  2. **非阻塞自动进入、顶栏组合按钮与组头 `+`（`SessionList.vue`、`App.vue`）**：
+     - 顶栏左主按钮精确为 `新建`（显式传 `preset: 'shell'` 打开弹窗），右侧 `更多新建选项` 菜单展示 `Shell` / `Codex`（`--yolo`）/ `Agy`（`--dangerously-skip-permissions`）；弹窗内可切预设、点选 `GET /api/workspaces` 历史路径或手输路径，保留原占位符 `会话名（留空自动生成）`。
+     - `POST /api/term` 成功返回 `{ id, name, cwd, cmd }` 后，**不阻塞等待 `await refresh()`**，直接关闭弹窗/菜单、用响应的 `cwd` 展开工作区并立即 `emit('open', created.id, created.name)`，同时后台 `void refresh()`。
+     - 组头右侧 `+` 打开共享轻量预设菜单，点选即按该组完整 `cwd` + `preset` 直接创建（无确认弹窗），按完整 `cwd` 键记录进行中状态防连点，错误显示在列表提示区。
+  3. **隔离构建、浏览器回归、`systemd-run` 专项与收尾清理**：
      - 执行 `cd web && pnpm build`，带 `PKG_CONFIG_PATH` 编译 `go build -tags limpet_embed -o .runtime/limpet-server-010 ./server`。
-     - 使用**专用临时目录**（`LIMPET_HOME="$PWD/.runtime/dev-home-010"`）与独立空闲端口运行：
-       - `tests/limet-reconnect-browser-test.mjs` 全套 **10/10 既有场景**；
-       - Spec 010 §5.2 专项 Playwright 验收（工作区分组与同名消歧、折叠记忆、紧凑两行与悬停操作、顶栏组合按钮与历史工作区填充、组头 `+` 一键秒建及连点去重、使用临时 shim 验证 `codex --yolo` 与 `agy --dangerously-skip-permissions` 真实启动及 `cwd`、`#quick-switch` 同步分组、`360px` 零横向溢出）。
-     - 普通 `kill` 停掉自启测试 server，彻底删除 `.runtime/dev-home-010`、`.runtime/limpet-server-010` 与临时验收脚本，保持工作区干净且 U2 无 `server/` 改动。
-- **完成证据**：`cd web && pnpm build` PASS、U1 `go test -race -count=1 ./server` 基准有效、既有 `10/10` 与 Spec 010 §5.2 专项 Playwright 全部通过，仓库干净无残留。
+     - **既有 S1–S10 回归**：传绝对路径 `SERVER_BIN="$PWD/.runtime/limpet-server-010"`、`LIMPET_HOME="$PWD/.runtime/dev-home-010"`、空闲 `PORT`（`PORT` 与 `PORT+2` 空闲）与 `LIMPET_WORKER_LAUNCH=direct` 运行 `node tests/limet-reconnect-browser-test.mjs`，确认 **10/10 场景**通过。
+     - **Spec 010 §5.2 专项 Playwright 验收**：在独立临时目录跑通分组/同名消歧/折叠与 `#quick-switch`、延迟 `GET /api/term` 验证非阻塞立即直开、组头 `+` 秒建与 `-2` 去重、精简基础 PATH + 登录文件 shim + 隔离 `.zshrc` 陷阱验证 `codex --yolo` 与 `agy --dangerously-skip-permissions` 真实启动及 `cwd`、桌面悬停按钮可点、`360px` 下**整页与侧边栏容器内部均无横向溢出**。
+     - **真实 `systemd-run --user` 专项验收**：在同一隔离临时目录以 `LIMPET_WORKER_LAUNCH=systemd-run` 启动内嵌 server，创建预设会话并核对独立 `limpet-worker-<uuid>.service` 单元、真实 `cwd` 与参数、以及重启 server 后 `recoverWorkers` 恢复全部元数据。
+     - **清理顺序**：按 UUID 关闭本轮剩余测试会话 → 普通 `kill` 停测试 server → 彻底删除 `.runtime/dev-home-010`、`.runtime/limpet-server-010` 与本轮临时脚本（确保工作区干净、U2 无 `server/` 改动、`~/.limpet-dev` 与 `~/.limpet` 未受触碰）。
+- **完成证据**：`cd web && pnpm build` PASS、U1 `go test -race -count=1 ./server` 基准有效、既有 `10/10` + Spec 010 §5.2 Playwright + `systemd-run --user` 专项全部通过，仓库干净无残留。
 
 ---
 
