@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 )
@@ -43,7 +45,9 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 // 才返回；失败 → 500，不留半死会话（spec 003）。非法名称 400；与活会话重名 409。
 func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		Name   string `json:"name"`
+		Cwd    string `json:"cwd"`
+		Preset string `json:"preset"`
 	}
 	b, err := readBody(w, r)
 	if err != nil {
@@ -62,7 +66,28 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h, err := m.create(name)
+	preset := strings.TrimSpace(body.Preset)
+	switch preset {
+	case "", "shell", "codex", "agy":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "未知启动预设"})
+		return
+	}
+	cwd, err := workspaceDir(body.Cwd)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errHome) {
+			status = http.StatusInternalServerError
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	config, err := webPreset(preset, cwd)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	h, err := m.create(name, &config, preset != "" || strings.TrimSpace(body.Cwd) != "")
 	if err != nil {
 		if errors.Is(err, errDuplicate) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -71,7 +96,42 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": h.uuid})
+	home, _ := os.UserHomeDir()
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id": h.uuid, "name": config.Name, "cwd": displayCwd(config.Cwd, home), "cmd": config.Cmd,
+	})
+}
+
+var errHome = errors.New("无法获取用户主目录")
+
+func workspaceDir(cwd string) (string, error) {
+	if strings.ContainsRune(cwd, 0) {
+		return "", errors.New("工作目录不能包含 NUL")
+	}
+	if strings.TrimSpace(cwd) == "" || cwd == "~" || strings.HasPrefix(cwd, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", errHome
+		}
+		if suffix, ok := strings.CutPrefix(cwd, "~/"); ok {
+			cwd = filepath.Join(home, suffix)
+		} else {
+			cwd = home
+		}
+	}
+	if !filepath.IsAbs(cwd) {
+		return "", errors.New("工作目录必须是绝对路径")
+	}
+	cwd = filepath.Clean(cwd)
+	info, err := os.Stat(cwd)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("工作目录不存在、不可访问或不是目录")
+	}
+	return cwd, nil
+}
+
+func (m *manager) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, m.workspaces())
 }
 
 // handleList GET /api/term。活会话实时查询（逐 worker 探测）。

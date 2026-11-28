@@ -264,7 +264,7 @@ func TestScrollbackBroadcastClassificationAndOrdering(t *testing.T) {
 			delete(m.sessions, id)
 		})
 	}
-	h, err := m.create("broadcast")
+	h, err := createTestShell(m, "broadcast")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestWebCreateScrollbackABA(t *testing.T) {
 	}
 	createdWorker := make(chan created, 1)
 	go func() {
-		h, err := m.create("aba")
+		h, err := createTestShell(m, "aba")
 		createdWorker <- created{h, err}
 	}()
 	writer := waitSettingsReader(t, m.settingsPath)

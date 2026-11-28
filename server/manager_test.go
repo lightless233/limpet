@@ -68,9 +68,21 @@ func testManager(t *testing.T) *manager {
 	return m
 }
 
+func createTestShell(m *manager, name string) (*workerHandle, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	config, err := webPreset("shell", home)
+	if err != nil {
+		return nil, err
+	}
+	return m.create(name, &config, false)
+}
+
 func TestManagerConcurrentCreateRenameAndList(t *testing.T) {
 	m := testManager(t)
-	first, err := m.create("first")
+	first, err := createTestShell(m, "first")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +92,8 @@ func TestManagerConcurrentCreateRenameAndList(t *testing.T) {
 	results := make(chan error, 3)
 	var workers sync.WaitGroup
 	for _, op := range []func() error{
-		func() error { _, err := m.create(name); return err },
-		func() error { _, err := m.create(name); return err },
+		func() error { _, err := createTestShell(m, name); return err },
+		func() error { _, err := createTestShell(m, name); return err },
 		func() error { return m.renameSession(first.uuid, name) },
 	} {
 		workers.Go(func() {
@@ -119,7 +131,7 @@ func TestManagerConcurrentCreateRenameAndList(t *testing.T) {
 		t.Fatalf("并发争用同一名称时成功 %d/3 次，期望 1 次", succeeded)
 	}
 
-	second, err := m.create("second")
+	second, err := createTestShell(m, "second")
 	if err != nil {
 		t.Fatal(err)
 	}

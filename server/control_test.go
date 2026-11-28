@@ -154,7 +154,7 @@ func TestHTTPListMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
-	web, err := m.create("web")
+	web, err := createTestShell(m, "web")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestHTTPListMetadata(t *testing.T) {
 		case id:
 			want["name"], want["attached"], want["cmd"], want["cwd"] = "cli", true, "sh", "~/workspace"
 		case web.uuid:
-			want["name"], want["attached"] = "web", false
+			want["name"], want["attached"], want["cmd"], want["cwd"] = "web", false, "sh", "~"
 		default:
 			t.Fatalf("意外会话 %v", row)
 		}

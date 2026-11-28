@@ -21,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // uuidRe 稳定 ID：8 字节随机 hex。
@@ -277,10 +278,10 @@ func (m *manager) discover(id, name string, recovering bool) (*workerHandle, err
 		}
 	}
 	if err == nil {
-		if ack.Cwd != "" {
+		if reg.Cwd == "" && ack.Cwd != "" {
 			reg.Cwd = ack.Cwd
 		}
-		if ack.Cmd != "" {
+		if reg.Cmd == "" && ack.Cmd != "" {
 			reg.Cmd = ack.Cmd
 		}
 	}
@@ -328,60 +329,119 @@ func (m *manager) get(id string) *workerHandle {
 
 // create 启动 worker 进程并等它就绪（socket 可探测、自报 uuid 一致）。
 // Shell 启动失败则 worker 退出、创建请求失败，不留半死会话（spec 003）。
-func (m *manager) create(name string) (*workerHandle, error) {
+func (m *manager) create(name string, config *webLaunchConfig, autoName bool) (*workerHandle, error) {
 	id := newID()
+	home, _ := os.UserHomeDir()
 	if name == "" {
 		name = id
+		if autoName {
+			base := config.Cmd
+			if config.Cwd != filepath.Clean(home) {
+				base = filepath.Base(config.Cwd) + "-" + base
+			}
+			runes := []rune(strings.Map(func(r rune) rune {
+				if r == ':' || r == '.' || r == '/' || unicode.IsControl(r) {
+					return '-'
+				}
+				return r
+			}, base))
+			if candidate := string(runes[:min(len(runes), 96)]); nameValid(candidate) {
+				name = candidate
+			}
+		}
 	} else if !nameValid(name) {
 		return nil, fmt.Errorf("名称不合法：不能包含 : 或 .，长度不超过 100 字符")
+	} else {
+		autoName = false
 	}
 
 	m.mu.Lock()
-	if m.nameTakenLocked(name, "") {
+	if autoName {
+		base := []rune(name)
+		for n := 2; m.nameTakenLocked(name, ""); n++ {
+			suffix := fmt.Sprintf("-%d", n)
+			name = string(base[:min(len(base), 100-len(suffix))]) + suffix
+		}
+	} else if m.nameTakenLocked(name, "") {
 		m.mu.Unlock()
 		return nil, errDuplicate
 	}
 	m.creating[name] = struct{}{}
 	m.pendingIDs[id] = struct{}{}
 	m.mu.Unlock()
+	releasePending := true
 	defer func() {
 		m.mu.Lock()
 		delete(m.creating, name)
-		delete(m.pendingIDs, id)
+		if releasePending {
+			delete(m.pendingIDs, id)
+		}
 		m.mu.Unlock()
 	}()
 
 	sockPath := filepath.Join(m.workersDir, id+".sock")
 	logPath := filepath.Join(m.workersDir, id+".log")
+	launchPath := filepath.Join(m.workersDir, id+".launch.json")
+	config.Name = name
+	if err := atomicWrite(launchPath, mustJSON(config)); err != nil {
+		return nil, fmt.Errorf("写入 Web 启动配置失败: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(launchPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("清理 Web 启动配置 %s 失败: %v", id, err)
+		}
+	}()
 	killHard, err := m.spawnWorker(id, logPath)
 	if err != nil {
+		if m.launch == launchSystemdRun {
+			stopWorkerUnit(id)
+		}
 		return nil, fmt.Errorf("启动 worker 失败: %w", err)
+	}
+
+	abortWorker := func() error {
+		killHard()
+		if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			releasePending = false
+			return fmt.Errorf("清理 worker socket 失败: %w", err)
+		}
+		return nil
 	}
 
 	// 等就绪：socket 可探测且自报 uuid 一致（间隔 50ms，上限 spawnWait）。
 	deadline := time.Now().Add(spawnWait)
+	var createdAt time.Time
 	for {
 		if time.Now().After(deadline) {
-			killHard()
-			_ = os.Remove(sockPath)
-			return nil, fmt.Errorf("worker %s 未在 %v 内就绪", id, spawnWait)
+			return nil, errors.Join(fmt.Errorf("worker %s 启动失败或在 %v 内未就绪", id, spawnWait), abortWorker())
 		}
 		time.Sleep(50 * time.Millisecond)
 		ack, err := probeWorker(sockPath, id)
 		if err == nil && ack.readyFor(id) {
+			createdAt = time.UnixMilli(ack.CreatedAt)
 			break
+		}
+		if err == nil && ack.Op == "probe" && ack.OK && ack.UUID == id && ack.Ready != nil && !*ack.Ready {
+			return nil, errors.Join(fmt.Errorf("worker %s 在就绪前结束", id), abortWorker())
 		}
 	}
 
 	h := &workerHandle{
-		uuid: id, name: name, createdAt: time.Now(),
+		uuid: id, name: name, createdAt: createdAt,
 		socketPath: sockPath, logPath: logPath,
 	}
 	m.mu.Lock()
+	m.registry[id] = regEntry{Name: name, CreatedAt: h.createdAt, Cwd: config.Cwd, Cmd: config.Cmd}
+	if err := m.saveRegistry(); err != nil {
+		delete(m.registry, id)
+		m.mu.Unlock()
+		if stopErr := stopWorkerAndWait(sockPath, id); stopErr != nil {
+			err = errors.Join(err, stopErr, abortWorker())
+		}
+		return nil, fmt.Errorf("登记会话失败: %w", err)
+	}
 	m.sessions[id] = h
-	m.registry[id] = regEntry{Name: name, CreatedAt: h.createdAt}
 	delete(m.pendingIDs, id)
-	m.saveRegistry()
 	m.mu.Unlock()
 	_, _ = m.syncWorkerScrollback(h, m.currentScrollback())
 	return h, nil
@@ -402,10 +462,17 @@ func (m *manager) closeSession(id string) error {
 		return errNotFound
 	}
 
-	ack, err := killWorker(h.socketPath, id)
+	if err := stopWorkerAndWait(h.socketPath, id); err != nil {
+		return err
+	}
+	m.dropStale(id, h)
+	return nil
+}
+
+func stopWorkerAndWait(socketPath, id string) error {
+	ack, err := killWorker(socketPath, id)
 	if err != nil {
 		if staleSocket(err) {
-			m.dropStale(id, h)
 			return nil
 		}
 		return fmt.Errorf("请求 worker 关闭失败: %w", err)
@@ -417,9 +484,8 @@ func (m *manager) closeSession(id string) error {
 	budget := killGrace + reapAfterKill + frameBudget + exitWriteBudget + time.Second
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
-		_, err := os.Stat(h.socketPath)
+		_, err := os.Stat(socketPath)
 		if errors.Is(err, os.ErrNotExist) {
-			m.dropStale(id, h)
 			return nil
 		}
 		if err != nil {
@@ -470,20 +536,66 @@ func (m *manager) list() []map[string]any {
 			"id": item.ID, "name": item.Name, "created": item.Created, "attached": item.Attached,
 		}
 		if item.Cwd != "" {
-			cwd := item.Cwd
-			if home != "" {
-				if cwd == home {
-					cwd = "~"
-				} else if suffix, ok := strings.CutPrefix(cwd, strings.TrimRight(home, "/")+"/"); ok {
-					cwd = "~/" + suffix
-				}
-			}
-			row["cwd"] = cwd
+			row["cwd"] = displayCwd(item.Cwd, home)
 		}
 		if item.Cmd != "" {
 			row["cmd"] = filepath.Base(item.Cmd)
 		}
 		out = append(out, row)
+	}
+	return out
+}
+
+func displayCwd(cwd, home string) string {
+	if home != "" {
+		home = filepath.Clean(home)
+		if cwd == home {
+			return "~"
+		}
+		if suffix, ok := strings.CutPrefix(cwd, strings.TrimRight(home, "/")+"/"); ok {
+			return "~/" + suffix
+		}
+	}
+	return cwd
+}
+
+func (m *manager) workspaces() []string {
+	home, _ := os.UserHomeDir()
+	recent := make(map[string]time.Time)
+	m.mu.Lock()
+	for _, entry := range m.registry {
+		if !filepath.IsAbs(entry.Cwd) {
+			continue
+		}
+		path := filepath.Clean(entry.Cwd)
+		if path == filepath.Clean(home) {
+			continue
+		}
+		if prior, exists := recent[path]; !exists || entry.CreatedAt.After(prior) {
+			recent[path] = entry.CreatedAt
+		}
+	}
+	m.mu.Unlock()
+
+	type workspace struct {
+		path string
+		used time.Time
+	}
+	items := make([]workspace, 0, len(recent))
+	for path, used := range recent {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			items = append(items, workspace{displayCwd(path, home), used})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].used.Equal(items[j].used) {
+			return items[i].path < items[j].path
+		}
+		return items[i].used.After(items[j].used)
+	})
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.path)
 	}
 	return out
 }

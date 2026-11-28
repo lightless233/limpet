@@ -15,7 +15,7 @@ import (
 
 func TestHandshakeAndCrossOriginGuards(t *testing.T) {
 	m := testManager(t)
-	h, err := m.create("terminal")
+	h, err := createTestShell(m, "terminal")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -134,6 +134,7 @@ func (m *manager) handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings", m.handlePutSettings)
 	mux.HandleFunc("POST /api/term", m.handleCreate)
 	mux.HandleFunc("GET /api/term", m.handleList)
+	mux.HandleFunc("GET /api/workspaces", m.handleWorkspaces)
 	mux.HandleFunc("POST /api/term/{id}/close", m.handleClose)
 	mux.HandleFunc("POST /api/term/{id}/rename", m.handleRename)
 	mux.HandleFunc("GET /api/ws/term/{id}", m.handleWS)

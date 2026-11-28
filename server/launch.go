@@ -9,13 +9,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type launchMode string
@@ -26,6 +29,36 @@ const (
 )
 
 func workerUnit(id string) string { return "limpet-worker-" + id + ".service" }
+
+func webPreset(preset, cwd string) (webLaunchConfig, error) {
+	shell := defaultShell()
+	config := webLaunchConfig{Cwd: cwd, Cmd: filepath.Base(shell), Argv: []string{shell, "-i"}}
+	if preset == "" || preset == "shell" {
+		return config, nil
+	}
+	switch filepath.Base(shell) {
+	case "sh", "bash", "zsh", "dash", "ksh":
+	default:
+		return webLaunchConfig{}, fmt.Errorf("预设 %s 不支持登录 Shell %s", preset, filepath.Base(shell))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	check := exec.CommandContext(ctx, shell, "-lc", `p=$(command -v -- "$1") && [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]`, shell, preset)
+	check.Dir, check.Env = cwd, append(cliEnv(), "TERM=xterm-256color")
+	if err := check.Run(); err != nil {
+		if ctx.Err() != nil {
+			return webLaunchConfig{}, fmt.Errorf("检查登录环境中的 %s 超时", preset)
+		}
+		return webLaunchConfig{}, fmt.Errorf("登录环境中找不到可执行的 %s: %w", preset, err)
+	}
+	flag := "--yolo"
+	if preset == "agy" {
+		flag = "--dangerously-skip-permissions"
+	}
+	config.Cmd = preset
+	config.Argv = []string{shell, "-lc", `exec "$@"`, shell, preset, flag}
+	return config, nil
+}
 
 // launchFromEnv 读取 LIMPET_WORKER_LAUNCH（缺省 direct）；未知取值是配置错误。
 func launchFromEnv(v string) (launchMode, error) {
@@ -100,12 +133,18 @@ func spawnWorkerDirect(exe, id, logPath string, config *workerConfig) (killHard 
 		cmd.ExtraFiles = []*os.File{reader}
 		cmd.Env = append(cliEnv(), workerConfigEnv+"=1")
 		configIn = writer
+	} else {
+		cmd.Env = append(os.Environ(), webLaunchEnv+"=1")
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	process := cmd.Process
-	go func() { _ = cmd.Wait() }()
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
 	if configIn != nil {
 		_ = cmd.ExtraFiles[0].Close()
 		if err := json.NewEncoder(configIn).Encode(config); err != nil {
@@ -113,7 +152,15 @@ func spawnWorkerDirect(exe, id, logPath string, config *workerConfig) (killHard 
 			return nil, fmt.Errorf("传递 worker 启动配置: %w", err)
 		}
 	}
-	return func() { _ = process.Kill() }, nil
+	return func() {
+		_ = process.Signal(syscall.SIGTERM)
+		select {
+		case <-done:
+		case <-time.After(killGrace + reapAfterKill + time.Second):
+			_ = process.Kill()
+			<-done
+		}
+	}, nil
 }
 
 func cliEnv() []string {
@@ -143,14 +190,21 @@ func spawnWorkerSystemdRun(exe, id, logPath string) (killHard func(), err error)
 	for _, kv := range workerEnv() {
 		args = append(args, "--setenv="+kv)
 	}
-	args = append(args, exe, "worker", id)
+	args = append(args, "--setenv="+webLaunchEnv+"=1", exe, "worker", id)
 	out, err := exec.Command("systemd-run", args...).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("systemd-run: %w: %s", err, bytes.TrimSpace(out))
 	}
-	return func() {
-		_, _ = exec.Command("systemctl", "--user", "stop", workerUnit(id)).CombinedOutput()
-	}, nil
+	return func() { stopWorkerUnit(id) }, nil
+}
+
+func stopWorkerUnit(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", "--user", "stop", workerUnit(id)).CombinedOutput()
+	if err != nil {
+		log.Printf("停止 worker 单元 %s: %v: %s", workerUnit(id), err, bytes.TrimSpace(out))
+	}
 }
 
 // systemdUnitEnv 是 systemd 给 server 自己这个单元专用的变量：描述的是 server，不是 worker。

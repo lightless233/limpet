@@ -111,22 +111,19 @@ type session struct {
 func startSession(paths sessionPaths, id string, config *workerConfig, first *viewer,
 	reportStartFailure func(error)) (_ *session, err error) {
 	cwd, _ := os.UserHomeDir()
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = loginShell()
-	}
-	argv := []string{shell, "-i"}
+	argv := []string{defaultShell(), "-i"}
 	env := append(os.Environ(), "TERM=xterm-256color")
 	dims := viewerDims{Cols: gridCols, Rows: gridRows}
+	cli := config != nil && config.WaitFirstViewer
 	if config != nil {
 		argv, cwd, dims = config.Argv, config.Cwd, config.Dims
 		env = cliEnv()
-		if os.Getenv("TERM") == "" {
+		if !cli || os.Getenv("TERM") == "" {
 			env = append(env, "TERM=xterm-256color")
 		}
 	}
 	s := &session{
-		id: id, createdAt: time.Now(), cli: config != nil,
+		id: id, createdAt: time.Now(), cli: cli,
 		curCols: dims.Cols, curRows: dims.Rows, owner: first,
 		queryQueue: make(chan []byte, queryQueueSize),
 		viewers:    make(map[*viewer]struct{}), done: make(chan struct{}),
@@ -295,6 +292,13 @@ func setSessionPTYSize(file *os.File, cols, rows uint16) error {
 		return errno
 	}
 	return err
+}
+
+func defaultShell() string {
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return loginShell()
 }
 
 func loginShell() string {

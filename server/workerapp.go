@@ -18,6 +18,7 @@ import (
 
 const (
 	workerConfigEnv = "LIMPET_WORKER_CONFIG"
+	webLaunchEnv    = "LIMPET_WEB_LAUNCH"
 	firstViewerWait = 10 * time.Second
 	// 实时输出的爆发期合批窗口：距上次刷出不足该窗口时，再攒一小段连续碎包
 	// 合并成一帧，把高频输出（峰值可达上千帧/秒）压回温和的重绘节奏；
@@ -31,6 +32,39 @@ type workerConfig struct {
 	Dims            viewerDims
 	Name            string
 	WaitFirstViewer bool
+}
+
+type webLaunchConfig struct {
+	Argv []string `json:"argv"`
+	Cwd  string   `json:"cwd"`
+	Name string   `json:"name"`
+	Cmd  string   `json:"cmd"`
+}
+
+func readWebLaunch(path string) (webLaunchConfig, error) {
+	var config webLaunchConfig
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return config, fmt.Errorf("读取 Web 启动配置: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return config, fmt.Errorf("删除 Web 启动配置: %w", err)
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return config, fmt.Errorf("解析 Web 启动配置: %w", err)
+	}
+	if len(config.Argv) == 0 || config.Argv[0] == "" || !filepath.IsAbs(config.Cwd) ||
+		strings.ContainsRune(config.Cwd, 0) || !nameValid(config.Name) ||
+		config.Cmd == "" || config.Cmd == "." || config.Cmd == ".." || filepath.Base(config.Cmd) != config.Cmd ||
+		strings.ContainsRune(config.Cmd, 0) {
+		return config, fmt.Errorf("Web 启动配置不合法")
+	}
+	for _, arg := range config.Argv {
+		if strings.ContainsRune(arg, 0) {
+			return config, fmt.Errorf("Web 启动参数含 NUL")
+		}
+	}
+	return config, nil
 }
 
 func readWorkerConfig() (*workerConfig, error) {
@@ -54,6 +88,7 @@ type workerHost struct {
 	id       string
 	paths    sessionPaths
 	config   *workerConfig
+	cmd      string
 	mu       sync.Mutex
 	session  *session
 	claimed  bool
@@ -65,9 +100,27 @@ func runWorker(uuid string, paths sessionPaths) error {
 	if !uuidRe.MatchString(uuid) {
 		return fmt.Errorf("uuid 不合法: %q", uuid)
 	}
-	config, err := readWorkerConfig()
-	if err != nil {
-		return err
+	var config *workerConfig
+	var command string
+	if os.Getenv(webLaunchEnv) == "1" {
+		web, err := readWebLaunch(filepath.Join(paths.socketDir, uuid+".launch.json"))
+		if err != nil {
+			return err
+		}
+		config = &workerConfig{
+			Argv: web.Argv, Cwd: web.Cwd, Name: web.Name,
+			Dims: viewerDims{Cols: gridCols, Rows: gridRows},
+		}
+		command = web.Cmd
+	} else {
+		var err error
+		config, err = readWorkerConfig()
+		if err != nil {
+			return err
+		}
+		if config != nil {
+			command = filepath.Base(config.Argv[0])
+		}
 	}
 	if err := setSubreaper(); err != nil {
 		log.Printf("setSubreaper 失败（已孤儿化的任务可能无法回收）: %v", err)
@@ -78,14 +131,14 @@ func runWorker(uuid string, paths sessionPaths) error {
 		}
 	}
 
-	w := &workerHost{id: uuid, paths: paths, config: config, done: make(chan struct{})}
+	w := &workerHost{id: uuid, paths: paths, config: config, cmd: command, done: make(chan struct{})}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM)
 	defer signal.Stop(sig)
 
-	if config == nil {
-		// Web create still starts the shell before publishing the socket.
-		s, err := startSession(paths, uuid, nil, nil, nil)
+	waitFirstViewer := config != nil && config.WaitFirstViewer
+	if !waitFirstViewer {
+		s, err := startSession(paths, uuid, config, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -116,7 +169,7 @@ func runWorker(uuid string, paths sessionPaths) error {
 	}()
 
 	var timeout <-chan time.Time
-	if config != nil {
+	if waitFirstViewer {
 		timer := time.NewTimer(firstViewerWait)
 		defer timer.Stop()
 		timeout = timer.C
@@ -221,7 +274,7 @@ func (w *workerHost) handleConn(fc *frameConn) {
 			ack.CreatedAt = s.createdAt.UnixMilli()
 			if w.config != nil {
 				ack.Name, ack.Cwd = w.config.Name, w.config.Cwd
-				ack.Cmd = filepath.Base(w.config.Argv[0])
+				ack.Cmd = w.cmd
 			}
 		}
 		w.mu.Unlock()
