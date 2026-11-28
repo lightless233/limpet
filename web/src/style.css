@@ -59,6 +59,9 @@
    加载顺序晚于本文件，单类选择器会被简写覆盖回去 */
 .wterm.wterm {
   overflow-y: auto;
+  /* WebGL 模式下 wterm 延迟 150ms 才同步 scrollback 占位高度，resize() 重建网格会清空
+     占位；预留稳定滚动条槽位，避免经典滚动条反复显隐触发 ResizeObserver 尺寸振荡。 */
+  scrollbar-gutter: stable;
   --term-bg: var(--limpet-canvas);
   --term-fg: var(--limpet-text);
   --term-font-family: var(--limpet-mono);
