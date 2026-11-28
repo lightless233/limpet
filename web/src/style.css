@@ -15,11 +15,13 @@
   --limpet-warn: #fbbf24;
   --limpet-danger: #f87171;
   --limpet-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", Menlo,
-    Consolas, "Microsoft YaHei", "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans Mono CJK SC", monospace;
+    Consolas, "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei",
+    "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans Mono CJK SC", monospace;
   background: var(--limpet-canvas);
   color: var(--limpet-text);
-  font-family: "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans CJK SC",
-    system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Noto Sans",
+    "PingFang SC", "HarmonyOS Sans SC", "MiSans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size-adjust: from-font;
 }
 
 @layer components {
@@ -70,7 +72,7 @@
 }
 
 .terminal-frame { overflow: hidden; padding: 4px 6px; }
-.terminal-host { width: 100%; height: 100%; }
+.terminal-host { width: 100%; height: 100%; font-size-adjust: none; }
 .terminal-host .xterm { user-select: text; }
 
 .terminal-locked .terminal-frame {
