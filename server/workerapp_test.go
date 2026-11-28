@@ -94,6 +94,253 @@ func waitWorkerSocketGone(t *testing.T, socket string, budget time.Duration) {
 	t.Fatalf("worker socket 未移除: %s", socket)
 }
 
+// serveViewerTestSession 构造只够 serveViewer 运行的最小 session（不启动 PTY）。
+func serveViewerTestSession() *session {
+	return &session{
+		id:         newID(),
+		createdAt:  time.Now(),
+		viewers:    make(map[*viewer]struct{}),
+		done:       make(chan struct{}),
+		stop:       make(chan struct{}),
+		queryQueue: make(chan []byte, 1),
+	}
+}
+
+// pumpViewer 把 serveViewer 接到一对 net.Pipe 上跑，返回测试侧连接与泵退出信号。
+func pumpViewer(t *testing.T) (client net.Conn, v *viewer, s *session, pumpDone chan struct{}) {
+	t.Helper()
+	s = serveViewerTestSession()
+	server, client := net.Pipe()
+	v = newViewer(newFrameConn(server), 0)
+	v.dims = viewerDims{Cols: 80, Rows: 24}
+	s.viewerWG.Add(1)
+	pumpDone = make(chan struct{})
+	go func() {
+		s.serveViewer(v, handshakeAck{}, false)
+		close(pumpDone)
+	}()
+	t.Cleanup(func() {
+		// 先撤测试侧：未读完的帧（如 EXIT）让写侧立即出错返回，泵得以退出。
+		_ = client.Close()
+		select {
+		case <-pumpDone:
+		case <-time.After(3 * time.Second):
+			_ = server.Close()
+			<-pumpDone
+			t.Error("serveViewer 未在 3s 内退出")
+		}
+	})
+	return client, v, s, pumpDone
+}
+
+// emit 按生产侧（handleOutput）的契约入队输出：先计入积压字节，再入队。
+func emit(v *viewer, data string) {
+	v.queued.Add(int64(len(data)))
+	v.queue <- viewerEvent{data: []byte(data)}
+}
+
+func readFrameDeadline(c net.Conn, within time.Duration) (frameType, []byte, error) {
+	_ = c.SetReadDeadline(time.Now().Add(within))
+	return readFrame(c)
+}
+
+// skipPreamble 消费握手应答与 ready 帧，返回首个数据帧。
+func skipPreamble(t *testing.T, c net.Conn) (frameType, []byte, error) {
+	t.Helper()
+	for {
+		kind, body, err := readFrameDeadline(c, 3*time.Second)
+		if err != nil {
+			t.Fatalf("等待数据帧: %v", err)
+		}
+		if kind != ftHandshakeAck && kind != ftReady {
+			return kind, body, err
+		}
+	}
+}
+
+// 验收①：连续高频小包合并成更少的 ftOutput 帧，字节无丢失、顺序一致。
+func TestServeViewerBatchesBurstOutput(t *testing.T) {
+	client, v, _, _ := pumpViewer(t)
+	const chunks = 300
+	var want strings.Builder
+	for i := 0; i < chunks; i++ {
+		want.WriteString("abcd")
+	}
+	for i := 0; i < chunks; i++ {
+		emit(v, "abcd")
+	}
+	var got strings.Builder
+	frames := 1 // skipPreamble 返回的即是首个输出帧
+	var kind frameType
+	var body []byte
+	var err error
+	kind, body, err = skipPreamble(t, client)
+	// 滚动读帧：首帧之后每读一帧把读限顺延 150ms，超时即输出已安静（合批窗口早已结束）。
+	for ; err == nil; kind, body, err = readFrameDeadline(client, 150*time.Millisecond) {
+		switch kind {
+		case ftOutput:
+			got.Write(body)
+			frames++
+		case ftSize:
+			t.Fatalf("意外尺寸帧 %q", body)
+		case ftExit:
+			t.Fatal("意外退出帧")
+		}
+	}
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("读帧失败: %v", err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("输出字节不一致: got %d bytes, want %d bytes", got.Len(), want.Len())
+	}
+	if frames >= chunks/10 {
+		t.Fatalf("%d 个碎包写出了 %d 帧，未有效合批", chunks, frames)
+	}
+	if queued := v.queued.Load(); queued != 0 {
+		t.Errorf("合批后 queued 未清零: %d", queued)
+	}
+}
+
+// 验收②：交错的 ftOutput + ftSize + ftOutput 严格保序，尺寸不能越过前后的输出字节。
+func TestServeViewerOrdersSizeBetweenOutput(t *testing.T) {
+	client, v, s, _ := pumpViewer(t)
+	code := 0
+	s.end = exitMsg{Reason: "command-exit", ExitCode: &code}
+	// 先落一帧 head，使后续输出进入合批等待；尺寸事件在等待期间到达时
+	// 必须先刷出已累积字节（A），再写尺寸，随后才是 B。
+	emit(v, "head")
+	kind, body, err := skipPreamble(t, client)
+	if err != nil || kind != ftOutput || string(body) != "head" {
+		t.Fatalf("首帧 = %v %q, %v", kind, body, err)
+	}
+	emit(v, "A")
+	v.queue <- viewerEvent{size: resizeMsg{Cols: 90, Rows: 30}}
+	emit(v, "B")
+	close(v.queue)
+
+	var seg strings.Builder
+	sized := false
+	for {
+		kind, body, err = readFrameDeadline(client, 3*time.Second)
+		if err != nil {
+			t.Fatalf("读帧失败: %v", err)
+		}
+		switch kind {
+		case ftOutput:
+			seg.Write(body)
+			if !sized {
+				// head 之后到尺寸之前只允许 A（可整段或碎段到达）。
+				if !strings.HasPrefix("A", seg.String()) {
+					t.Fatalf("尺寸帧前的输出字节越序: %q", seg.String())
+				}
+			} else if !strings.HasPrefix("B", seg.String()) {
+				t.Fatalf("尺寸帧后的输出字节越序: %q", seg.String())
+			}
+		case ftSize:
+			_, dims, ok := decodeResize(body)
+			if !ok || dims.Cols != 90 || dims.Rows != 30 {
+				t.Fatalf("尺寸帧载荷 = %q", body)
+			}
+			if sized {
+				t.Fatal("意外的第二个尺寸帧")
+			}
+			if seg.String() != "A" {
+				t.Fatalf("尺寸帧前的输出字节 = %q, want A", seg.String())
+			}
+			sized = true
+			seg.Reset()
+		case ftExit:
+			if !sized || seg.String() != "B" {
+				t.Fatalf("退出前状态不符: sized=%v seg=%q", sized, seg.String())
+			}
+			return
+		default:
+			t.Fatalf("意外帧 %v: %q", kind, body)
+		}
+	}
+}
+
+// 验收③：输出后立刻退出时，尾部字节与 ftExit 完整送达且不被合批窗口拖延。
+func TestServeViewerFlushesTailBeforeExit(t *testing.T) {
+	client, v, s, _ := pumpViewer(t)
+	code := 7
+	s.end = exitMsg{Reason: "command-exit", ExitCode: &code}
+	// 先落一帧，使尾部输出落在合批窗口内：退出不得干等定时器。
+	emit(v, "head")
+	kind, body, err := skipPreamble(t, client)
+	if err != nil || kind != ftOutput || string(body) != "head" {
+		t.Fatalf("首帧 = %v %q, %v", kind, body, err)
+	}
+	emit(v, "tail")
+	started := time.Now()
+	close(v.queue)
+
+	var got strings.Builder
+	var exit exitMsg
+	for {
+		kind, body, err = readFrameDeadline(client, 2*time.Second)
+		if err != nil {
+			t.Fatalf("等待尾部帧与退出: %v", err)
+		}
+		if kind == ftExit {
+			if err := json.Unmarshal(body, &exit); err != nil {
+				t.Fatalf("退出帧载荷 = %q, %v", body, err)
+			}
+			break
+		}
+		if kind != ftOutput {
+			t.Fatalf("意外帧 %v: %q", kind, body)
+		}
+		got.Write(body)
+	}
+	if got.String() != "tail" {
+		t.Fatalf("尾部字节 = %q, want tail", got.String())
+	}
+	if exit.Reason != "command-exit" || exit.ExitCode == nil || *exit.ExitCode != 7 {
+		t.Fatalf("退出帧 = %+v", exit)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("退出被拖延: %v", elapsed)
+	}
+}
+
+// 验收③补充：合批等待期间 viewer 被丢弃（done 触发）时立即返回，不阻塞丢弃路径。
+func TestServeViewerDroppedDuringBatchWait(t *testing.T) {
+	client, v, _, pumpDone := pumpViewer(t)
+	// 先落一帧使后续输出进入合批等待，再触发丢弃。
+	emit(v, "head")
+	kind, body, err := skipPreamble(t, client)
+	if err != nil || kind != ftOutput || string(body) != "head" {
+		t.Fatalf("首帧 = %v %q, %v", kind, body, err)
+	}
+	emit(v, "burst")
+	v.closeWith(4001, "too slow")
+	started := time.Now()
+	// DETACH 是尽力而为：readViewer 在 closed 置位后退出并关闭连接，可能与
+	// 输出泵的 DETACH 写入竞争。收到则校验，EOF 也算符合契约——关键是泵不阻塞、及时退出。
+	for {
+		kind, body, err = readFrameDeadline(client, 3*time.Second)
+		if err != nil {
+			break
+		}
+		if kind == ftDetach {
+			var dm detachMsg
+			if err := json.Unmarshal(body, &dm); err != nil || dm.Code != 4001 {
+				t.Fatalf("DETACH 载荷 = %q, %v", body, err)
+			}
+			break
+		}
+	}
+	select {
+	case <-pumpDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("丢弃后 serveViewer 未及时退出")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("丢弃路径被拖延: %v", elapsed)
+	}
+}
+
 func TestCLIWorkerGate(t *testing.T) {
 	for _, op := range []string{"kill", "timeout", "failed-start"} {
 		t.Run(op, func(t *testing.T) {
@@ -321,8 +568,10 @@ func TestIsTerminalReportOnly(t *testing.T) {
 }
 
 func TestTerminalReportDoesNotPingPongSize(t *testing.T) {
+	// REPORT 与随后的 stty size 之间隔一个合批窗口：输出泵会把窗口内到达的
+	// 连续碎包合并成一帧，紧邻的两个输出不再保证分属两帧。
 	_, id, socket := cliTestWorker(t, "/bin/sh", "-c",
-		"trap 'stty size' WINCH; stty -echo; printf 'READY\\n'; chunk=$(stty -icanon min 1 time 0; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'); stty icanon; printf 'REPORT:%s\\n' \"$chunk\"; stty size; while :; do if IFS= read -r line; then stty size; fi; done")
+		"trap 'stty size' WINCH; stty -echo; printf 'READY\\n'; chunk=$(stty -icanon min 1 time 0; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'); stty icanon; printf 'REPORT:%s\\n' \"$chunk\"; sleep 0.1; stty size; while :; do if IFS= read -r line; then stty size; fi; done")
 	fc, ack, err := openWorker(socket, id, "start", frameBudget)
 	if err != nil || !ack.OK {
 		t.Fatalf("start = %+v, %v", ack, err)

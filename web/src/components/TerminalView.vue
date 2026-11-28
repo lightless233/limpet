@@ -1,3 +1,32 @@
+<script lang="ts">
+// 模块级：WebGL2 探测结果按浏览器会话缓存一次。
+let rendererProbe: 'dom' | 'webgl' | null = null
+
+// 挂载 <Terminal> 前探测 webgl 渲染器是否可用（该 prop 仅在挂载时生效）：
+// 需要 OffscreenCanvas（含 transferToImageBitmap）与可用的 webgl2 上下文；
+// 软件渲染器（RDP/虚拟机里的 SwiftShader、llvmpipe 等）跑 webgl 反而更慢，
+// 必须回退 dom。任何异常一律静默回退 dom。
+const SOFTWARE_RENDERER_PATTERNS = ['swiftshader', 'llvmpipe', 'softpipe', 'software', 'microsoft basic render']
+
+function detectRenderer(): 'dom' | 'webgl' {
+  if (rendererProbe) return rendererProbe
+  rendererProbe = 'dom'
+  try {
+    if (typeof OffscreenCanvas === 'undefined' || !OffscreenCanvas.prototype.transferToImageBitmap) return 'dom'
+    const gl = new OffscreenCanvas(1, 1).getContext('webgl2')
+    if (!gl) return 'dom'
+    let names = String(gl.getParameter(gl.RENDERER) ?? '')
+    const debug = gl.getExtension('WEBGL_debug_renderer_info')
+    if (debug) names += ' ' + String(gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) ?? '')
+    // 立即释放探测用的 WebGL 上下文，不占用浏览器配额。
+    gl.getExtension('WEBGL_lose_context')?.loseContext()
+    const lowered = names.toLowerCase()
+    if (!SOFTWARE_RENDERER_PATTERNS.some((p) => lowered.includes(p))) rendererProbe = 'webgl'
+  } catch { /* 探测失败一律回退 dom */ }
+  return rendererProbe
+}
+</script>
+
 <script setup lang="ts">
 // 终端视图：wterm(ghostty core) ↔ WebSocket ↔ Go(worker PTY)。
 // 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready/size/ping，前端→resize/pong）。
@@ -22,6 +51,9 @@ const emit = defineEmits<{
 const PING_TIMEOUT_MS = 60_000
 const BACKOFF_START_MS = 1000
 const BACKOFF_MAX_MS = 30_000
+
+// 渲染器：webgl 仅在硬件加速可用时启用（探测结果模块级缓存）。
+const terminalRenderer = detectRenderer()
 
 const term = useTemplateRef('term')
 const rail = useTemplateRef('rail')
@@ -70,6 +102,7 @@ let unmounted = false
 
 onMounted(() => {
   window.addEventListener('online', reconnectNow)
+  window.addEventListener('focus', requestImmediateRender)
   document.addEventListener('visibilitychange', reconnectNow)
   window.visualViewport?.addEventListener('resize', syncViewport)
   window.visualViewport?.addEventListener('scroll', syncViewport)
@@ -81,12 +114,18 @@ onMounted(() => {
 onBeforeUnmount(() => {
   unmounted = true
   window.removeEventListener('online', reconnectNow)
+  window.removeEventListener('focus', requestImmediateRender)
   document.removeEventListener('visibilitychange', reconnectNow)
   window.visualViewport?.removeEventListener('resize', syncViewport)
   window.visualViewport?.removeEventListener('scroll', syncViewport)
   clearTimeout(reconnectTimer)
   clearInterval(watchdog)
   detachSocket()
+  resetThrottle()
+  pending.length = 0
+  // <Terminal> 在本组件卸载流程里才执行 WTerm.destroy()（它不会释放 core）；
+  // 等卸载完成后显式释放最后一轮 core 的 WASM 内存。
+  void nextTick(() => core.value?.dispose())
 })
 
 function detachSocket() {
@@ -105,10 +144,15 @@ async function connect() {
   reconnectTimer = 0
   waitingToReconnect = false
   detachSocket()
+  // 旧连接的残余输出与节流定时器全部作废，不得串进新实例。
+  resetThrottle()
   pending.length = 0
   status.value = my === 1 ? 'connecting' : 'reconnecting'
   // 每次接入都重建 core 并重新挂载终端组件，让本次接入拥有干净的
   // 屏幕状态。组件重挂载会重新触发 @ready，termReady 随之复位。
+  // <Terminal> 卸载不会释放 core：替换前显式 dispose 上一轮的 WASM 内存
+  //（dispose 幂等且全部方法有守卫，旧实例此刻已无事件可再触达它）。
+  core.value?.dispose()
   core.value = null
   termReady = false
   fatalError.value = ''
@@ -121,7 +165,11 @@ async function connect() {
   let loaded: GhosttyCore
   try {
     loaded = await GhosttyCore.load()
-    if (unmounted || my !== gen) return
+    if (unmounted || my !== gen) {
+      // 这次接入已被更新的接入或卸载作废：释放刚加载的 WASM 内存。
+      loaded.dispose()
+      return
+    }
   } catch (e) {
     if (unmounted || my !== gen) return
     fatalError.value = e instanceof Error ? e.message : String(e)
@@ -244,13 +292,156 @@ function parseDimensions(ctl: Dimensions): Dimensions | undefined {
   }
 }
 
+// ---- 输出合批与渲染节流 ----
+// WS 的二进制分片先在轻量队列里合并成一个 Uint8Array，再一次性喂给 write()。
+// setRenderingPaused 只推迟绘制：字节始终持续喂入，Ghostty WASM 状态、终端
+// 查询回复与 scrollback 实时准确，不积压也不丢帧。
+const THROTTLE_BURST_BYTES = 32 * 1024 // 每秒输出超过该字节数视为高频爆发
+const THROTTLE_SLOW_FRAME_MS = 12 // 单次喂入耗时超过该值视为慢帧
+const THROTTLE_IDLE_UNPAUSE_MS = 80 // 输出停顿这么久立即解除暂停刷出画面
+const outbox: Uint8Array[] = []
+let outboxTimer = 0
+let lastOutputAt = 0
+let burstBytes = 0
+let burstWindowAt = 0
+let lastFrameCost = 0
+let renderPaused = false
+let pauseTimer = 0
+let idleTimer = 0
+let unpauseRaf = 0
+
+function setRenderingPaused(paused: boolean) {
+  term.value?.instance?.setRenderingPaused(paused)
+}
+
+function scheduleOutboxFlush() {
+  if (outboxTimer) return
+  outboxTimer = window.setTimeout(flushOutbox, 0)
+}
+
+function flushOutbox() {
+  if (outboxTimer) {
+    clearTimeout(outboxTimer)
+    outboxTimer = 0
+  }
+  if (!outbox.length) return
+  let total = 0
+  for (const chunk of outbox) total += chunk.length
+  const merged = new Uint8Array(total)
+  let at = 0
+  for (const chunk of outbox) {
+    merged.set(chunk, at)
+    at += chunk.length
+  }
+  outbox.length = 0
+  const started = performance.now()
+  term.value?.write(merged)
+  const cost = performance.now() - started
+  lastFrameCost = lastFrameCost === 0 ? cost : lastFrameCost * 0.6 + cost * 0.4
+  const now = performance.now()
+  if (now - burstWindowAt >= 1000) {
+    burstWindowAt = now
+    burstBytes = 0
+  }
+  burstBytes += merged.length
+  if (renderPaused) {
+    // 输出仍在持续：顺延「停顿解除」；节拍解除照常到点刷出。
+    clearTimeout(idleTimer)
+    idleTimer = window.setTimeout(endRenderPause, THROTTLE_IDLE_UNPAUSE_MS)
+  } else {
+    maybeThrottle()
+  }
+}
+
+// 爆发判定：输出流正在进行中，且吞吐超阈值或上一帧偏慢。
+function shouldThrottle(): boolean {
+  if (document.visibilityState !== 'visible') return false
+  if (performance.now() - lastOutputAt > 40) return false
+  return burstBytes >= THROTTLE_BURST_BYTES || lastFrameCost > THROTTLE_SLOW_FRAME_MS
+}
+
+// 目标重绘间隔：聚焦 + WebGL 33–50ms；DOM 渲染器或慢帧 80–200ms；
+// 可见但未聚焦的双开窗口在爆发期压到 150–250ms。压力越大越靠区间后段。
+function throttleInterval(): number {
+  let lo = 33
+  let hi = 50
+  if (terminalRenderer !== 'webgl' || lastFrameCost > THROTTLE_SLOW_FRAME_MS) {
+    lo = 80
+    hi = 200
+  }
+  if (document.visibilityState === 'visible' && !document.hasFocus()) {
+    lo = 150
+    hi = 250
+  }
+  const pressure = Math.min(1, Math.max(burstBytes / (THROTTLE_BURST_BYTES * 8), lastFrameCost / 30))
+  return Math.round(lo + (hi - lo) * pressure)
+}
+
+function maybeThrottle() {
+  if (renderPaused || !shouldThrottle()) return
+  renderPaused = true
+  setRenderingPaused(true)
+  pauseTimer = window.setTimeout(endRenderPause, throttleInterval())
+  idleTimer = window.setTimeout(endRenderPause, THROTTLE_IDLE_UNPAUSE_MS)
+}
+
+function endRenderPause() {
+  clearTimeout(pauseTimer)
+  clearTimeout(idleTimer)
+  pauseTimer = idleTimer = 0
+  if (!renderPaused) return
+  renderPaused = false
+  setRenderingPaused(false)
+  // setRenderingPaused(true) 会取消尚未执行的绘制，不能与解除同步调用；
+  // 等这一帧真的画完再决定是否进入下一个节拍窗口。
+  unpauseRaf = requestAnimationFrame(() => {
+    unpauseRaf = 0
+    if (unmounted) return
+    maybeThrottle()
+  })
+}
+
+// 用户输入或窗口重新聚焦：立即解除暂停刷出最新画面，绝不留在 paused 状态。
+function requestImmediateRender() {
+  cancelAnimationFrame(unpauseRaf)
+  unpauseRaf = 0
+  clearTimeout(pauseTimer)
+  clearTimeout(idleTimer)
+  pauseTimer = idleTimer = 0
+  if (!renderPaused) return
+  renderPaused = false
+  setRenderingPaused(false)
+}
+
+// 断线、重连或卸载：清空缓存队列与所有定时器，旧连接的残余字节绝不串进新实例。
+function resetThrottle() {
+  cancelAnimationFrame(unpauseRaf)
+  clearTimeout(pauseTimer)
+  clearTimeout(idleTimer)
+  clearTimeout(outboxTimer)
+  unpauseRaf = pauseTimer = idleTimer = outboxTimer = 0
+  outbox.length = 0
+  if (renderPaused) {
+    renderPaused = false
+    setRenderingPaused(false)
+  }
+  lastOutputAt = 0
+  burstBytes = 0
+  burstWindowAt = 0
+  lastFrameCost = 0
+}
+
 function deliver(event: Uint8Array | Dimensions) {
   if (!termReady) {
     pending.push(event)
   } else if (event instanceof Uint8Array) {
-    term.value?.write(event)
+    lastOutputAt = performance.now()
+    outbox.push(event)
+    scheduleOutboxFlush()
   } else {
-    // Apply synchronously, before the next VT frame. The props also retain the current geometry.
+    // 尺寸帧严格保序：先同步刷空此前缓存的输出字节再 resize，
+    // 保证尺寸不会越过前后的 VT 字节。props 同时保留当前几何。
+    flushOutbox()
     remoteSize.value = event
     term.value?.resize(event.cols, event.rows)
   }
@@ -273,6 +464,7 @@ function sendInput(bytes: Uint8Array): boolean {
 }
 
 function onData(chunk: string) {
+  requestImmediateRender()
   if (ctrlSticky.value) {
     ctrlSticky.value = false
     if (chunk.length === 1) {
@@ -289,6 +481,7 @@ function onData(chunk: string) {
 
 // 终端程序开启鼠标跟踪后的原始 X10 报告。
 function onBinary(bytes: Uint8Array) {
+  requestImmediateRender()
   sendInput(new Uint8Array(bytes))
 }
 
@@ -324,6 +517,7 @@ function onTerminalError(e: unknown) {
   clearTimeout(reconnectTimer)
   reconnectTimer = 0
   detachSocket()
+  resetThrottle()
   pending.length = 0
   fatalError.value = String(e)
   status.value = 'error'
@@ -347,6 +541,7 @@ const KEY_DEFS: { label: string; bytes: string }[] = [
 const ctrlSticky = ref(false)
 
 function sendKey(bytes: string) {
+  requestImmediateRender()
   sendInput(encoder.encode(bytes))
   term.value?.focus()
 }
@@ -369,11 +564,24 @@ function observeRail(el: HTMLElement) {
   }
   let lastHeight = el.clientHeight
   let following = el.scrollHeight - el.scrollTop - lastHeight < 5
+  let lastGridWidth = 0
   const onScroll = () => {
     if (el.clientHeight === lastHeight) following = el.scrollHeight - el.scrollTop - lastHeight < 5
     syncScroll()
   }
-  const observer = new ResizeObserver(() => {
+  const observer = new ResizeObserver((entries) => {
+    // 网格高度随滚动历史每行增长属常态；仅容器尺寸或网格宽度真正变化时才
+    // 重新测量同步，忽略纯高度变化，避免滚动时每行触发一次同步布局读取。
+    let relevant = false
+    for (const entry of entries) {
+      if (entry.target === el) {
+        relevant = true
+      } else if (entry.contentRect.width !== lastGridWidth) {
+        lastGridWidth = entry.contentRect.width
+        relevant = true
+      }
+    }
+    if (!relevant) return
     if (el.clientHeight !== lastHeight) {
       lastHeight = el.clientHeight
       if (following) el.scrollTop = el.scrollHeight
@@ -426,6 +634,7 @@ function toggleComposer() {
 }
 
 function sendDraft(enter: boolean) {
+  requestImmediateRender()
   if (sendInput(encoder.encode(draft.value + (enter ? '\r' : '')))) {
     draft.value = ''
     composerInput.value?.focus({ preventScroll: true })
@@ -541,6 +750,7 @@ function reloadPage() {
           v-if="core"
           ref="term"
           :core="core"
+          :renderer="terminalRenderer"
           :auto-resize="!lockedWidth"
           :cols="lockedWidth ? remoteSize?.cols : undefined"
           :rows="lockedWidth ? remoteSize?.rows : undefined"

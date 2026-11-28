@@ -19,6 +19,10 @@ import (
 const (
 	workerConfigEnv = "LIMPET_WORKER_CONFIG"
 	firstViewerWait = 10 * time.Second
+	// 实时输出的爆发期合批窗口：距上次刷出不足该窗口时，再攒一小段连续碎包
+	// 合并成一帧，把高频输出（峰值可达上千帧/秒）压回温和的重绘节奏；
+	// 首包与稀疏输出仍零延迟直发。
+	viewerBatchWindow = 16 * time.Millisecond
 )
 
 type workerConfig struct {
@@ -339,6 +343,20 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 	go s.readViewer(v)
 
 	buf := make([]byte, 0, wsChunk)
+	var lastFlush time.Time
+	// flushOutput 把已累积的字节作为一帧写出。失败即丢弃该 viewer，与原路径一致。
+	flushOutput := func() bool {
+		if v.closed.Load() {
+			return false
+		}
+		if fc.writeFrame(ftOutput, buf) != nil {
+			v.closeWith(4001, "too slow")
+			return false
+		}
+		buf = buf[:0]
+		lastFlush = time.Now()
+		return true
+	}
 	writeSize := func(size resizeMsg) bool {
 		if v.closed.Load() {
 			return false
@@ -349,6 +367,11 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 		}
 		return true
 	}
+	// 合批等待定时器：只在等待期间 armed，复用同一实例，不泄漏。
+	// （Go 1.23+ 语义：Stop 返回后 t.C 不会再送达残值，Stop+Reset 无需排空。）
+	batch := time.NewTimer(time.Hour)
+	batch.Stop()
+	defer batch.Stop()
 	for !v.closed.Load() {
 		select {
 		case <-v.done:
@@ -389,8 +412,49 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 			if v.closed.Load() {
 				return
 			}
-			if fc.writeFrame(ftOutput, buf) != nil {
-				v.closeWith(4001, "too slow")
+			// 爆发期微批：距上次刷出不足一个窗口且缓冲未满时，在剩余窗口内继续
+			// 收集后续 ftOutput 合并成一帧。待写的尺寸事件会切开批次，先行直发。
+			if since := time.Since(lastFlush); nextSize.Cols == 0 && len(buf) < wsChunk && since < viewerBatchWindow {
+				batch.Stop()
+				batch.Reset(viewerBatchWindow - since)
+			batchWait:
+				for len(buf) < wsChunk {
+					select {
+					case <-batch.C:
+						break batchWait
+					case <-v.done:
+						return
+					case event, ok := <-v.queue:
+						if !ok {
+							// 退出不拖延：立即刷出已累积的字节，再走原有退出路径。
+							if !flushOutput() {
+								return
+							}
+							if !v.closed.Load() {
+								_ = fc.writeFrameTimeout(ftExit, mustJSON(s.end), exitWriteBudget)
+							}
+							return
+						}
+						if len(event.data) == 0 {
+							// 尺寸事件不能越过前后的输出字节：先刷出已累积字节再写尺寸。
+							if !flushOutput() {
+								return
+							}
+							if !writeSize(event.size) {
+								return
+							}
+							break batchWait
+						}
+						buf = append(buf, event.data...)
+						v.queued.Add(-int64(len(event.data)))
+					}
+				}
+				if len(buf) != 0 && !flushOutput() {
+					return
+				}
+				continue
+			}
+			if !flushOutput() {
 				return
 			}
 			if nextSize.Cols != 0 && !writeSize(nextSize) {
