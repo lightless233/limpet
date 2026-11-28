@@ -305,7 +305,7 @@ func cliStart(base, name string, explicit bool, argv []string) (int, error) {
 
 func connectCLIViewer(ctx context.Context, base, id, op string) (*frameConn, error) {
 	path := filepath.Join(base, "workers", id+".sock")
-	fc, ack, err := openWorkerContext(ctx, path, id, op, frameBudget)
+	fc, ack, err := openWorkerContext(ctx, path, handshakeReq{Op: op, UUID: id}, frameBudget)
 	if err != nil {
 		return nil, fmt.Errorf("连接会话 %s: %w", id, err)
 	}

@@ -19,7 +19,10 @@ import (
 func TestMain(tests *testing.M) {
 	if len(os.Args) == 3 && os.Args[1] == "worker" {
 		if dir := os.Getenv("LIMPET_TEST_WORKER_HOME"); dir != "" {
-			paths := sessionPaths{histDir: filepath.Join(dir, "history"), socketDir: filepath.Join(dir, "workers")}
+			paths := sessionPaths{
+				histDir: filepath.Join(dir, "history"), socketDir: filepath.Join(dir, "workers"),
+				settingsPath: filepath.Join(dir, "settings.json"),
+			}
 			if err := runWorker(os.Args[2], paths); err != nil {
 				log.Fatal(err)
 			}
@@ -41,14 +44,16 @@ func testManager(t *testing.T) *manager {
 	t.Setenv("SHELL", "/bin/sh")
 	t.Setenv("ENV", "")
 	m := &manager{
-		sessions:   make(map[string]*workerHandle),
-		creating:   make(map[string]struct{}),
-		pendingIDs: make(map[string]struct{}),
-		registry:   make(map[string]regEntry),
-		workersDir: filepath.Join(dir, "workers"),
-		regPath:    filepath.Join(dir, "sessions.json"),
-		exePath:    os.Args[0],
-		launch:     launchDirect,
+		sessions:     make(map[string]*workerHandle),
+		creating:     make(map[string]struct{}),
+		pendingIDs:   make(map[string]struct{}),
+		registry:     make(map[string]regEntry),
+		workersDir:   filepath.Join(dir, "workers"),
+		regPath:      filepath.Join(dir, "sessions.json"),
+		settingsPath: filepath.Join(dir, "settings.json"),
+		scrollback:   defaultScrollback,
+		exePath:      os.Args[0],
+		launch:       launchDirect,
 	}
 	if err := os.Mkdir(m.workersDir, 0o700); err != nil {
 		t.Fatal(err)

@@ -31,32 +31,32 @@ func (w *wsConn) close(code websocket.StatusCode, reason string) {
 
 // probeWorker 探测一台 worker，不占 viewer。
 func probeWorker(path, uuid string) (handshakeAck, error) {
-	return workerOp(path, uuid, "probe", 2*time.Second)
+	return workerOp(path, handshakeReq{Op: "probe", UUID: uuid}, 2*time.Second)
 }
 
 // killWorker 请求回收会话，worker 应答后自行回收与清理 socket。
 func killWorker(path, uuid string) (handshakeAck, error) {
-	return workerOp(path, uuid, "kill", 5*time.Second)
+	return workerOp(path, handshakeReq{Op: "kill", UUID: uuid}, 5*time.Second)
 }
 
 // attachWorker 建立 viewer 连接，握手完成之后才开始中继。
 func attachWorker(path, uuid string) (*frameConn, handshakeAck, error) {
-	return openWorker(path, uuid, "attach", 2*time.Second)
+	return openWorker(path, handshakeReq{Op: "attach", UUID: uuid}, 2*time.Second)
 }
 
-func workerOp(path, uuid, op string, readBudget time.Duration) (handshakeAck, error) {
-	fc, ack, err := openWorker(path, uuid, op, readBudget)
+func workerOp(path string, req handshakeReq, readBudget time.Duration) (handshakeAck, error) {
+	fc, ack, err := openWorker(path, req, readBudget)
 	if err == nil {
 		_ = fc.close()
 	}
 	return ack, err
 }
 
-func openWorker(path, uuid, op string, readBudget time.Duration) (*frameConn, handshakeAck, error) {
-	return openWorkerContext(context.Background(), path, uuid, op, readBudget)
+func openWorker(path string, req handshakeReq, readBudget time.Duration) (*frameConn, handshakeAck, error) {
+	return openWorkerContext(context.Background(), path, req, readBudget)
 }
 
-func openWorkerContext(ctx context.Context, path, uuid, op string, readBudget time.Duration) (_ *frameConn, ack handshakeAck, err error) {
+func openWorkerContext(ctx context.Context, path string, req handshakeReq, readBudget time.Duration) (_ *frameConn, ack handshakeAck, err error) {
 	dialer := net.Dialer{Timeout: 2 * time.Second}
 	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
@@ -71,7 +71,7 @@ func openWorkerContext(ctx context.Context, path, uuid, op string, readBudget ti
 	fc := newFrameConn(conn)
 	stop := context.AfterFunc(ctx, func() { _ = fc.close() })
 	defer stop()
-	if err := fc.writeFrame(ftHandshake, mustJSON(handshakeReq{Op: op, UUID: uuid})); err != nil {
+	if err := fc.writeFrame(ftHandshake, mustJSON(req)); err != nil {
 		return nil, ack, err
 	}
 	if err := conn.SetReadDeadline(time.Now().Add(readBudget)); err != nil {

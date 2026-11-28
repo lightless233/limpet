@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +26,6 @@ import (
 
 const (
 	gridCols, gridRows = 80, 24
-	gridScrollback     = 10000 // 与重接深度对齐（spec 003）；更深的历史由录制承担
 	queryQueueSize     = 64
 )
 
@@ -66,8 +66,9 @@ func (v *viewer) closeWith(code int, reason string) {
 
 // sessionPaths 是 worker 需要的文件系统位置。
 type sessionPaths struct {
-	histDir   string
-	socketDir string
+	histDir      string
+	socketDir    string
+	settingsPath string
 }
 
 // session 是 worker 进程的全部状态：PTY、双网格、录制与 viewer 集合。
@@ -79,10 +80,11 @@ type session struct {
 	cmd  *exec.Cmd
 	ptmx *os.File
 
-	grid   *libghostty.Terminal // 真实网格：吃全量原始字节（备用屏也进）
-	shadow *libghostty.Terminal // 影子网格：只吃主屏阶段字节，供全屏程序运行中重接还原主屏
-	gridMu sync.Mutex           // 同时保护 grid/shadow 的访问与 fedBytes 的更新
-	altf   altFilter
+	grid       *libghostty.Terminal // 真实网格：吃全量原始字节（备用屏也进）
+	shadow     *libghostty.Terminal // 影子网格：只吃主屏阶段字节，供全屏程序运行中重接还原主屏
+	gridMu     sync.Mutex           // 同时保护 grid/shadow 的访问与 fedBytes 的更新
+	altf       altFilter
+	scrollback int // guarded by gridMu
 
 	curCols, curRows uint16 // 网格当前尺寸（跟随输入者）
 
@@ -159,21 +161,28 @@ func startSession(paths sessionPaths, id string, config *workerConfig, first *vi
 	}
 	recordingFiles = append(recordingFiles, mf)
 
-	s.grid, err = libghostty.NewTerminal(
+	s.scrollback, err = readScrollback(paths.settingsPath)
+	if err != nil {
+		log.Printf("读取 worker %s 的回滚设置失败，采用默认值: %v", id, err)
+		s.scrollback, err = defaultScrollback, nil
+	}
+	options := []libghostty.TerminalOption{
 		libghostty.WithSize(dims.Cols, dims.Rows),
-		libghostty.WithMaxScrollbackLines(gridScrollback),
+		libghostty.WithMaxScrollbackBytes(math.MaxUint),
+	}
+	if s.scrollback != 0 {
+		options = append(options, libghostty.WithMaxScrollbackLines(uint(s.scrollback)))
+	}
+	s.grid, err = libghostty.NewTerminal(append(options,
 		libghostty.WithContinuationMaxBytes(1<<20),
 		libghostty.WithWritePty(func(_ *libghostty.Terminal, data []byte) {
 			s.onQueryReply(data)
 		}),
-	)
+	)...)
 	if err != nil {
 		return nil, err
 	}
-	s.shadow, err = libghostty.NewTerminal(
-		libghostty.WithSize(dims.Cols, dims.Rows),
-		libghostty.WithMaxScrollbackLines(gridScrollback),
-	)
+	s.shadow, err = libghostty.NewTerminal(options...)
 	if err != nil {
 		s.grid.Close()
 		return nil, err
@@ -196,6 +205,42 @@ func startSession(paths sessionPaths, id string, config *workerConfig, first *vi
 	go s.writeQueryReplies()
 	go s.run()
 	return s, nil
+}
+
+// syncScrollback serializes the disk check and update with CLI startup and live RPCs.
+// A nil expected value is used only by CLI startup to adopt the current setting.
+func (s *session) syncScrollback(path string, expected *int) error {
+	s.gridMu.Lock()
+	defer s.gridMu.Unlock()
+	if s.ending.Load() || s.grid == nil || s.shadow == nil {
+		return errors.New("会话正在结束")
+	}
+	lines, err := readScrollback(path)
+	if err != nil {
+		return fmt.Errorf("读取回滚设置失败: %w", err)
+	}
+	if expected != nil && lines != *expected {
+		return errors.New("配置已过期")
+	}
+	if lines == s.scrollback {
+		return nil
+	}
+	unlimited := uint(math.MaxUint)
+	var limit *uint
+	if lines != 0 {
+		value := uint(lines)
+		limit = &value
+	}
+	for _, terminal := range []*libghostty.Terminal{s.grid, s.shadow} {
+		if err := terminal.SetScrollbackMaxBytes(&unlimited); err != nil {
+			return err
+		}
+		if err := terminal.SetScrollbackMaxLines(limit); err != nil {
+			return err
+		}
+	}
+	s.scrollback = lines
+	return nil
 }
 
 func startSessionPTY(cmd *exec.Cmd, dims viewerDims) (*os.File, error) {

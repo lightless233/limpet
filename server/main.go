@@ -50,8 +50,9 @@ func main() {
 			log.Fatal(err)
 		}
 		paths := sessionPaths{
-			histDir:   filepath.Join(base, "history"),
-			socketDir: filepath.Join(base, "workers"),
+			histDir:      filepath.Join(base, "history"),
+			socketDir:    filepath.Join(base, "workers"),
+			settingsPath: filepath.Join(base, "settings.json"),
 		}
 		if err := runWorker(args[1], paths); err != nil {
 			log.Fatal(err)
@@ -129,6 +130,8 @@ func runServer() error {
 
 func (m *manager) handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/settings", m.handleGetSettings)
+	mux.HandleFunc("PUT /api/settings", m.handlePutSettings)
 	mux.HandleFunc("POST /api/term", m.handleCreate)
 	mux.HandleFunc("GET /api/term", m.handleList)
 	mux.HandleFunc("POST /api/term/{id}/close", m.handleClose)

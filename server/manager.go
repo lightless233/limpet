@@ -68,6 +68,10 @@ type manager struct {
 	registry   map[string]regEntry
 	exePath    string
 	launch     launchMode // worker 启动方式（spec 005，见 launch.go）
+
+	settingsPath string
+	settingsMu   sync.Mutex // serializes persistence and broadcast
+	scrollback   int        // guarded by mu
 }
 
 func newManager(launch launchMode) (*manager, error) {
@@ -80,15 +84,16 @@ func newManager(launch launchMode) (*manager, error) {
 		return nil, err
 	}
 	m := &manager{
-		sessions:   map[string]*workerHandle{},
-		creating:   map[string]struct{}{},
-		pendingIDs: map[string]struct{}{},
-		histDir:    filepath.Join(base, "history"),
-		workersDir: filepath.Join(base, "workers"),
-		regPath:    filepath.Join(base, "sessions.json"),
-		registry:   map[string]regEntry{},
-		exePath:    exe,
-		launch:     launch,
+		sessions:     map[string]*workerHandle{},
+		creating:     map[string]struct{}{},
+		pendingIDs:   map[string]struct{}{},
+		histDir:      filepath.Join(base, "history"),
+		workersDir:   filepath.Join(base, "workers"),
+		regPath:      filepath.Join(base, "sessions.json"),
+		registry:     map[string]regEntry{},
+		exePath:      exe,
+		launch:       launch,
+		settingsPath: filepath.Join(base, "settings.json"),
 	}
 	for _, d := range []string{m.histDir, m.workersDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
@@ -96,6 +101,9 @@ func newManager(launch launchMode) (*manager, error) {
 		}
 	}
 	if err := m.loadRegistry(); err != nil {
+		return nil, err
+	}
+	if err := m.loadSettings(); err != nil {
 		return nil, err
 	}
 	m.recoverWorkers()
@@ -136,19 +144,25 @@ func (m *manager) saveRegistry() (err error) {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(m.regPath), ".sessions-*.tmp")
+	return atomicWrite(m.regPath, b)
+}
+
+func atomicWrite(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	_, err = tmp.Write(b)
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(data)
+	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), m.regPath)
+	return os.Rename(tmp.Name(), path)
 }
 
 func (m *manager) registryEndLocked(id string) {
@@ -366,8 +380,10 @@ func (m *manager) create(name string) (*workerHandle, error) {
 	m.mu.Lock()
 	m.sessions[id] = h
 	m.registry[id] = regEntry{Name: name, CreatedAt: h.createdAt}
+	delete(m.pendingIDs, id)
 	m.saveRegistry()
 	m.mu.Unlock()
+	_, _ = m.syncWorkerScrollback(h, m.currentScrollback())
 	return h, nil
 }
 

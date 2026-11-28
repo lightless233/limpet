@@ -160,7 +160,7 @@ func TestHTTPListMetadata(t *testing.T) {
 	}
 	const secret = "test-limpet-private-argv-marker"
 	_, id, socket := startTestCLIWorker(t, filepath.Dir(m.workersDir), cwd, "/bin/sh", "-c", "read line", "sh", secret)
-	fc, ack, err := openWorker(socket, id, "start", frameBudget)
+	fc, ack, err := openWorker(socket, handshakeReq{Op: "start", UUID: id}, frameBudget)
 	if err != nil || !ack.OK {
 		t.Fatalf("start = %+v, %v", ack, err)
 	}

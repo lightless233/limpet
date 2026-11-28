@@ -27,7 +27,10 @@ func cliTestWorker(t *testing.T, argv ...string) (paths sessionPaths, id, socket
 
 func startTestCLIWorker(t *testing.T, dir, cwd string, argv ...string) (paths sessionPaths, id, socket string) {
 	t.Helper()
-	paths = sessionPaths{histDir: filepath.Join(dir, "history"), socketDir: filepath.Join(dir, "workers")}
+	paths = sessionPaths{
+		histDir: filepath.Join(dir, "history"), socketDir: filepath.Join(dir, "workers"),
+		settingsPath: filepath.Join(dir, "settings.json"),
+	}
 	id = newID()
 	socket = filepath.Join(paths.socketDir, id+".sock")
 	r, w, err := os.Pipe()
@@ -397,7 +400,7 @@ func TestCLIWorkerGate(t *testing.T) {
 					t.Fatalf("等待期 kill = %+v, %v", ack, err)
 				}
 			case "failed-start":
-				fc, ack, err := openWorker(socket, id, "start", frameBudget)
+				fc, ack, err := openWorker(socket, handshakeReq{Op: "start", UUID: id}, frameBudget)
 				if err != nil || ack.OK || !strings.Contains(ack.Reason, "启动") {
 					t.Fatalf("失败命令的握手 = %+v, %v", ack, err)
 				}
@@ -427,7 +430,7 @@ func TestCLIWorkerOutputAndExit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			paths, id, socket := cliTestWorker(t, "/bin/sh", "-c", tc.script)
-			fc, ack, err := openWorker(socket, id, "start", frameBudget)
+			fc, ack, err := openWorker(socket, handshakeReq{Op: "start", UUID: id}, frameBudget)
 			if err != nil || !ack.OK {
 				t.Fatalf("start = %+v, %v", ack, err)
 			}
@@ -482,7 +485,7 @@ func TestCLIWorkerOutputAndExit(t *testing.T) {
 func TestCLIWorkerActiveSize(t *testing.T) {
 	_, id, socket := cliTestWorker(t, "/bin/sh", "-c",
 		"trap 'stty size' WINCH; while :; do if read line; then stty size; fi; done")
-	fc, ack, err := openWorker(socket, id, "start", frameBudget)
+	fc, ack, err := openWorker(socket, handshakeReq{Op: "start", UUID: id}, frameBudget)
 	if err != nil || !ack.OK {
 		t.Fatalf("start = %+v, %v", ack, err)
 	}
@@ -602,7 +605,7 @@ func TestTerminalReportDoesNotPingPongSize(t *testing.T) {
 	// 连续碎包合并成一帧，紧邻的两个输出不再保证分属两帧。
 	_, id, socket := cliTestWorker(t, "/bin/sh", "-c",
 		"trap 'stty size' WINCH; stty -echo; printf 'READY\\n'; chunk=$(stty -icanon min 1 time 0; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'); stty icanon; printf 'REPORT:%s\\n' \"$chunk\"; sleep 0.1; stty size; while :; do if IFS= read -r line; then stty size; fi; done")
-	fc, ack, err := openWorker(socket, id, "start", frameBudget)
+	fc, ack, err := openWorker(socket, handshakeReq{Op: "start", UUID: id}, frameBudget)
 	if err != nil || !ack.OK {
 		t.Fatalf("start = %+v, %v", ack, err)
 	}

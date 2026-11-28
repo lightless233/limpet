@@ -205,6 +205,11 @@ func (w *workerHost) handleConn(fc *frameConn) {
 		_ = reply()
 		return
 	}
+	if req.Op == scrollbackOp && !validScrollback(req.Scrollback) {
+		ack.Reason = "回滚行数不合法"
+		_ = reply()
+		return
+	}
 	w.mu.Lock()
 	s, stopping := w.session, w.stopping
 	switch req.Op {
@@ -237,6 +242,21 @@ func (w *workerHost) handleConn(fc *frameConn) {
 				s.shutdown()
 			}
 		}
+	case scrollbackOp:
+		w.mu.Unlock()
+		switch {
+		case stopping:
+			ack.Reason = "会话正在结束"
+		case s == nil:
+			ack.Reason = "会话尚未就绪"
+		default:
+			if err := s.syncScrollback(w.paths.settingsPath, req.Scrollback); err != nil {
+				ack.Reason = err.Error()
+			} else {
+				ack.OK = true
+			}
+		}
+		_ = reply()
 	case "start":
 		if w.config == nil || w.claimed || stopping {
 			w.mu.Unlock()
@@ -262,6 +282,8 @@ func (w *workerHost) handleConn(fc *frameConn) {
 		go w.waitSession(s)
 		if stopping {
 			go s.shutdown()
+		} else if err := s.syncScrollback(w.paths.settingsPath, nil); err != nil {
+			log.Printf("worker %s 在 CLI 接入前重检回滚设置失败: %v", w.id, err)
 		}
 		ack.OK = true
 		s.serveViewer(v, ack, false)

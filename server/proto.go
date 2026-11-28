@@ -56,9 +56,12 @@ const (
 
 // handshakeReq 是连接首帧。start 由启动 CLI 认领，attach 接入已运行的会话。
 type handshakeReq struct {
-	Op   string `json:"op"`
-	UUID string `json:"uuid"`
+	Op         string `json:"op"`
+	UUID       string `json:"uuid"`
+	Scrollback *int   `json:"scrollback,omitempty"`
 }
+
+const scrollbackOp = "set_scrollback"
 
 // handshakeAck 自报操作与 UUID，Busy 表示存在接入中的 viewer。
 type handshakeAck struct {
