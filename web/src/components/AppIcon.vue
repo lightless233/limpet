@@ -7,6 +7,7 @@ const paths = {
   back: 'm12 6-6 6 6 6M6 12h13',
   arrowUp: 'M12 19V5m-6 6 6-6 6 6',
   down: 'm6 9 6 6 6-6',
+  right: 'm9 6 6 6-6 6',
   lock: 'M8 11V8a4 4 0 1 1 8 0v3M7 11h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2Z',
   more: 'M5 12h.01M12 12h.01M19 12h.01',
   minus: 'M5 12h14',
@@ -15,6 +16,7 @@ const paths = {
   refresh: 'M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5',
   folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z',
   folderOpen: 'M3 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1M3 7v10a2 2 0 0 0 2 2h13.2a2 2 0 0 0 1.9-1.4l1.5-5A1.5 1.5 0 0 0 20.2 10H6.8a2 2 0 0 0-1.9 1.4L3 17',
+  folderPlus: 'M12 10v6M9 13h6M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z',
 }
 
 defineProps<{ name: keyof typeof paths }>()

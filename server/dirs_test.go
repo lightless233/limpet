@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -119,4 +121,67 @@ func TestHandleListDirs(t *testing.T) {
 			t.Fatalf("GET path=%q = %d, want 400", bad, code)
 		}
 	}
+}
+
+func postCreateDir(t *testing.T, m *manager, parent, name string) (int, dirEntry) {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"parent": parent, "name": name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	m.handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/dirs", strings.NewReader(string(body))))
+	var out dirEntry
+	if w.Code == http.StatusOK {
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("POST /api/dirs invalid json: %v (%s)", err, w.Body.Bytes())
+		}
+	}
+	return w.Code, out
+}
+
+func TestHandleCreateDir(t *testing.T) {
+	m := testManager(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if err := os.WriteFile(filepath.Join(home, "existing-file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, entry := postCreateDir(t, m, "~", "projects")
+	if code != http.StatusOK {
+		t.Fatalf("POST ~ / projects = %d", code)
+	}
+	if entry != (dirEntry{Name: "projects", Path: "~/projects"}) {
+		t.Fatalf("entry = %+v", entry)
+	}
+	if info, err := os.Stat(filepath.Join(home, "projects")); err != nil || !info.IsDir() {
+		t.Fatalf("created dir missing: err=%v info=%v", err, info)
+	}
+
+	code, sub := postCreateDir(t, m, "~/projects", "my app")
+	if code != http.StatusOK || sub != (dirEntry{Name: "my app", Path: "~/projects/my app"}) {
+		t.Fatalf("POST sub = %d %+v", code, sub)
+	}
+
+	for _, dup := range []string{"projects", "existing-file"} {
+		if code, _ := postCreateDir(t, m, "~", dup); code != http.StatusConflict {
+			t.Fatalf("dup %q = %d, want 409", dup, code)
+		}
+	}
+
+	longName := strings.Repeat("a", 256)
+	for _, badName := range []string{"", "   ", ".", "..", "a/b", `a\b`, "a\nb", "a\x00b", longName} {
+		if code, _ := postCreateDir(t, m, "~", badName); code != http.StatusBadRequest {
+			t.Fatalf("bad name %q = %d, want 400", badName, code)
+		}
+	}
+
+	for _, badParent := range []string{"relative", filepath.Join(home, "missing"), "~/existing-file"} {
+		if code, _ := postCreateDir(t, m, badParent, "ok"); code != http.StatusBadRequest {
+			t.Fatalf("bad parent %q = %d, want 400", badParent, code)
+		}
+	}
+	_ = fmt.Sprint
 }

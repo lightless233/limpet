@@ -210,6 +210,69 @@ func (m *manager) handleListDirs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func dirNameValid(name string) bool {
+	if name == "" || name == "." || name == ".." || len(name) > 255 {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// handleCreateDir POST /api/dirs。在已校验存在的父目录下创建单级子文件夹。
+func (m *manager) handleCreateDir(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Parent string `json:"parent"`
+		Name   string `json:"name"`
+	}
+	b, err := readBody(w, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "读取请求体失败"})
+		return
+	}
+	if err := json.Unmarshal(b, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+	parent, err := workspaceDir(body.Parent)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errHome) {
+			status = http.StatusInternalServerError
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if !dirNameValid(name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "文件夹名称不合法"})
+		return
+	}
+	createdPath := filepath.Join(parent, name)
+	if err := os.Mkdir(createdPath, 0o755); err != nil {
+		switch {
+		case errors.Is(err, os.ErrExist):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "同名文件或目录已存在"})
+		case errors.Is(err, os.ErrPermission):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "没有权限在此目录创建文件夹"})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "创建文件夹失败：" + err.Error()})
+		}
+		return
+	}
+	home, _ := os.UserHomeDir()
+	writeJSON(w, http.StatusOK, dirEntry{
+		Name: name,
+		Path: displayCwd(createdPath, home),
+	})
+}
+
 // handleList GET /api/term。活会话实时查询（逐 worker 探测）。
 func (m *manager) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m.list())
