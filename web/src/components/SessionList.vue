@@ -350,30 +350,31 @@ function fmtTime(iso: string) {
       <p v-else-if="loading && !sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">加载中…</p>
       <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>
 
-      <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group mb-3 min-w-0">
+      <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group min-w-0">
         <div class="workspace-heading flex min-w-0 items-center gap-1">
           <h2 class="min-w-0 flex-1">
-            <button type="button" class="control w-full min-w-0 justify-start bg-transparent text-left text-xs text-[var(--limpet-muted)] hover:text-[var(--limpet-text)]"
+            <button type="button" class="workspace-toggle control w-full min-w-0 justify-start bg-transparent text-left text-[13px] font-medium hover:bg-[rgb(255_255_255/5%)] active:bg-[var(--limpet-pressed)]"
               :aria-expanded="!collapsed.has(group.key)" :aria-controls="workspaceListId + '-' + index"
               @click="setCollapsed(group.key, !collapsed.has(group.key))">
-              <AppIcon name="down" class="size-3 shrink-0 text-[var(--limpet-muted)]" :class="{ '-rotate-90': collapsed.has(group.key) }" />
-              <bdi class="min-w-0 flex-1 truncate font-semibold" dir="ltr"
+              <AppIcon :name="collapsed.has(group.key) ? 'folder' : 'folderOpen'" class="size-4 shrink-0 text-[var(--limpet-muted)]" />
+              <bdi class="min-w-0 flex-1 truncate" dir="ltr"
                 @pointerenter="showCwdTip($event, group.key || '~')" @pointerleave="scheduleHideCwdTip">{{ group.title }}</bdi>
-              <span class="shrink-0 tabular-nums text-[var(--limpet-muted)]">{{ group.items.length }}</span>
+              <span class="shrink-0 text-xs tabular-nums text-[var(--limpet-muted)]">{{ group.items.length }}</span>
+              <AppIcon name="down" class="size-3 shrink-0 text-[var(--limpet-muted)] transition-transform duration-150" :class="{ '-rotate-90': collapsed.has(group.key) }" />
             </button>
           </h2>
-          <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)]"
+          <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[rgb(255_255_255/5%)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]"
             :aria-label="'在 ' + group.title + ' 新建会话'" :popovertarget="presetMenuId"
             :aria-busy="creating.has(group.key)" :disabled="creating.has(group.key)" @click="preparePresetMenu(group.key)">
             <AppIcon v-if="creating.has(group.key)" name="refresh" class="animate-spin" />
             <AppIcon v-else name="add" />
           </button>
         </div>
-        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5 pl-3.5">
+        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5 pl-4">
           <li v-for="s in group.items" :key="s.id" class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
             :class="{ 'session-row-active': activeId === s.id }">
             <button
-              class="session-entry grid min-h-11 min-w-0 flex-1 content-center gap-0.5 rounded-md px-2 py-1.5 text-left disabled:opacity-50"
+              class="session-entry grid min-h-10 min-w-0 flex-1 content-center gap-0.5 rounded-md px-2 py-1 text-left disabled:opacity-50"
               :aria-current="activeId === s.id ? 'true' : undefined"
               :disabled="closing.has(s.id)"
               @click="emit('open', s.id, s.name)"
@@ -480,6 +481,20 @@ function fmtTime(iso: string) {
 }
 .workspace-heading {
   margin-bottom: 0.125rem;
+}
+.workspace-group + .workspace-group {
+  margin-top: 0.625rem;
+  padding-top: 0.625rem;
+  border-top: 1px solid rgb(255 255 255 / 7%);
+}
+.workspace-toggle {
+  color: #b8c0cc;
+}
+.workspace-toggle:hover {
+  color: var(--limpet-text);
+}
+@media (pointer: coarse) {
+  .session-entry { min-height: 2.75rem; }
 }
 .command-badge {
   color: #cbd5e1;

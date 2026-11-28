@@ -12,6 +12,8 @@ const paths = {
   bottom: 'm6 12 6 6 6-6M12 18V4M5 21h14',
   composer: 'M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9l-5 3v-3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm3 4h10m-10 4h7',
   refresh: 'M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5',
+  folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z',
+  folderOpen: 'M3 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1M3 7v10a2 2 0 0 0 2 2h13.2a2 2 0 0 0 1.9-1.4l1.5-5A1.5 1.5 0 0 0 20.2 10H6.8a2 2 0 0 0-1.9 1.4L3 17',
 }
 
 defineProps<{ name: keyof typeof paths }>()
