@@ -34,14 +34,14 @@ function detectRenderer(): 'dom' | 'webgl' {
 // 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready/size/ping，前端→resize/pong）。
 // 接入由调用方给定的会话 ID 直接进行（会话已在列表中创建）。
 // 断线自动重连（spec 005）：网络抖动、切网、锁屏恢复、server 重启之后自动接回原会话。
-import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useTemplateRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useTemplateRef } from 'vue'
 import { FitAddon } from '@xterm/addon-fit'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
-import { MAX_SCROLLBACK, type ScrollbackResult, type SessionItem } from '../sessions'
+import { groupSessions, MAX_SCROLLBACK, type ScrollbackResult, type SessionItem } from '../sessions'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
@@ -54,6 +54,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   back: []; openSession: [id: string, name: string]; refreshSessions: []; sessionAuthExpired: []
 }>()
+const workspaces = computed(() => groupSessions(props.sessions))
 
 // server 每 20s 发一帧 ping；超过这个时限没收到任何消息即判定连接已死（与服务端的 60s 判定对称）。
 const PING_TIMEOUT_MS = 60_000
@@ -770,16 +771,19 @@ function reloadPage() {
           {{ sessionsError }} <button class="control" @click="emit('refreshSessions')">重试</button>
         </p>
         <p v-else-if="sessionsLoading && !sessions.length" class="text-sm text-[var(--limpet-muted)]">加载中…</p>
-        <ul class="grid gap-1">
-          <li v-for="session in sessions" :key="session.id" class="min-w-0">
-            <button class="control w-full min-w-0 justify-start text-left" :aria-current="session.id === sessionId ? 'true' : undefined"
-              :disabled="session.id === sessionId" @click="emit('openSession', session.id, session.name)">
-              <span class="size-1.5 shrink-0 rounded-full"
-                :class="session.attached ? 'bg-[var(--limpet-accent)]' : 'bg-[var(--limpet-muted)]'"></span>
-              <span class="truncate">{{ session.name }}</span>
-            </button>
-          </li>
-        </ul>
+        <section v-for="group in workspaces" :key="group.key" class="mb-2 min-w-0">
+          <h2 class="truncate px-2 py-1 text-xs text-[var(--limpet-muted)]">{{ group.title }}</h2>
+          <ul class="grid gap-1">
+            <li v-for="session in group.items" :key="session.id" class="min-w-0">
+              <button class="control w-full min-w-0 justify-start text-left" :aria-current="session.id === sessionId ? 'true' : undefined"
+                :disabled="session.id === sessionId" @click="emit('openSession', session.id, session.name)">
+                <span class="size-1.5 shrink-0 rounded-full"
+                  :class="session.attached ? 'bg-[var(--limpet-accent)]' : 'bg-[var(--limpet-muted)]'"></span>
+                <span class="truncate">{{ session.name }}</span>
+              </button>
+            </li>
+          </ul>
+        </section>
       </template>
       <button class="control mt-2 w-full justify-start" @click="emit('back')">
         <AppIcon name="back" /> 返回会话列表

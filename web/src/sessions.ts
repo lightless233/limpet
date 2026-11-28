@@ -9,6 +9,49 @@ export interface SessionItem {
   cmd?: string
 }
 
+export function workspaceKey(cwd?: string): string {
+  return cwd && cwd !== '~' ? cwd : ''
+}
+
+export function groupSessions(sessions: SessionItem[]) {
+  const groups = new Map<string, { key: string; title: string; items: SessionItem[]; latest: number; parts: string[] }>()
+  const byLeaf = new Map<string, string[][]>()
+  for (const session of sessions) {
+    const key = workspaceKey(session.cwd)
+    const created = Date.parse(session.created)
+    const group = groups.get(key)
+    if (group) {
+      group.items.push(session)
+      group.latest = Math.max(group.latest, created)
+      continue
+    }
+    const parts = key.split('/').filter(Boolean)
+    const title = key ? parts.at(-1) ?? key : '主目录'
+    groups.set(key, { key, title, items: [session], latest: created, parts })
+    if (key) {
+      const siblings = byLeaf.get(title)
+      if (siblings) siblings.push(parts)
+      else byLeaf.set(title, [parts])
+    }
+  }
+  for (const group of groups.values()) {
+    const siblings = byLeaf.get(group.title)
+    if (!group.key || !siblings || siblings.length === 1) continue
+    group.title = group.key
+    for (let depth = 2; depth <= group.parts.length; depth++) {
+      const suffix = group.parts.slice(-depth).join('/')
+      if (siblings.every((parts) => parts === group.parts || parts.slice(-depth).join('/') !== suffix)) {
+        group.title = suffix
+        break
+      }
+    }
+  }
+  return [...groups.values()].sort((a, b) => {
+    if (!a.key || !b.key) return Number(!a.key) - Number(!b.key)
+    return b.latest - a.latest || (a.key < b.key ? -1 : 1)
+  })
+}
+
 const POLL_INTERVAL_MS = 5000
 export const MAX_SCROLLBACK = 1_000_000
 

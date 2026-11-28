@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRaw, useTemplateRef, watch } from 'vue'
-import type { useSessions } from '../sessions'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRaw, useId, useTemplateRef, watch } from 'vue'
+import { groupSessions, workspaceKey, type useSessions } from '../sessions'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{ store: ReturnType<typeof useSessions>; activeId?: string }>()
@@ -9,6 +9,87 @@ const { sessions, loading, refreshing, loadError, authExpired, request, refresh 
 const busy = ref(false)
 const closing = ref(new Set<string>())
 const closeError = ref('')
+const createError = ref('')
+const creating = ref(new Set<string>())
+const workspaces = computed(() => groupSessions(sessions.value))
+const collapsedKey = 'limpet.collapsed-workspaces'
+const collapsed = ref(new Set<string>())
+try {
+  const saved: unknown = JSON.parse(localStorage.getItem(collapsedKey) ?? '[]')
+  if (Array.isArray(saved)) collapsed.value = new Set(saved.filter((key): key is string => typeof key === 'string'))
+} catch { /* Use the default expanded state when storage is unavailable. */ }
+
+function setCollapsed(key: string, next: boolean) {
+  if (collapsed.value.has(key) === next) return
+  if (next) collapsed.value.add(key)
+  else collapsed.value.delete(key)
+  try {
+    localStorage.setItem(collapsedKey, JSON.stringify([...collapsed.value]))
+  } catch { /* The current page still keeps its collapse state. */ }
+}
+
+const activeWorkspace = computed(() => sessions.value.find((item) => item.id === props.activeId))
+watch([() => props.activeId, () => activeWorkspace.value && workspaceKey(activeWorkspace.value.cwd)], ([id, key]) => {
+  if (id && key !== undefined) setCollapsed(key, false)
+})
+
+const presets = [
+  { id: 'shell', label: 'Shell', flag: '' },
+  { id: 'codex', label: 'Codex', flag: '--yolo' },
+  { id: 'agy', label: 'Agy', flag: '--dangerously-skip-permissions' },
+] as const
+type Preset = typeof presets[number]['id']
+type CreatedSession = { id: string; name: string; cwd: string; cmd: string }
+const workspaceHistory = ref<string[]>([])
+const presetMenuId = useId()
+const workspaceListId = useId()
+const presetMenu = useTemplateRef<HTMLDivElement>('presetMenu')
+const menuWorkspace = ref<string | null>(null)
+
+function preparePresetMenu(key: string | null) {
+  hideCwdTip()
+  menuWorkspace.value = key
+}
+
+async function requestCreate(name: string, cwd: string, preset: Preset): Promise<CreatedSession | undefined> {
+  const res = await request('/api/term', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name.trim(), cwd, preset }),
+  })
+  if (!res) return
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error ?? 'HTTP ' + res.status)
+  }
+  return res.json()
+}
+
+function openCreated(created: CreatedSession) {
+  setCollapsed(workspaceKey(created.cwd), false)
+  emit('open', created.id, created.name)
+  void refresh()
+}
+
+async function selectPreset(preset: Preset) {
+  const cwd = menuWorkspace.value
+  presetMenu.value?.hidePopover()
+  if (cwd === null) {
+    openCreate(preset)
+    return
+  }
+  if (creating.value.has(cwd) || authExpired.value) return
+  creating.value.add(cwd)
+  createError.value = ''
+  try {
+    const created = await requestCreate('', cwd, preset)
+    if (created) openCreated(created)
+  } catch (error) {
+    createError.value = '新建失败：' + (error instanceof Error ? error.message : String(error))
+  } finally {
+    creating.value.delete(cwd)
+  }
+}
 
 const cwdTip = useTemplateRef<HTMLDivElement>('cwdTip')
 const cwdTipText = ref('')
@@ -88,7 +169,8 @@ onBeforeUnmount(() => {
   hideCwdTip()
 })
 
-type Action = { mode: 'create'; name: string } | { mode: 'rename' | 'close'; id: string; name: string }
+type Action = { mode: 'create'; name: string; cwd: string; preset: Preset } |
+  { mode: 'rename' | 'close'; id: string; name: string }
 const action = ref<Action | null>(null)
 const actionError = ref('')
 const dialog = useTemplateRef('dialog')
@@ -114,8 +196,17 @@ async function openAction(next: Action) {
   if (toRaw(action.value) === next && !dialog.value?.open) dialog.value?.showModal()
 }
 
-function openCreate() {
-  void openAction({ mode: 'create', name: '' })
+async function openCreate(preset: Preset = 'shell') {
+  const next: Action = { mode: 'create', name: '', cwd: '', preset }
+  workspaceHistory.value = []
+  await openAction(next)
+  if (toRaw(action.value) !== next) return
+  try {
+    const res = await request('/api/workspaces')
+    if (!res?.ok) return
+    const paths: string[] = await res.json()
+    if (toRaw(action.value) === next) workspaceHistory.value = paths
+  } catch { /* Workspace history is optional. */ }
 }
 
 defineExpose({ openCreate })
@@ -166,8 +257,15 @@ async function submitAction() {
   busy.value = true
   actionError.value = ''
   try {
-    const url = current.mode === 'create' ? '/api/term' : '/api/term/' + encodeURIComponent(current.id) + '/rename'
-    const res = await request(url, {
+    if (current.mode === 'create') {
+      const created = await requestCreate(current.name, current.cwd, current.preset)
+      if (created) {
+        if (action.value === current) dialog.value?.close()
+        openCreated(created)
+      }
+      return
+    }
+    const res = await request('/api/term/' + encodeURIComponent(current.id) + '/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: current.name.trim() }),
@@ -226,9 +324,15 @@ function fmtTime(iso: string) {
         <button class="control" aria-label="刷新列表" title="刷新列表" :disabled="refreshing" @click="refresh()">
           <AppIcon name="refresh" :class="{ 'animate-spin': refreshing }" />
         </button>
-        <button class="control text-sm" @click="openCreate">
-          <AppIcon name="add" /> 新建
-        </button>
+        <div class="inline-flex gap-px">
+          <button class="control rounded-e-none text-sm" @click="openCreate()">
+            <AppIcon name="add" /> 新建
+          </button>
+          <button class="control rounded-s-none" aria-label="更多新建选项" :popovertarget="presetMenuId"
+            @click="preparePresetMenu(null)">
+            <AppIcon name="down" />
+          </button>
+        </div>
       </div>
     </header>
 
@@ -237,59 +341,106 @@ function fmtTime(iso: string) {
       <button class="control text-sm" @click="reloadPage">刷新页面</button>
     </div>
 
-    <div v-else class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2" @scroll.passive="hideCwdTip">
-      <p v-if="closeError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">{{ closeError }}</p>
+    <div v-else class="session-groups min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2" @scroll.passive="hideCwdTip">
+      <p v-if="createError" role="alert" class="wrap-anywhere p-2 text-sm text-[var(--limpet-danger)]">{{ createError }}</p>
+      <p v-if="closeError" role="alert" class="wrap-anywhere p-2 text-sm text-[var(--limpet-danger)]">{{ closeError }}</p>
       <p v-if="loadError" role="alert" class="p-2 text-sm text-[var(--limpet-danger)]">
         {{ loadError }} <button class="control" @click="refresh()">重试</button>
       </p>
       <p v-else-if="loading && !sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">加载中…</p>
       <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>
 
-      <ul class="grid gap-1">
-        <li v-for="s in sessions" :key="s.id" class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
-          :class="{ 'session-row-active': activeId === s.id }">
-          <button
-            class="session-entry flex min-h-11 min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-2 text-left disabled:opacity-50"
-            :aria-current="activeId === s.id ? 'true' : undefined"
-            :disabled="closing.has(s.id)"
-            @click="emit('open', s.id, s.name)"
-          >
-            <span class="mt-1.5 size-2 shrink-0 rounded-full" :class="s.attached ? 'bg-[var(--limpet-accent)]' : 'bg-[var(--limpet-muted)]'"
-              :title="s.attached ? '使用中' : '空闲'"></span>
-            <span class="grid min-w-0 flex-1 gap-0.5">
-              <span class="truncate text-sm font-medium">{{ s.name }}</span>
-              <span v-if="s.cmd || s.cwd" class="flex min-w-0 items-center gap-1.5 text-xs text-[var(--limpet-muted)] [font-family:var(--limpet-mono)]">
-                <span v-if="s.cmd" class="max-w-[6rem] shrink-0 truncate rounded border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-1.5">{{ s.cmd }}</span>
-                <span v-if="s.cwd" class="cwd truncate"
-                  @pointerenter="showCwdTip($event, s.cwd)" @pointerleave="scheduleHideCwdTip"><bdi dir="ltr">{{ s.cwd }}</bdi></span>
+      <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group mb-2 min-w-0">
+        <div class="workspace-heading flex min-w-0 items-center gap-1">
+          <h2 class="min-w-0 flex-1">
+            <button type="button" class="control w-full min-w-0 justify-start bg-transparent text-left text-xs"
+              :aria-expanded="!collapsed.has(group.key)" :aria-controls="workspaceListId + '-' + index"
+              @click="setCollapsed(group.key, !collapsed.has(group.key))">
+              <AppIcon name="down" class="size-3 shrink-0 text-[var(--limpet-muted)]" :class="{ '-rotate-90': collapsed.has(group.key) }" />
+              <bdi class="min-w-0 flex-1 truncate font-semibold" dir="ltr"
+                @pointerenter="showCwdTip($event, group.key || '~')" @pointerleave="scheduleHideCwdTip">{{ group.title }}</bdi>
+              <span class="shrink-0 tabular-nums text-[var(--limpet-muted)]">{{ group.items.length }}</span>
+            </button>
+          </h2>
+          <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)]"
+            :aria-label="'在 ' + group.title + ' 新建会话'" :popovertarget="presetMenuId"
+            :aria-busy="creating.has(group.key)" :disabled="creating.has(group.key)" @click="preparePresetMenu(group.key)">
+            <AppIcon v-if="creating.has(group.key)" name="refresh" class="animate-spin" />
+            <AppIcon v-else name="add" />
+          </button>
+        </div>
+        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5">
+          <li v-for="s in group.items" :key="s.id" class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
+            :class="{ 'session-row-active': activeId === s.id }">
+            <button
+              class="session-entry grid min-h-11 min-w-0 flex-1 content-center gap-0.5 rounded-md px-2 py-1.5 text-left disabled:opacity-50"
+              :aria-current="activeId === s.id ? 'true' : undefined"
+              :disabled="closing.has(s.id)"
+              @click="emit('open', s.id, s.name)"
+            >
+              <span class="flex min-w-0 items-center gap-2">
+                <span class="size-1.5 shrink-0 rounded-full" :class="s.attached ? 'bg-[var(--limpet-accent)]' : 'bg-[var(--limpet-muted)]'"
+                  :title="s.attached ? '使用中' : '空闲'"></span>
+                <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ s.name }}</span>
               </span>
-              <time :datetime="s.created" class="text-xs text-[var(--limpet-muted)]">{{ fmtTime(s.created) }}</time>
-            </span>
-          </button>
-          <button class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-pressed)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]" aria-label="重命名" title="重命名"
-            :disabled="closing.has(s.id)" @click="openAction({ mode: 'rename', id: s.id, name: s.name })">
-            <AppIcon name="edit" />
-          </button>
-          <button class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-pressed)] hover:text-[var(--limpet-danger)] active:bg-[var(--limpet-pressed)]" aria-label="关闭" title="关闭"
-            :disabled="closing.has(s.id)" @click="openAction({ mode: 'close', id: s.id, name: s.name })">
-            <AppIcon name="close" />
-          </button>
-        </li>
-      </ul>
+              <span class="flex min-w-0 items-center gap-1.5 pl-3.5 text-xs text-[var(--limpet-muted)]">
+                <span v-if="s.cmd" :data-command="s.cmd" class="command-badge min-w-0 max-w-[6rem] truncate rounded border px-1 [font-family:var(--limpet-mono)]">{{ s.cmd }}</span>
+                <time :datetime="s.created" class="shrink-0">{{ fmtTime(s.created) }}</time>
+              </span>
+            </button>
+            <button class="control session-row-action shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-pressed)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]" aria-label="重命名" title="重命名"
+              :disabled="closing.has(s.id)" @click="openAction({ mode: 'rename', id: s.id, name: s.name })">
+              <AppIcon name="edit" />
+            </button>
+            <button class="control session-row-action shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-pressed)] hover:text-[var(--limpet-danger)] active:bg-[var(--limpet-pressed)]" aria-label="关闭" title="关闭"
+              :disabled="closing.has(s.id)" @click="openAction({ mode: 'close', id: s.id, name: s.name })">
+              <AppIcon name="close" />
+            </button>
+          </li>
+        </ul>
+      </section>
+    </div>
+
+    <div v-if="!authExpired" :id="presetMenuId" ref="presetMenu" popover="auto" class="preset-popover">
+      <div role="group" aria-label="启动预设" class="grid gap-1">
+        <button v-for="preset in presets" :key="preset.id" type="button"
+          class="control min-w-0 justify-start px-3 text-left text-sm" @click="selectPreset(preset.id)">
+          <span class="shrink-0">{{ preset.label }}</span>
+          <span v-if="preset.flag" class="min-w-0 wrap-anywhere text-xs text-[var(--limpet-muted)] [font-family:var(--limpet-mono)]">{{ preset.flag }}</span>
+        </button>
+      </div>
     </div>
 
     <dialog ref="dialog" closedby="any" class="session-dialog" aria-labelledby="session-action-title"
       @close="onDialogClose" v-on="lightDismiss">
-      <form v-if="action" class="grid gap-3" @submit.prevent="submitAction">
+      <form v-if="action" class="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3" @submit.prevent="submitAction">
         <h2 id="session-action-title" class="text-base font-semibold">{{ actionTitle }}</h2>
         <p v-if="action.mode === 'close'" class="min-w-0 wrap-anywhere text-sm text-[var(--limpet-muted)]">
           关闭「{{ action.name }}」会终止其中的进程。
         </p>
-        <input v-else v-model="action.name" autofocus autocomplete="off" spellcheck="false" enterkeyhint="done"
+        <template v-if="action.mode === 'create'">
+          <fieldset class="grid min-w-0 grid-cols-3 gap-1 text-sm">
+            <legend class="sr-only">启动预设</legend>
+            <label v-for="preset in presets" :key="preset.id" class="control preset-choice cursor-pointer">
+              <input v-model="action.preset" type="radio" name="preset" :value="preset.id" class="sr-only" />
+              {{ preset.label }}
+            </label>
+          </fieldset>
+          <input v-model="action.cwd" autocomplete="off" spellcheck="false" aria-label="工作目录" placeholder="~"
+            class="min-w-0 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-2 text-base focus-visible:outline-[var(--limpet-accent)]"
+            @keydown.enter="preventComposingSubmit" />
+          <div v-if="workspaceHistory.length" class="flex min-w-0 flex-wrap gap-1">
+            <button v-for="path in workspaceHistory" :key="path" type="button"
+              class="control max-w-full justify-start text-xs" @click="action.cwd = path">
+              <bdi class="min-w-0 truncate" dir="ltr">{{ path }}</bdi>
+            </button>
+          </div>
+        </template>
+        <input v-if="action.mode !== 'close'" v-model="action.name" autofocus autocomplete="off" spellcheck="false" enterkeyhint="done"
           class="min-w-0 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-3 py-2 text-base focus-visible:outline-[var(--limpet-accent)]"
           aria-label="会话名" :placeholder="action.mode === 'create' ? '会话名（留空自动生成）' : '输入新的会话名'"
           @keydown.enter="preventComposingSubmit" />
-        <p v-if="actionError" role="alert" class="text-sm text-[var(--limpet-danger)]">{{ actionError }}</p>
+        <p v-if="actionError" role="alert" class="wrap-anywhere text-sm text-[var(--limpet-danger)]">{{ actionError }}</p>
         <div class="flex justify-end gap-2 text-sm">
           <button v-if="action.mode === 'close'" type="button" class="control" autofocus @click="dialog?.close()">取消</button>
           <button v-else type="button" class="control" @click="dialog?.close()">取消</button>
@@ -327,7 +478,58 @@ function fmtTime(iso: string) {
   background: var(--limpet-control);
   box-shadow: inset 2px 0 0 var(--limpet-accent);
 }
-.cwd { direction: rtl; }
+.workspace-heading {
+  border-bottom: 1px solid var(--limpet-line);
+  margin-bottom: 0.25rem;
+}
+.command-badge {
+  border-color: var(--limpet-line);
+  background: var(--limpet-canvas);
+}
+.command-badge[data-command="codex"] {
+  color: #b4abd1;
+  background: #232031;
+  border-color: #322b42;
+}
+.command-badge[data-command="agy"] {
+  color: #a5c4ba;
+  background: #1c2928;
+  border-color: #2a3b38;
+}
+@media (hover: hover) and (pointer: fine) {
+  .session-row-action { opacity: 0; }
+  .session-row:is(:hover, :focus-within, .session-row-active) .session-row-action { opacity: 1; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .session-row-action { transition: opacity 120ms ease; }
+}
+.preset-choice:has(input:checked) {
+  color: var(--limpet-accent);
+  background: var(--limpet-pressed);
+}
+.preset-choice:has(input:focus-visible) {
+  outline: 2px solid var(--limpet-accent);
+  outline-offset: -2px;
+}
+.preset-popover {
+  width: min(17rem, calc(100vw - 1rem));
+  max-height: calc(100dvh - 1rem);
+  overflow: auto;
+  padding: 0.375rem;
+  border: 1px solid var(--limpet-line);
+  border-radius: 0.5rem;
+  background: var(--limpet-surface);
+  color: var(--limpet-text);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+}
+@supports (position-area: block-end) {
+  .preset-popover {
+    inset: auto;
+    margin: 0;
+    position-area: block-end span-inline-start;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+}
 .cwd-tooltip {
   position: fixed;
   inset: auto;
