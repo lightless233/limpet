@@ -2,7 +2,7 @@
 // 模块级：WebGL2 探测结果按浏览器会话缓存一次。
 let rendererProbe: 'dom' | 'webgl' | null = null
 
-// 挂载 <Terminal> 前探测 webgl 渲染器是否可用（该 prop 仅在挂载时生效）：
+// 挂载 WebGL addon 前探测硬件加速：
 // 需要 OffscreenCanvas（含 transferToImageBitmap）与可用的 webgl2 上下文；
 // 软件渲染器（RDP/虚拟机里的 SwiftShader、llvmpipe 等）跑 webgl 反而更慢，
 // 必须回退 dom。任何异常一律静默回退 dom。
@@ -30,14 +30,17 @@ function detectRenderer(): 'dom' | 'webgl' {
 </script>
 
 <script setup lang="ts">
-// 终端视图：wterm(ghostty core) ↔ WebSocket ↔ Go(worker PTY)。
+// 终端视图：xterm.js ↔ WebSocket ↔ Go(worker PTY)。
 // 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready/size/ping，前端→resize/pong）。
 // 接入由调用方给定的会话 ID 直接进行（会话已在列表中创建）。
 // 断线自动重连（spec 005）：网络抖动、切网、锁屏恢复、server 重启之后自动接回原会话。
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
-import { Terminal, type WTerm } from '@wterm/vue'
-import { GhosttyCore } from '@wterm/ghostty'
-import '@wterm/vue/css'
+import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useTemplateRef } from 'vue'
+import { FitAddon } from '@xterm/addon-fit'
+import { Unicode11Addon } from '@xterm/addon-unicode11'
+import { WebLinksAddon } from '@xterm/addon-web-links'
+import { WebglAddon } from '@xterm/addon-webgl'
+import { Terminal } from '@xterm/xterm'
+import '@xterm/xterm/css/xterm.css'
 import type { SessionItem } from '../sessions'
 import AppIcon from './AppIcon.vue'
 
@@ -54,49 +57,36 @@ const PING_TIMEOUT_MS = 60_000
 const BACKOFF_START_MS = 1000
 const BACKOFF_MAX_MS = 30_000
 
-// 渲染器：webgl 仅在硬件加速可用时启用（探测结果模块级缓存）。
-const terminalRenderer = detectRenderer()
-
-const term = useTemplateRef('term')
-const rail = useTemplateRef('rail')
+const terminalHost = useTemplateRef('terminalHost')
 const composerInput = useTemplateRef('composerInput')
-const core = ref<GhosttyCore | null>(null)
-// 已加载但尚未晋升到 core 的实例：ready 帧前 WebSocket 断掉/重试/卸载时，
-// 这个孤儿不会被 <Terminal> 引用，必须显式释放（WTerm.destroy 不释放 core）。
-let pendingCore: GhosttyCore | null = null
-// fatalError：core 加载或 Terminal 初始化失败，终端组件无法存在，
-// 以全屏错误替代终端；重新连接会重建 core 并重新挂载组件。
+const term = shallowRef<Terminal>()
 const fatalError = ref('')
 
-// reconnecting：自动重连进行中（含退避等待）。ended / authExpired 是终态，不再重连。
+// reconnecting 包含退避等待。ended / authExpired 是终态，不再重连。
 type Status = 'connecting' | 'reconnecting' | 'connected' | 'ended' | 'authExpired' | 'error'
 const status = ref<Status>('connecting')
-
-const encoder = new TextEncoder()
-let ws: WebSocket | null = null
-// 每次接入重新挂载 Terminal，等该实例的 @ready 再交付输出。
-let termReady = false
 type Dimensions = { cols: number; rows: number }
-// Vue 终端挂载前收到的尺寸与 VT 字节按同一顺序重放。
-const pending: (Uint8Array | Dimensions)[] = []
+type Delivery = Uint8Array | Dimensions | 'fit'
+type Connection = {
+  generation: number
+  socket: WebSocket
+  queue: Delivery[]
+  draining: boolean
+  resizing: boolean
+  fit: FitAddon
+}
+const encoder = new TextEncoder()
+let connection: Connection | undefined
 const lockPreference = ref(localStorage.getItem('limpet.lock-width') === 'true')
 const supportsLockWidth = ref<boolean | null>(null)
 const lockedWidth = ref(false)
-const remoteSize = ref<Dimensions>()
 const defaultFontSize = matchMedia('(min-width: 768px)').matches ? 13 : 11
 const storedFontSize = Number(localStorage.getItem('limpet.font-size'))
 const fontSize = ref(Number.isInteger(storedFontSize) && storedFontSize >= 10 && storedFontSize <= 18 ? storedFontSize : defaultFontSize)
-const terminalStyle = computed(() => ({
-  '--limpet-font-size': fontSize.value + 'px',
-  '--limpet-row-height': Math.ceil(fontSize.value * 1.25) + 'px',
-  '--limpet-remote-cols': remoteSize.value?.cols,
-}))
 const viewportHeight = ref<number>()
 const viewportTop = ref(0)
-const railWidth = ref(0)
-let stopRail: (() => void) | undefined
 
-// 重连状态。gen 是接入代数：connect() 中途有 await，期间若发起了新的接入，旧的那次自行作废。
+// 重连状态。gen 是接入代数：旧连接的异步核对与交付回调不得触及新实例。
 let gen = 0
 let waitingToReconnect = false
 let reconnectDelay = 0
@@ -107,7 +97,6 @@ let unmounted = false
 
 onMounted(() => {
   window.addEventListener('online', reconnectNow)
-  window.addEventListener('focus', requestImmediateRender)
   document.addEventListener('visibilitychange', reconnectNow)
   window.visualViewport?.addEventListener('resize', syncViewport)
   window.visualViewport?.addEventListener('scroll', syncViewport)
@@ -119,118 +108,76 @@ onMounted(() => {
 onBeforeUnmount(() => {
   unmounted = true
   window.removeEventListener('online', reconnectNow)
-  window.removeEventListener('focus', requestImmediateRender)
   document.removeEventListener('visibilitychange', reconnectNow)
   window.visualViewport?.removeEventListener('resize', syncViewport)
   window.visualViewport?.removeEventListener('scroll', syncViewport)
   clearTimeout(reconnectTimer)
   clearInterval(watchdog)
-  detachSocket()
-  resetThrottle()
-  pending.length = 0
-  // <Terminal> 在本组件卸载流程里才执行 WTerm.destroy()（它不会释放 core）；
-  // releaseCores 经 nextTick 等卸载完成后再释放最后一轮 core 的 WASM 内存。
-  releaseCores()
+  disposeConnection()
 })
 
-function detachSocket() {
-  stopRail?.()
-  stopRail = undefined
-  if (!ws) return
-  // 先摘回调再关闭，避免旧连接的 onclose 污染新一轮连接的状态。
-  ws.onopen = ws.onmessage = ws.onclose = null
-  ws.close()
-  ws = null
+function disposeConnection() {
+  gen++
+  const previous = connection
+  connection = undefined
+  if (previous) {
+    previous.queue.length = 0
+    const { socket } = previous
+    socket.onopen = socket.onmessage = socket.onclose = null
+    socket.close()
+  }
+  term.value?.dispose()
+  term.value = undefined
+  terminalHost.value?.replaceChildren()
 }
 
-// releaseCores 释放上一轮的 core。pendingCore 无人引用，同步释放即可；
-// core.value 仍被 <Terminal>（WTerm）引用：先置 null 让其卸载，再在
-// nextTick（WTerm.destroy() 之后）释放 WASM 内存（dispose 幂等，全方法有守卫）。
-function releaseCores() {
-  pendingCore?.dispose()
-  pendingCore = null
-  const prev = core.value
-  core.value = null
-  if (prev) void nextTick(() => prev.dispose())
-}
-
-async function connect() {
-  const my = ++gen
+function connect() {
   clearTimeout(reconnectTimer)
   reconnectTimer = 0
   waitingToReconnect = false
-  detachSocket()
-  // 旧连接的残余输出与节流定时器全部作废，不得串进新实例。
-  resetThrottle()
-  pending.length = 0
-  status.value = my === 1 ? 'connecting' : 'reconnecting'
-  // 每次接入都重建 core 并重新挂载终端组件，让本次接入拥有干净的
-  // 屏幕状态。组件重挂载会重新触发 @ready，termReady 随之复位。
-  releaseCores()
-  termReady = false
+  disposeConnection()
+  status.value = gen === 1 ? 'connecting' : 'reconnecting'
   fatalError.value = ''
   supportsLockWidth.value = null
   lockedWidth.value = false
-  remoteSize.value = undefined
-  railWidth.value = 0
   lastMsgAt = 0
 
-  let loaded: GhosttyCore
-  try {
-    loaded = await GhosttyCore.load()
-    if (unmounted || my !== gen) {
-      // 这次接入已被更新的接入或卸载作废：释放刚加载的 WASM 内存。
-      loaded.dispose()
-      return
-    }
-    // 晋升推迟到 ready 帧：在此之前断线/重试/卸载时由 releaseCores 兜底释放。
-    pendingCore = loaded
-  } catch (e) {
-    if (unmounted || my !== gen) return
-    fatalError.value = e instanceof Error ? e.message : String(e)
-    status.value = 'error'
-    return
-  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const sock = new WebSocket(`${proto}//${location.host}/api/ws/term/${encodeURIComponent(props.sessionId)}`)
-  ws = sock
-  sock.binaryType = 'arraybuffer'
-  // 收到 ready 帧才算「已连接」并开放输入。
-  sock.onopen = () => {
-    if (ws !== sock) return
-    lastMsgAt = Date.now()
-    if (lockPreference.value) sock.send('{"type":"resize","cols":0,"rows":0}')
+  const socket = new WebSocket(`${proto}//${location.host}/api/ws/term/${encodeURIComponent(props.sessionId)}`)
+  const current: Connection = {
+    generation: gen, socket, queue: [], draining: false, resizing: false, fit: new FitAddon(),
   }
-  sock.onmessage = (e) => {
-    if (ws !== sock) return
+  connection = current
+  socket.binaryType = 'arraybuffer'
+  socket.onopen = () => {
+    if (connection !== current) return
     lastMsgAt = Date.now()
-    if (typeof e.data === 'string') {
-      // 文本帧 = 控制 JSON。
-      try {
-        const ctl = JSON.parse(e.data)
-        if (ctl.type === 'ready' && !core.value) {
-          reconnectDelay = 0
-          remoteSize.value = parseDimensions(ctl)
-          supportsLockWidth.value = remoteSize.value !== undefined
-          lockedWidth.value = lockPreference.value && supportsLockWidth.value
-          pendingCore = null
-          core.value = loaded
-        } else if (ctl.type === 'size' && lockedWidth.value) {
-          const size = parseDimensions(ctl)
-          if (size) deliver(size)
-        } else if (ctl.type === 'ping' && sock.readyState === WebSocket.OPEN) {
-          sock.send('{"type":"pong"}')
-        }
-      } catch { /* 忽略无法解析的控制帧 */ }
+    if (lockPreference.value) socket.send('{"type":"resize","cols":0,"rows":0}')
+  }
+  socket.onmessage = (e) => {
+    if (connection !== current) return
+    lastMsgAt = Date.now()
+    if (typeof e.data !== 'string') {
+      deliver(current, new Uint8Array(e.data as ArrayBuffer))
       return
     }
-    deliver(new Uint8Array(e.data as ArrayBuffer))
+    let ctl: { type: string } & Dimensions
+    try {
+      ctl = JSON.parse(e.data)
+    } catch {
+      return
+    }
+    if (ctl?.type === 'ready' && !term.value) {
+      openTerminal(current, parseDimensions(ctl))
+    } else if (ctl?.type === 'size' && lockedWidth.value) {
+      const size = parseDimensions(ctl)
+      if (size) deliver(current, size)
+    } else if (ctl?.type === 'ping' && socket.readyState === WebSocket.OPEN) {
+      socket.send('{"type":"pong"}')
+    }
   }
-  sock.onclose = (e) => {
-    // 已被替换或主动关闭的旧连接不算断线。
-    if (ws !== sock) return
-    ws = null
-    void onDisconnected(e.code)
+  socket.onclose = (e) => {
+    if (connection === current) void onDisconnected(e.code)
   }
 }
 
@@ -238,10 +185,6 @@ async function connect() {
 // 4001 慢连接被丢弃、4002 心跳超时）先核对会话是否还在，再决定重连还是进入终态。
 async function onDisconnected(code: number) {
   if (unmounted) return
-  // ready 帧前断线：尚未晋升的 core 成孤儿，先释放（core.value 里的实例仍被
-  // <Terminal> 展示当前画面，交给后续接入或卸载时统一释放）。
-  pendingCore?.dispose()
-  pendingCore = null
   if (code === 1000) {
     status.value = 'ended'
     emit('refreshSessions')
@@ -300,7 +243,7 @@ function reconnectNow() {
 // 连接无声死亡时浏览器不会触发 close（手机切网的常态）。server 每 20s 发 ping，
 // 60s 没收到任何消息就当作已死：主动关闭并重连。
 function checkLiveness() {
-  if (!ws || status.value !== 'connected') return
+  if (!connection || status.value !== 'connected') return
   if (Date.now() - lastMsgAt <= PING_TIMEOUT_MS) return
   scheduleReconnect()
 }
@@ -312,160 +255,146 @@ function parseDimensions(ctl: Dimensions): Dimensions | undefined {
   }
 }
 
-// ---- 输出写入与渲染节流 ----
-// 字节同步 write()：后端已有 16ms 微批合帧，前端不再异步合批——异步队列会让
-// 未锁宽模式下本地 ResizeObserver 的 resize 插队到已到达的 VT 字节之前，越序。
-// setRenderingPaused 只推迟绘制：字节始终持续喂入，Ghostty WASM 状态、终端
-// 查询回复与 scrollback 实时准确，不积压也不丢帧。
-const THROTTLE_BURST_BYTES = 32 * 1024 // 每秒输出超过该字节数视为高频爆发
-const THROTTLE_SLOW_FRAME_MS = 12 // 单次喂入耗时超过该值视为慢帧
-const THROTTLE_IDLE_UNPAUSE_MS = 80 // 输出停顿这么久立即解除暂停刷出画面
-const INTERACTIVE_GRACE_MS = 120 // 用户交互后这段时间不节流，保住刚解除的绘制
-let lastOutputAt = 0
-let burstBytes = 0
-let burstWindowAt = 0
-let lastFrameCost = 0
-let renderPaused = false
-let pauseTimer = 0
-let idleTimer = 0
-let unpauseRaf = 0
-// write() 执行中：core 的分块回调会同步发出终端查询回包（走 onData）。它们
-// 照常 sendInput，但不得惊动节流状态机，更不得抢先注册决策帧。
-let writing = false
-let interactiveUntil = 0
-
-function setRenderingPaused(paused: boolean) {
-  term.value?.instance?.setRenderingPaused(paused)
+function deliver(current: Connection, event: Delivery) {
+  current.queue.push(event)
+  drain(current)
 }
 
-// 爆发判定：输出流正在进行中，且吞吐超阈值或上一帧偏慢。
-function shouldThrottle(): boolean {
-  if (document.visibilityState !== 'visible') return false
-  if (performance.now() < interactiveUntil) return false
-  if (performance.now() - lastOutputAt > 40) return false
-  return burstBytes >= THROTTLE_BURST_BYTES || lastFrameCost > THROTTLE_SLOW_FRAME_MS
-}
+function drain(current: Connection) {
+  const terminal = term.value
+  if (!terminal || connection !== current || current.draining || current.resizing) return
 
-// 目标重绘间隔：聚焦 + WebGL 33–50ms；DOM 渲染器或慢帧 80–200ms；
-// 可见但未聚焦的双开窗口在爆发期压到 150–250ms。压力越大越靠区间后段。
-function throttleInterval(): number {
-  let lo = 33
-  let hi = 50
-  if (terminalRenderer !== 'webgl' || lastFrameCost > THROTTLE_SLOW_FRAME_MS) {
-    lo = 80
-    hi = 200
+  current.draining = true
+  let consumed = 0
+  try {
+    while (consumed < current.queue.length && !current.resizing) {
+      const event = current.queue[consumed++]!
+      if (event instanceof Uint8Array) {
+        terminal.write(event)
+        continue
+      }
+
+      // write 的回调可能同步执行。先占住屏障，后续帧始终留在 FIFO 中。
+      current.resizing = true
+      terminal.write('', () => {
+        if (connection !== current || term.value !== terminal) return
+        try {
+          if (event === 'fit') fitTerminal(terminal, current.fit)
+          else terminal.resize(event.cols, event.rows)
+        } catch (error) {
+          failTerminal(error)
+          return
+        }
+        current.resizing = false
+        drain(current)
+      })
+    }
+  } catch (error) {
+    failTerminal(error)
+  } finally {
+    current.queue.splice(0, consumed)
+    current.draining = false
   }
-  if (document.visibilityState === 'visible' && !document.hasFocus()) {
-    lo = 150
-    hi = 250
+}
+
+function fitTerminal(terminal: Terminal, fit: FitAddon) {
+  const size = fit.proposeDimensions()
+  if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return
+  // FitAddon 允许一行，超大浏览器也能测出超过 worker 协议上限的尺寸。
+  if (parseDimensions(size)) fit.fit()
+  else terminal.resize(Math.min(500, size.cols), Math.min(200, Math.max(2, size.rows)))
+}
+
+function reportResize(current: Connection, { cols, rows }: Dimensions) {
+  if (connection === current && !lockedWidth.value && current.socket.readyState === WebSocket.OPEN) {
+    current.socket.send(JSON.stringify({ type: 'resize', cols, rows }))
   }
-  const pressure = Math.min(1, Math.max(burstBytes / (THROTTLE_BURST_BYTES * 8), lastFrameCost / 30))
-  return Math.round(lo + (hi - lo) * pressure)
 }
 
-function maybeThrottle() {
-  // unpauseRaf 非零表示上一帧的绘制尚未画完：此时 setRenderingPaused(true)
-  // 会取消刚排好的 WTerm._flushRenders，把爆发期放行的帧整个误杀。
-  if (renderPaused || unpauseRaf || !shouldThrottle()) return
-  renderPaused = true
-  setRenderingPaused(true)
-  pauseTimer = window.setTimeout(endRenderPause, throttleInterval())
-  idleTimer = window.setTimeout(endRenderPause, THROTTLE_IDLE_UNPAUSE_MS)
-}
-
-function endRenderPause() {
-  clearTimeout(pauseTimer)
-  clearTimeout(idleTimer)
-  pauseTimer = idleTimer = 0
-  if (!renderPaused) return
-  renderPaused = false
-  setRenderingPaused(false)
-  // WTerm 的绘制 rAF 在 setRenderingPaused(false) 内先注册，决策帧后注册：
-  // 同帧 FIFO 先画完再决定下一拍。armUnpauseDecision 只允许出现在这里。
-  armUnpauseDecision()
-}
-
-// 解除暂停后安排「下一拍」决策：WTerm 的绘制 rAF 先于本回调注册，回调执行时
-// 这一帧已画完。unpauseRaf 非零期间 maybeThrottle 一律不再暂停。
-function armUnpauseDecision() {
-  if (unpauseRaf) return
-  unpauseRaf = requestAnimationFrame(() => {
-    unpauseRaf = 0
-    if (unmounted) return
-    maybeThrottle()
+function openTerminal(current: Connection, remoteSize?: Dimensions) {
+  const host = terminalHost.value!
+  reconnectDelay = 0
+  supportsLockWidth.value = remoteSize !== undefined
+  lockedWidth.value = lockPreference.value && remoteSize !== undefined
+  const terminal = new Terminal({
+    ...(lockedWidth.value ? remoteSize : undefined),
+    allowProposedApi: true,
+    scrollback: 10000,
+    fontFamily: getComputedStyle(host).getPropertyValue('--limpet-mono').trim(),
+    fontSize: fontSize.value,
+    theme: {
+      background: '#121417', foreground: '#e6eaf0', cursor: '#34d399',
+      selectionBackground: '#60a5fa66',
+      black: '#242830', red: '#f87171', green: '#34d399', yellow: '#fbbf24',
+      blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#d8dde6',
+      brightBlack: '#80899a', brightRed: '#fca5a5', brightGreen: '#6ee7b7', brightYellow: '#fde68a',
+      brightBlue: '#93c5fd', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#f4f6fa',
+    },
   })
-}
-
-// 用户输入或窗口重新聚焦：立即解除暂停刷出最新画面，绝不留在 paused 状态。
-// interactiveUntil 交互宽限让 shouldThrottle 暂时为 false，刚解除的绘制不会被
-// 后续输出抢先把节流挂回去。这里绝不注册决策帧——决策帧只能紧跟
-// setRenderingPaused(false) 注册（见 endRenderPause），否则会在下一帧反超
-// WTerm._flushRenders 而误杀绘制。
-function requestImmediateRender() {
-  clearTimeout(pauseTimer)
-  clearTimeout(idleTimer)
-  pauseTimer = idleTimer = 0
-  interactiveUntil = performance.now() + INTERACTIVE_GRACE_MS
-  if (!renderPaused) return
-  renderPaused = false
-  setRenderingPaused(false)
-}
-
-// 断线、重连或卸载：清空节流状态与所有定时器，旧连接的残余绝不串进新实例。
-function resetThrottle() {
-  cancelAnimationFrame(unpauseRaf)
-  clearTimeout(pauseTimer)
-  clearTimeout(idleTimer)
-  unpauseRaf = pauseTimer = idleTimer = 0
-  if (renderPaused) {
-    renderPaused = false
-    setRenderingPaused(false)
+  term.value = terminal
+  try {
+    terminal.loadAddon(current.fit)
+    terminal.loadAddon(new Unicode11Addon())
+    terminal.unicode.activeVersion = '11'
+    terminal.loadAddon(new WebLinksAddon())
+    terminal.open(host)
+    if (detectRenderer() === 'webgl') {
+      let addon: WebglAddon | undefined
+      try {
+        const webgl = addon = new WebglAddon()
+        terminal.loadAddon(webgl)
+        webgl.onContextLoss(() => webgl.dispose())
+      } catch {
+        addon?.dispose()
+      }
+    }
+    terminal.onData(onData)
+    terminal.onBinary((chunk) => {
+      const bytes = new Uint8Array(chunk.length)
+      for (let i = 0; i < chunk.length; i++) bytes[i] = chunk.charCodeAt(i) & 0xff
+      sendInput(bytes)
+    })
+    terminal.attachCustomKeyEventHandler((event) => {
+      if (event.type !== 'keydown' || event.altKey || event.isComposing || event.ctrlKey === event.metaKey) return true
+      const key = event.key.toLowerCase()
+      // 拦截 xterm 的按键编码，保留浏览器 paste 事件的默认动作。
+      if (key === 'v') return false
+      if (key !== 'c' || !terminal.hasSelection()) return true
+      const text = terminal.getSelection()
+      if (navigator.clipboard) {
+        event.preventDefault()
+        void navigator.clipboard.writeText(text).catch(() => {
+          if (term.value === terminal && terminal.getSelection() === text) document.execCommand('copy')
+        })
+      }
+      // Clipboard API 不可用时，让浏览器的 copy 事件交给 xterm 处理。
+      return false
+    })
+    if (!lockedWidth.value) {
+      fitTerminal(terminal, current.fit)
+      reportResize(current, terminal)
+      terminal.onResize((size) => reportResize(current, size))
+    }
+    status.value = 'connected'
+    drain(current)
+  } catch (error) {
+    failTerminal(error)
+    return
   }
-  lastOutputAt = 0
-  burstBytes = 0
-  burstWindowAt = 0
-  lastFrameCost = 0
-  interactiveUntil = 0
-}
-
-function deliver(event: Uint8Array | Dimensions) {
-  if (!termReady) {
-    pending.push(event)
-  } else if (event instanceof Uint8Array) {
-    // 同步 write 保证 VT 字节与本地 resize、尺寸事件的先后与到达顺序一致。
-    lastOutputAt = performance.now()
-    const started = performance.now()
-    writing = true
-    try {
-      term.value?.write(event)
-    } finally {
-      writing = false
+  if (connection !== current) return
+  emit('refreshSessions')
+  void nextTick(() => {
+    const focus = document.activeElement
+    if (connection === current && status.value === 'connected' &&
+        focus !== composerInput.value && !focus?.closest('dialog[open]')) {
+      terminal.focus()
     }
-    const cost = performance.now() - started
-    lastFrameCost = lastFrameCost === 0 ? cost : lastFrameCost * 0.6 + cost * 0.4
-    const now = performance.now()
-    if (now - burstWindowAt >= 1000) {
-      burstWindowAt = now
-      burstBytes = 0
-    }
-    burstBytes += event.length
-    if (renderPaused) {
-      // 输出仍在持续：顺延「停顿解除」；节拍解除照常到点刷出。
-      clearTimeout(idleTimer)
-      idleTimer = window.setTimeout(endRenderPause, THROTTLE_IDLE_UNPAUSE_MS)
-    } else {
-      maybeThrottle()
-    }
-  } else {
-    // 前序字节均已同步写入，直接 resize 天然严格保序。props 同时保留当前几何。
-    remoteSize.value = event
-    term.value?.resize(event.cols, event.rows)
-  }
+  })
 }
 
 // 输入闸门：WS 打开 + 已收到 ready。接入中与重连中的按键直接丢弃，不缓冲。
 function sendInput(bytes: Uint8Array): boolean {
-  const sock = ws
+  const sock = connection?.socket
   if (sock?.readyState !== WebSocket.OPEN || status.value !== 'connected') return false
   const CHUNK = 64 * 1024
   try {
@@ -480,65 +409,24 @@ function sendInput(bytes: Uint8Array): boolean {
 }
 
 function onData(chunk: string) {
-  // write() 期间 core 分块回调同步发出的查询回包不是用户输入：照常发送，
-  // 但不触发 requestImmediateRender（否则会抢先注册决策帧/宽限，见节流段注释）。
-  if (!writing) requestImmediateRender()
-  if (ctrlSticky.value) {
-    ctrlSticky.value = false
-    if (chunk.length === 1) {
-      const code = chunk.toUpperCase().charCodeAt(0)
-      if (code >= 64 && code <= 95) {
-        // @A-Z[\]^_ → 控制字符 0x00-0x1F
-        sendInput(encoder.encode(String.fromCharCode(code & 0x1f)))
-        return
-      }
+  if (ctrlSticky.value && chunk.length === 1) {
+    let code = chunk.charCodeAt(0)
+    if (code >= 97 && code <= 122) code -= 32
+    if (code >= 64 && code <= 95) {
+      if (sendInput(Uint8Array.of(code & 0x1f))) ctrlSticky.value = false
+      return
     }
   }
+  // 自动查询回包是多字节序列，直接发送，不消耗下一个字母的 Ctrl。
   sendInput(encoder.encode(chunk))
 }
 
-// 终端程序开启鼠标跟踪后的原始 X10 报告。
-function onBinary(bytes: Uint8Array) {
-  requestImmediateRender()
-  sendInput(new Uint8Array(bytes))
-}
-
-function onResize(cols: number, rows: number) {
-  if (!lockedWidth.value && ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', cols, rows }))
-  }
-}
-
-function onReady(wt: WTerm) {
-  if (ws?.readyState !== WebSocket.OPEN || !core.value) return
-  onResize(wt.cols, wt.rows)
-  termReady = true
-  status.value = 'connected'
-  for (const event of pending) deliver(event)
-  pending.length = 0
-  if (lockedWidth.value) observeRail(wt.element)
-  emit('refreshSessions')
-  const my = gen
-  void nextTick(() => {
-    const focus = document.activeElement
-    if (my === gen && status.value === 'connected' && focus !== composerInput.value && !focus?.closest('dialog[open]')) {
-      term.value?.focus()
-    }
-  })
-}
-
-// WTerm 初始化失败（wasm 加载/实例化问题）：终端不可用，转为 fatalError；
-// 下次重连会重建 core 并重新挂载组件。
-function onTerminalError(e: unknown) {
-  gen++
+function failTerminal(error: unknown) {
   waitingToReconnect = false
   clearTimeout(reconnectTimer)
   reconnectTimer = 0
-  detachSocket()
-  resetThrottle()
-  pending.length = 0
-  releaseCores()
-  fatalError.value = String(e)
+  disposeConnection()
+  fatalError.value = error instanceof Error ? error.message : String(error)
   status.value = 'error'
 }
 
@@ -560,7 +448,6 @@ const KEY_DEFS: { label: string; bytes: string }[] = [
 const ctrlSticky = ref(false)
 
 function sendKey(bytes: string) {
-  requestImmediateRender()
   sendInput(encoder.encode(bytes))
   term.value?.focus()
 }
@@ -577,56 +464,8 @@ function syncViewport() {
   viewportTop.value = keyboardResized ? viewport.offsetTop : 0
 }
 
-function observeRail(el: HTMLElement) {
-  const syncScroll = () => {
-    if (rail.value && rail.value.scrollLeft !== el.scrollLeft) rail.value.scrollLeft = el.scrollLeft
-  }
-  let lastHeight = el.clientHeight
-  let following = el.scrollHeight - el.scrollTop - lastHeight < 5
-  let lastGridWidth = 0
-  const onScroll = () => {
-    if (el.clientHeight === lastHeight) following = el.scrollHeight - el.scrollTop - lastHeight < 5
-    syncScroll()
-  }
-  const observer = new ResizeObserver((entries) => {
-    // 网格高度随滚动历史每行增长属常态；仅容器尺寸或网格宽度真正变化时才
-    // 重新测量同步，忽略纯高度变化，避免滚动时每行触发一次同步布局读取。
-    let relevant = false
-    for (const entry of entries) {
-      if (entry.target === el) {
-        relevant = true
-      } else if (entry.contentRect.width !== lastGridWidth) {
-        lastGridWidth = entry.contentRect.width
-        relevant = true
-      }
-    }
-    if (!relevant) return
-    if (el.clientHeight !== lastHeight) {
-      lastHeight = el.clientHeight
-      if (following) el.scrollTop = el.scrollHeight
-    }
-    const overflow = el.scrollWidth - el.clientWidth
-    railWidth.value = overflow > 1 ? el.offsetWidth + overflow : 0
-    void nextTick(syncScroll)
-  })
-  observer.observe(el)
-  const grid = el.querySelector('.term-grid')
-  if (grid) observer.observe(grid)
-  el.addEventListener('scroll', onScroll, { passive: true })
-  stopRail = () => {
-    observer.disconnect()
-    el.removeEventListener('scroll', onScroll)
-  }
-}
-
-function panTerminal() {
-  const el = term.value?.instance?.element
-  if (el && rail.value && el.scrollLeft !== rail.value.scrollLeft) el.scrollLeft = rail.value.scrollLeft
-}
-
 function scrollToBottom() {
-  const el = term.value?.instance?.element
-  if (el) el.scrollTop = el.scrollHeight
+  term.value?.scrollToBottom()
 }
 
 function toggleLockWidth() {
@@ -640,6 +479,10 @@ function setFontSize(size?: number) {
   fontSize.value = size ?? defaultFontSize
   if (size === undefined) localStorage.removeItem('limpet.font-size')
   else localStorage.setItem('limpet.font-size', String(size))
+  if (term.value && connection) {
+    term.value.options.fontSize = fontSize.value
+    if (!lockedWidth.value) deliver(connection, 'fit')
+  }
 }
 
 const composerOpen = ref(false)
@@ -653,7 +496,6 @@ function toggleComposer() {
 }
 
 function sendDraft(enter: boolean) {
-  requestImmediateRender()
   if (sendInput(encoder.encode(draft.value + (enter ? '\r' : '')))) {
     draft.value = ''
     composerInput.value?.focus({ preventScroll: true })
@@ -746,7 +588,7 @@ function reloadPage() {
           <AppIcon name="add" />
         </button>
         <button class="control" @click="setFontSize()">重置字号</button>
-        <button class="control" aria-label="滚到底部" title="滚到底部" :disabled="!core" @click="scrollToBottom">
+        <button class="control" aria-label="滚到底部" title="滚到底部" :disabled="!term" @click="scrollToBottom">
           <AppIcon name="bottom" />
         </button>
         <button class="control" aria-label="重载页面" title="重载页面" @click="reloadPage">
@@ -761,36 +603,11 @@ function reloadPage() {
     <div v-if="fatalError" class="min-h-0 flex-1 overflow-auto p-4 text-sm text-[var(--limpet-danger)]">
       {{ fatalError }}
     </div>
-    <!-- 捕获阶段先于 .wterm 的 mousedown/wheel 处理解除节流暂停：WebGL 模式下
-         wterm 会在这些事件里先 _syncText 再隐藏 GPU canvas，而 paused 时
-         _syncText 会跳过，露出一块过期 DOM。touchstart 覆盖移动端滚动。 -->
     <div v-else class="terminal-viewport flex min-h-0 min-w-0 flex-1 flex-col"
-      :class="{ 'terminal-locked': lockedWidth }" :style="terminalStyle"
-      :inert="status === 'connecting' || status === 'reconnecting'"
-      @mousedown.capture="requestImmediateRender"
-      @wheel.capture.passive="requestImmediateRender"
-      @touchstart.capture.passive="requestImmediateRender">
-      <div class="relative min-h-0 min-w-0 flex-1">
-        <Terminal
-          v-if="core"
-          ref="term"
-          :core="core"
-          :renderer="terminalRenderer"
-          :auto-resize="!lockedWidth"
-          :cols="lockedWidth ? remoteSize?.cols : undefined"
-          :rows="lockedWidth ? remoteSize?.rows : undefined"
-          :scrollback-lines="10000"
-          class="absolute inset-0 h-full w-full"
-          @data="onData"
-          @binary="onBinary"
-          @resize="onResize"
-          @ready="onReady"
-          @error="onTerminalError"
-        />
-      </div>
-      <div v-if="lockedWidth" v-show="railWidth" ref="rail" class="terminal-pan shrink-0"
-        role="region" tabindex="0" aria-label="横向滚动终端" @scroll.passive="panTerminal">
-        <div :style="{ width: railWidth + 'px' }"></div>
+      :class="{ 'terminal-locked': lockedWidth }"
+      :inert="status === 'connecting' || status === 'reconnecting'">
+      <div class="terminal-frame min-h-0 min-w-0 flex-1">
+        <div ref="terminalHost" class="terminal-host"></div>
       </div>
     </div>
 
