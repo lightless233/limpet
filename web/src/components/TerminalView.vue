@@ -13,7 +13,9 @@ function detectRenderer(): 'dom' | 'webgl' {
   rendererProbe = 'dom'
   try {
     if (typeof OffscreenCanvas === 'undefined' || !OffscreenCanvas.prototype.transferToImageBitmap) return 'dom'
-    const gl = new OffscreenCanvas(1, 1).getContext('webgl2')
+    // failIfMajorPerformanceCaveat 让软件实现（SwiftShader/llvmpipe）直接创建失败：
+    // 隐私策略可能屏蔽 WEBGL_debug_renderer_info，仅靠字符串会漏判。
+    const gl = new OffscreenCanvas(1, 1).getContext('webgl2', { failIfMajorPerformanceCaveat: true })
     if (!gl) return 'dom'
     let names = String(gl.getParameter(gl.RENDERER) ?? '')
     const debug = gl.getExtension('WEBGL_debug_renderer_info')
@@ -59,6 +61,9 @@ const term = useTemplateRef('term')
 const rail = useTemplateRef('rail')
 const composerInput = useTemplateRef('composerInput')
 const core = ref<GhosttyCore | null>(null)
+// 已加载但尚未晋升到 core 的实例：ready 帧前 WebSocket 断掉/重试/卸载时，
+// 这个孤儿不会被 <Terminal> 引用，必须显式释放（WTerm.destroy 不释放 core）。
+let pendingCore: GhosttyCore | null = null
 // fatalError：core 加载或 Terminal 初始化失败，终端组件无法存在，
 // 以全屏错误替代终端；重新连接会重建 core 并重新挂载组件。
 const fatalError = ref('')
@@ -124,8 +129,8 @@ onBeforeUnmount(() => {
   resetThrottle()
   pending.length = 0
   // <Terminal> 在本组件卸载流程里才执行 WTerm.destroy()（它不会释放 core）；
-  // 等卸载完成后显式释放最后一轮 core 的 WASM 内存。
-  void nextTick(() => core.value?.dispose())
+  // releaseCores 经 nextTick 等卸载完成后再释放最后一轮 core 的 WASM 内存。
+  releaseCores()
 })
 
 function detachSocket() {
@@ -136,6 +141,17 @@ function detachSocket() {
   ws.onopen = ws.onmessage = ws.onclose = null
   ws.close()
   ws = null
+}
+
+// releaseCores 释放上一轮的 core。pendingCore 无人引用，同步释放即可；
+// core.value 仍被 <Terminal>（WTerm）引用：先置 null 让其卸载，再在
+// nextTick（WTerm.destroy() 之后）释放 WASM 内存（dispose 幂等，全方法有守卫）。
+function releaseCores() {
+  pendingCore?.dispose()
+  pendingCore = null
+  const prev = core.value
+  core.value = null
+  if (prev) void nextTick(() => prev.dispose())
 }
 
 async function connect() {
@@ -150,10 +166,7 @@ async function connect() {
   status.value = my === 1 ? 'connecting' : 'reconnecting'
   // 每次接入都重建 core 并重新挂载终端组件，让本次接入拥有干净的
   // 屏幕状态。组件重挂载会重新触发 @ready，termReady 随之复位。
-  // <Terminal> 卸载不会释放 core：替换前显式 dispose 上一轮的 WASM 内存
-  //（dispose 幂等且全部方法有守卫，旧实例此刻已无事件可再触达它）。
-  core.value?.dispose()
-  core.value = null
+  releaseCores()
   termReady = false
   fatalError.value = ''
   supportsLockWidth.value = null
@@ -170,6 +183,8 @@ async function connect() {
       loaded.dispose()
       return
     }
+    // 晋升推迟到 ready 帧：在此之前断线/重试/卸载时由 releaseCores 兜底释放。
+    pendingCore = loaded
   } catch (e) {
     if (unmounted || my !== gen) return
     fatalError.value = e instanceof Error ? e.message : String(e)
@@ -198,6 +213,7 @@ async function connect() {
           remoteSize.value = parseDimensions(ctl)
           supportsLockWidth.value = remoteSize.value !== undefined
           lockedWidth.value = lockPreference.value && supportsLockWidth.value
+          pendingCore = null
           core.value = loaded
         } else if (ctl.type === 'size' && lockedWidth.value) {
           const size = parseDimensions(ctl)
@@ -222,6 +238,10 @@ async function connect() {
 // 4001 慢连接被丢弃、4002 心跳超时）先核对会话是否还在，再决定重连还是进入终态。
 async function onDisconnected(code: number) {
   if (unmounted) return
+  // ready 帧前断线：尚未晋升的 core 成孤儿，先释放（core.value 里的实例仍被
+  // <Terminal> 展示当前画面，交给后续接入或卸载时统一释放）。
+  pendingCore?.dispose()
+  pendingCore = null
   if (code === 1000) {
     status.value = 'ended'
     emit('refreshSessions')
@@ -378,7 +398,9 @@ function throttleInterval(): number {
 }
 
 function maybeThrottle() {
-  if (renderPaused || !shouldThrottle()) return
+  // unpauseRaf 非零表示上一帧的绘制尚未画完：此时 setRenderingPaused(true)
+  // 会取消刚排好的 WTerm._flushRenders，把爆发期放行的帧整个误杀。
+  if (renderPaused || unpauseRaf || !shouldThrottle()) return
   renderPaused = true
   setRenderingPaused(true)
   pauseTimer = window.setTimeout(endRenderPause, throttleInterval())
@@ -392,8 +414,13 @@ function endRenderPause() {
   if (!renderPaused) return
   renderPaused = false
   setRenderingPaused(false)
-  // setRenderingPaused(true) 会取消尚未执行的绘制，不能与解除同步调用；
-  // 等这一帧真的画完再决定是否进入下一个节拍窗口。
+  armUnpauseDecision()
+}
+
+// 解除暂停后安排「下一拍」决策：WTerm 的绘制 rAF 先于本回调注册，回调执行时
+// 这一帧已画完。unpauseRaf 非零期间 maybeThrottle 一律不再暂停。
+function armUnpauseDecision() {
+  if (unpauseRaf) return
   unpauseRaf = requestAnimationFrame(() => {
     unpauseRaf = 0
     if (unmounted) return
@@ -401,16 +428,17 @@ function endRenderPause() {
   })
 }
 
-// 用户输入或窗口重新聚焦：立即解除暂停刷出最新画面，绝不留在 paused 状态。
+// 用户输入或窗口重新聚焦：立即解除暂停刷出最新画面，绝不留在 paused 状态；
+// 并保证至少完整画完这一帧，之后才由 maybeThrottle 决定是否继续节流。
 function requestImmediateRender() {
-  cancelAnimationFrame(unpauseRaf)
-  unpauseRaf = 0
   clearTimeout(pauseTimer)
   clearTimeout(idleTimer)
   pauseTimer = idleTimer = 0
-  if (!renderPaused) return
-  renderPaused = false
-  setRenderingPaused(false)
+  if (renderPaused) {
+    renderPaused = false
+    setRenderingPaused(false)
+  }
+  armUnpauseDecision()
 }
 
 // 断线、重连或卸载：清空缓存队列与所有定时器，旧连接的残余字节绝不串进新实例。
@@ -519,6 +547,7 @@ function onTerminalError(e: unknown) {
   detachSocket()
   resetThrottle()
   pending.length = 0
+  releaseCores()
   fatalError.value = String(e)
   status.value = 'error'
 }

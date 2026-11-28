@@ -159,8 +159,15 @@ func skipPreamble(t *testing.T, c net.Conn) (frameType, []byte, error) {
 }
 
 // 验收①：连续高频小包合并成更少的 ftOutput 帧，字节无丢失、顺序一致。
+// 先落一帧首包让 lastFlush 生效，再以 ~1ms 间隔持续发碎包，使其全部落入
+// 16ms 合批窗口——覆盖 batchWait 时间窗路径，而非首包的非阻塞 drain 快路径。
 func TestServeViewerBatchesBurstOutput(t *testing.T) {
 	client, v, _, _ := pumpViewer(t)
+	emit(v, "h")
+	kind, body, err := skipPreamble(t, client)
+	if err != nil || kind != ftOutput || string(body) != "h" {
+		t.Fatalf("首帧 = %v %q, %v", kind, body, err)
+	}
 	const chunks = 300
 	var want strings.Builder
 	for i := 0; i < chunks; i++ {
@@ -168,15 +175,12 @@ func TestServeViewerBatchesBurstOutput(t *testing.T) {
 	}
 	for i := 0; i < chunks; i++ {
 		emit(v, "abcd")
+		time.Sleep(time.Millisecond)
 	}
 	var got strings.Builder
-	frames := 1 // skipPreamble 返回的即是首个输出帧
-	var kind frameType
-	var body []byte
-	var err error
-	kind, body, err = skipPreamble(t, client)
-	// 滚动读帧：首帧之后每读一帧把读限顺延 150ms，超时即输出已安静（合批窗口早已结束）。
-	for ; err == nil; kind, body, err = readFrameDeadline(client, 150*time.Millisecond) {
+	frames := 0
+	// 滚动读帧：每读一帧把读限顺延 150ms，超时即输出已安静（合批窗口早已结束）。
+	for kind, body, err = readFrameDeadline(client, 2*time.Second); err == nil; kind, body, err = readFrameDeadline(client, 150*time.Millisecond) {
 		switch kind {
 		case ftOutput:
 			got.Write(body)

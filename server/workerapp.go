@@ -449,6 +449,8 @@ func (s *session) serveViewer(v *viewer, ack handshakeAck, replay bool) {
 						v.queued.Add(-int64(len(event.data)))
 					}
 				}
+				// 因缓冲写满或尺寸事件提前跳出时定时器仍 armed：停掉避免多触发一次。
+				batch.Stop()
 				if len(buf) != 0 && !flushOutput() {
 					return
 				}
