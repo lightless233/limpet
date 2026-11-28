@@ -57,7 +57,10 @@ const PING_TIMEOUT_MS = 60_000
 const BACKOFF_START_MS = 1000
 const BACKOFF_MAX_MS = 30_000
 
+const terminalFrame = useTemplateRef('terminalFrame')
 const terminalHost = useTemplateRef('terminalHost')
+const rail = useTemplateRef('rail')
+const horizontalRange = ref(0)
 const composerInput = useTemplateRef('composerInput')
 const term = shallowRef<Terminal>()
 const fatalError = ref('')
@@ -74,6 +77,8 @@ type Connection = {
   draining: boolean
   resizing: boolean
   fit: FitAddon
+  fitFrame: number
+  stopLayout?: () => void
 }
 const encoder = new TextEncoder()
 let connection: Connection | undefined
@@ -122,13 +127,19 @@ function disposeConnection() {
   connection = undefined
   if (previous) {
     previous.queue.length = 0
+    cancelAnimationFrame(previous.fitFrame)
+    previous.stopLayout?.()
     const { socket } = previous
     socket.onopen = socket.onmessage = socket.onclose = null
     socket.close()
   }
   term.value?.dispose()
   term.value = undefined
-  terminalHost.value?.replaceChildren()
+  horizontalRange.value = 0
+  if (terminalHost.value) {
+    terminalHost.value.replaceChildren()
+    terminalHost.value.style.removeProperty('width')
+  }
 }
 
 function connect() {
@@ -145,7 +156,7 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const socket = new WebSocket(`${proto}//${location.host}/api/ws/term/${encodeURIComponent(props.sessionId)}`)
   const current: Connection = {
-    generation: gen, socket, queue: [], draining: false, resizing: false, fit: new FitAddon(),
+    generation: gen, socket, queue: [], draining: false, resizing: false, fit: new FitAddon(), fitFrame: 0,
   }
   connection = current
   socket.binaryType = 'arraybuffer'
@@ -277,7 +288,7 @@ function drain(current: Connection) {
       // write 的回调可能同步执行。先占住屏障，后续帧始终留在 FIFO 中。
       current.resizing = true
       terminal.write('', () => {
-        if (connection !== current || term.value !== terminal) return
+        if (current.generation !== gen || term.value !== terminal) return
         try {
           if (event === 'fit') fitTerminal(terminal, current.fit)
           else terminal.resize(event.cols, event.rows)
@@ -348,8 +359,11 @@ function openTerminal(current: Connection, remoteSize?: Dimensions) {
         addon?.dispose()
       }
     }
-    terminal.onData(onData)
+    terminal.onData((chunk) => {
+      if (connection === current) onData(chunk)
+    })
     terminal.onBinary((chunk) => {
+      if (connection !== current) return
       const bytes = new Uint8Array(chunk.length)
       for (let i = 0; i < chunk.length; i++) bytes[i] = chunk.charCodeAt(i) & 0xff
       sendInput(bytes)
@@ -375,6 +389,7 @@ function openTerminal(current: Connection, remoteSize?: Dimensions) {
       reportResize(current, terminal)
       terminal.onResize((size) => reportResize(current, size))
     }
+    observeLayout(current, terminal, host)
     status.value = 'connected'
     drain(current)
   } catch (error) {
@@ -462,10 +477,119 @@ function syncViewport() {
   const keyboardResized = viewport && Math.abs(viewport.scale - 1) < 0.01 && viewport.height < window.innerHeight - 1
   viewportHeight.value = keyboardResized ? viewport.height : undefined
   viewportTop.value = keyboardResized ? viewport.offsetTop : 0
+  if (connection) scheduleFit(connection)
+}
+
+function scheduleFit(current: Connection) {
+  if (lockedWidth.value || current.fitFrame || !term.value) return
+  current.fitFrame = requestAnimationFrame(() => {
+    current.fitFrame = 0
+    if (connection === current) deliver(current, 'fit')
+  })
+}
+
+function observeLayout(current: Connection, terminal: Terminal, host: HTMLElement) {
+  const frame = terminalFrame.value!
+  const locked = lockedWidth.value
+  const screen = host.querySelector<HTMLElement>('.xterm-screen')!
+  const listeners = new AbortController()
+  let following = true
+  let lastHeight = -1
+  let lastWidth = -1
+  const verticalBar = host.querySelector<HTMLElement>('.xterm-scrollable-element > .scrollbar.vertical')!
+
+  const observer = new ResizeObserver(() => {
+    if (connection !== current) return
+    if (!locked) {
+      scheduleFit(current)
+      return
+    }
+
+    const width = screen.getBoundingClientRect().width + verticalBar.getBoundingClientRect().width
+    if (width !== lastWidth) {
+      lastWidth = width
+      host.style.width = width + 'px'
+    }
+    const clientHeight = frame.clientHeight
+    if (clientHeight !== lastHeight || following) {
+      lastHeight = clientHeight
+      if (following) frame.scrollTop = frame.scrollHeight
+    }
+    const range = frame.scrollWidth - frame.clientWidth
+    if (horizontalRange.value !== range) {
+      horizontalRange.value = range
+      void nextTick(() => {
+        if (connection === current) syncRail()
+      })
+    }
+  })
+  observer.observe(frame)
+  if (locked) {
+    observer.observe(screen)
+    frame.addEventListener('scroll', () => {
+      if (frame.clientHeight === lastHeight) {
+        following = frame.scrollHeight - frame.clientHeight - frame.scrollTop <= 1
+      }
+      syncRail()
+    }, { passive: true, signal: listeners.signal })
+  }
+
+  let touch: { x: number; y: number; remaining: number; history?: boolean } | undefined
+  host.addEventListener('touchstart', (event) => {
+    const point = event.touches.length === 1 ? event.touches[0] : undefined
+    touch = point ? { x: point.clientX, y: point.clientY, remaining: 0 } : undefined
+  }, { passive: true, signal: listeners.signal })
+  host.addEventListener('touchmove', (event) => {
+    const point = event.touches.length === 1 ? event.touches[0] : undefined
+    if (!touch || !point || !event.cancelable || terminal.modes.mouseTrackingMode !== 'none') return
+    const dy = touch.y - point.clientY
+    if (touch.history === undefined) {
+      const dx = Math.abs(point.clientX - touch.x)
+      if (dy === 0 && dx === 0) return
+      // 超高网格先让浏览器沿该方向滚动外层，到边后再由 xterm 滚动历史。
+      const outerCanScroll = locked && (dy > 0
+        ? frame.scrollTop + frame.clientHeight < frame.scrollHeight - 1
+        : frame.scrollTop > 1)
+      const buffer = terminal.buffer.active
+      const historyCanScroll = dy > 0 ? buffer.viewportY < buffer.baseY : buffer.viewportY > 0
+      touch.history = Math.abs(dy) > dx && !outerCanScroll && historyCanScroll
+    }
+    if (!touch.history) return
+
+    event.preventDefault()
+    touch.y = point.clientY
+    touch.remaining += dy
+    const cellHeight = screen.getBoundingClientRect().height / terminal.rows
+    const lines = Math.trunc(touch.remaining / cellHeight)
+    if (lines) {
+      terminal.scrollLines(lines)
+      touch.remaining -= lines * cellHeight
+    }
+  }, { passive: false, signal: listeners.signal })
+
+  current.stopLayout = () => {
+    observer.disconnect()
+    listeners.abort()
+  }
+}
+
+function syncRail() {
+  const frame = terminalFrame.value
+  const bar = rail.value
+  if (frame && bar && bar.scrollLeft !== frame.scrollLeft) bar.scrollLeft = frame.scrollLeft
+}
+
+function panTerminal() {
+  const frame = terminalFrame.value
+  const bar = rail.value
+  if (frame && bar && frame.scrollLeft !== bar.scrollLeft) frame.scrollLeft = bar.scrollLeft
 }
 
 function scrollToBottom() {
   term.value?.scrollToBottom()
+  if (lockedWidth.value && terminalFrame.value) {
+    terminalFrame.value.scrollTop = terminalFrame.value.scrollHeight
+  }
 }
 
 function toggleLockWidth() {
@@ -481,7 +605,7 @@ function setFontSize(size?: number) {
   else localStorage.setItem('limpet.font-size', String(size))
   if (term.value && connection) {
     term.value.options.fontSize = fontSize.value
-    if (!lockedWidth.value) deliver(connection, 'fit')
+    scheduleFit(connection)
   }
 }
 
@@ -606,8 +730,12 @@ function reloadPage() {
     <div v-else class="terminal-viewport flex min-h-0 min-w-0 flex-1 flex-col"
       :class="{ 'terminal-locked': lockedWidth }"
       :inert="status === 'connecting' || status === 'reconnecting'">
-      <div class="terminal-frame min-h-0 min-w-0 flex-1">
+      <div ref="terminalFrame" class="terminal-frame min-h-0 min-w-0 flex-1">
         <div ref="terminalHost" class="terminal-host"></div>
+      </div>
+      <div v-show="lockedWidth && horizontalRange" ref="rail" class="terminal-pan shrink-0"
+        role="region" tabindex="0" aria-label="横向滚动终端" @scroll.passive="panTerminal">
+        <div :style="{ width: `calc(100% + ${horizontalRange}px)` }"></div>
       </div>
     </div>
 

@@ -71,7 +71,24 @@
 
 .terminal-frame { overflow: hidden; }
 .terminal-host { width: 100%; height: 100%; }
-.terminal-locked .terminal-host { width: max-content; height: auto; }
+.terminal-host .xterm { user-select: text; }
+
+.terminal-locked .terminal-frame {
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+}
+
+.terminal-locked .terminal-host {
+  width: max-content;
+  height: auto;
+}
+
+@media (pointer: fine) {
+  .terminal-locked .terminal-frame { scrollbar-color: auto; }
+  .terminal-locked .terminal-frame::-webkit-scrollbar:horizontal { height: 0; }
+}
 
 .terminal-pan {
   overflow: auto hidden;
