@@ -731,9 +731,9 @@ function fmtTime(iso: string) {
             <AppIcon v-else name="add" />
           </button>
         </div>
-        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5 pl-4">
+        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5 pl-2">
           <li v-for="(s, si) in group.items" :key="s.id" :data-session-id="s.id"
-            class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
+            class="session-row flex min-w-0 items-center gap-0.5 rounded-md px-1"
             :class="{
               'session-row-active': activeId === s.id,
               'drag-dragging': isDraggingSession(group.key, s.id),
@@ -746,7 +746,7 @@ function fmtTime(iso: string) {
               <AppIcon name="grip" />
             </button>
             <button
-              class="session-entry grid min-h-10 min-w-0 flex-1 content-center gap-0.5 rounded-md px-2 py-1 text-left disabled:opacity-50"
+              class="session-entry grid min-h-10 min-w-0 flex-1 content-center gap-0.5 rounded-md px-1.5 py-1 text-left disabled:opacity-50"
               :aria-current="activeId === s.id ? 'true' : undefined"
               :disabled="closing.has(s.id)"
               @click="emit('open', s.id, s.name)"
@@ -757,7 +757,7 @@ function fmtTime(iso: string) {
                 <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ s.name }}</span>
               </span>
               <span class="flex min-w-0 items-center gap-1.5 pl-3.5 text-xs text-[var(--limpet-muted)]">
-                <span v-if="s.cmd" :data-command="s.cmd" class="command-badge min-w-0 max-w-[6rem] truncate rounded border px-1.5 font-medium [font-family:var(--limpet-mono)]">{{ s.cmd }}</span>
+                <span v-if="s.cmd" :data-command="s.cmd" class="command-badge shrink-0 max-w-[6rem] truncate rounded border px-1.5 font-medium [font-family:var(--limpet-mono)]">{{ s.cmd }}</span>
                 <time :datetime="s.created" class="shrink-0">{{ fmtTime(s.created) }}</time>
               </span>
             </button>
@@ -977,18 +977,32 @@ function fmtTime(iso: string) {
 .workspace-toggle:hover {
   color: var(--limpet-text);
 }
-/* 拖动手柄：touch-action 只禁手柄自身，列表其余区域保持原生滚动；
-   桌面端低透明度低调展示，移动端（粗指针）清晰可见。 */
+/* 拖动手柄：touch-action 只禁手柄自身，列表其余区域保持原生滚动。
+   288px 侧栏宽度预算紧张：手柄与 edit/close 默认收窄（覆盖 .control 的 32px
+   最小宽，非触屏环境一律生效），仅粗指针（触屏）放宽为触控热区。 */
 .drag-handle {
   touch-action: none;
+  min-inline-size: 18px;
+  padding-inline: 0;
   opacity: 0.4;
 }
 .drag-handle:is(:hover, :focus-visible, :active) {
   opacity: 1;
   color: var(--limpet-text);
 }
+.session-row-action {
+  min-inline-size: 26px;
+  padding-inline: 0.25rem;
+}
 @media (pointer: coarse) {
-  .drag-handle { opacity: 0.75; }
+  .drag-handle {
+    opacity: 0.75;
+    min-inline-size: 36px;
+  }
+  .session-row-action {
+    min-inline-size: 44px;
+    padding-inline: 0.5rem;
+  }
 }
 .drag-dragging {
   opacity: 0.45;
