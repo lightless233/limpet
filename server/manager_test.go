@@ -51,6 +51,7 @@ func testManager(t *testing.T) *manager {
 		workersDir:   filepath.Join(dir, "workers"),
 		regPath:      filepath.Join(dir, "sessions.json"),
 		settingsPath: filepath.Join(dir, "settings.json"),
+		orderPath:    filepath.Join(dir, "order.json"),
 		scrollback:   defaultScrollback,
 		exePath:      os.Args[0],
 		launch:       launchDirect,
@@ -58,6 +59,7 @@ func testManager(t *testing.T) *manager {
 	if err := os.Mkdir(m.workersDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	m.loadOrder()
 	t.Cleanup(func() {
 		for id := range m.sessions {
 			if err := m.closeSession(id); err != nil {

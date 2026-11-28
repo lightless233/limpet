@@ -1,18 +1,181 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRaw, useId, useTemplateRef, watch } from 'vue'
-import { groupSessions, workspaceKey, type useSessions } from '../sessions'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, toRaw, useId, useTemplateRef, watch } from 'vue'
+import { groupSessions, TEMP_WORKSPACE_KEY, workspaceKey, type SessionOrder, type useSessions } from '../sessions'
 import { resolvedTheme, toggleTheme } from '../theme'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{ store: ReturnType<typeof useSessions>; activeId?: string }>()
 const emit = defineEmits<{ open: [id: string, name: string] }>()
-const { sessions, loading, refreshing, loadError, authExpired, request, refresh } = props.store
+const { sessions, loading, refreshing, loadError, authExpired, request, refresh, order, saveOrder, resetOrder } = props.store
 const busy = ref(false)
 const closing = ref(new Set<string>())
 const closeError = ref('')
 const createError = ref('')
 const creating = ref(new Set<string>())
-const workspaces = computed(() => groupSessions(sessions.value))
+const workspaces = computed(() => groupSessions(sessions.value, order.value, { includeEmptyTemp: true }))
+
+const orderDirty = computed(() => order.value.workspaces.length > 0 || Object.keys(order.value.sessions).length > 0)
+const restoring = ref(false)
+const orderError = ref('')
+
+async function resetToTimeOrder() {
+  if (restoring.value) return
+  restoring.value = true
+  orderError.value = ''
+  try {
+    await resetOrder()
+  } catch (e) {
+    orderError.value = '恢复排序失败：' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    restoring.value = false
+  }
+}
+
+// —— 手动排序拖拽（Pointer Events）：仅在专用手柄上响应，touch-action 只禁手柄本身，
+// 列表其余区域保持原生滚动。组内拖拽重排会话、组间拖拽重排普通工作区（「临时工作区」
+// 不参与组间拖拽，永远沉底）。松手后把完整列表写入 order 并 PUT /api/order 多端同步。
+interface DragVisual {
+  kind: 'session' | 'workspace'
+  groupKey: string // 会话拖拽：所属工作区 key；工作区拖拽：''
+  id: string // 会话 ID 或工作区 key
+  index: number // 当前插入位置（相对渲染列表，-1 未计算）
+  active: boolean // 是否已越过触发阈值
+}
+const drag = ref<DragVisual | null>(null)
+let dragCleanup: (() => void) | null = null
+
+function startDrag(e: PointerEvent, target: { kind: 'session'; groupKey: string; id: string } | { kind: 'workspace'; key: string }) {
+  if (authExpired.value) return
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  const handle = e.currentTarget as HTMLElement
+  // reactive 而非 ref+裸对象：拖动过程中的 index/active 变更必须触发指示线重渲染。
+  const visual = reactive<DragVisual>(target.kind === 'session'
+    ? { kind: 'session', groupKey: target.groupKey, id: target.id, index: -1, active: false }
+    : { kind: 'workspace', groupKey: '', id: target.key, index: -1, active: false })
+  const listEl = target.kind === 'session'
+    ? handle.closest('ul')
+    : (handle.closest('section.workspace-group')?.parentElement ?? null)
+  let index = -1
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return
+    if (!visual.active) {
+      if (Math.abs(ev.clientY - e.clientY) < 6) return
+      visual.active = true
+      drag.value = visual
+    }
+    index = computeInsertIndex(listEl, ev.clientY, visual.kind)
+    visual.index = index
+  }
+  const cleanup = () => {
+    handle.removeEventListener('pointermove', onMove)
+    handle.removeEventListener('pointerup', onUp)
+    handle.removeEventListener('pointercancel', onCancel)
+    handle.removeEventListener('lostpointercapture', onLost)
+    drag.value = null
+    dragCleanup = null
+  }
+  const finish = (ev: PointerEvent, commit: boolean) => {
+    if (ev.pointerId !== e.pointerId) return
+    cleanup()
+    if (commit && visual.active && index >= 0) commitDrag(visual, index)
+  }
+  const onUp = (ev: PointerEvent) => finish(ev, true)
+  const onCancel = (ev: PointerEvent) => finish(ev, false)
+  const onLost = () => { if (dragCleanup === cleanup) cleanup() }
+  handle.addEventListener('pointermove', onMove)
+  handle.addEventListener('pointerup', onUp)
+  handle.addEventListener('pointercancel', onCancel)
+  handle.addEventListener('lostpointercapture', onLost)
+  dragCleanup = cleanup
+  handle.setPointerCapture(e.pointerId)
+}
+
+onBeforeUnmount(() => dragCleanup?.())
+
+// computeInsertIndex 按指针 Y 与各行中点比较，返回「插到第几行之前」（等于行数＝插到最后）。
+// 高度为 0 的行（折叠组等）跳过。
+function computeInsertIndex(listEl: HTMLElement | null, y: number, kind: 'session' | 'workspace'): number {
+  if (!listEl) return -1
+  const selector = kind === 'session' ? ':scope > li[data-session-id]' : ':scope > section[data-workspace-key]'
+  const rows = [...listEl.querySelectorAll(selector)].filter((el) =>
+    kind === 'session' || (el as HTMLElement).dataset.workspaceKey !== TEMP_WORKSPACE_KEY)
+  let index = rows.length
+  for (let i = 0; i < rows.length; i++) {
+    const rect = rows[i].getBoundingClientRect()
+    if (rect.height <= 0) continue
+    if (y < rect.top + rect.height / 2) {
+      index = i
+      break
+    }
+  }
+  return index
+}
+
+async function saveOrderSafe(next: SessionOrder) {
+  orderError.value = ''
+  try {
+    await saveOrder(next)
+  } catch (e) {
+    orderError.value = '保存排序失败：' + (e instanceof Error ? e.message : String(e))
+  }
+}
+
+function commitDrag(visual: DragVisual, index: number) {
+  if (visual.kind === 'session') {
+    const group = workspaces.value.find((g) => g.key === visual.groupKey)
+    if (!group) return
+    const ids = group.items.map((item) => item.id)
+    const from = ids.indexOf(visual.id)
+    if (from < 0) return
+    let to = index <= from ? index : index - 1
+    to = Math.max(0, Math.min(to, ids.length - 1))
+    if (to === from) return
+    ids.splice(from, 1)
+    ids.splice(to, 0, visual.id)
+    void saveOrderSafe({ workspaces: [...order.value.workspaces], sessions: { ...order.value.sessions, [visual.groupKey]: ids } })
+    return
+  }
+  const keys = workspaces.value.filter((g) => g.key !== TEMP_WORKSPACE_KEY).map((g) => g.key)
+  const from = keys.indexOf(visual.id)
+  if (from < 0) return
+  let to = index <= from ? index : index - 1
+  to = Math.max(0, Math.min(to, keys.length - 1))
+  if (to === from) return
+  keys.splice(from, 1)
+  keys.splice(to, 0, visual.id)
+  void saveOrderSafe({ workspaces: keys, sessions: { ...order.value.sessions } })
+}
+
+function sessionBefore(groupKey: string, i: number): boolean {
+  const d = drag.value
+  return d?.kind === 'session' && d.groupKey === groupKey && d.index === i
+}
+
+function sessionAfter(groupKey: string, count: number, i: number): boolean {
+  const d = drag.value
+  return d?.kind === 'session' && d.groupKey === groupKey && d.index >= count && i === count - 1
+}
+
+function isDraggingSession(groupKey: string, id: string): boolean {
+  const d = drag.value
+  return d?.kind === 'session' && d.groupKey === groupKey && d.id === id
+}
+
+function workspaceBefore(groupKey: string, i: number): boolean {
+  const d = drag.value
+  return d?.kind === 'workspace' && groupKey !== TEMP_WORKSPACE_KEY && d.index === i
+}
+
+// 工作区拖拽的「插到最后」指示：普通组数量（渲染列表去掉沉底的临时工作区）。
+function workspaceAfter(groupKey: string, i: number, total: number): boolean {
+  const d = drag.value
+  return d?.kind === 'workspace' && groupKey !== TEMP_WORKSPACE_KEY && d.index >= total - 1 && i === total - 2
+}
+
+function isDraggingWorkspace(key: string): boolean {
+  const d = drag.value
+  return d?.kind === 'workspace' && d.id === key
+}
 const collapsedKey = 'limpet.collapsed-workspaces'
 const collapsed = ref(new Set<string>())
 try {
@@ -528,7 +691,21 @@ function fmtTime(iso: string) {
       <p v-else-if="loading && !sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">加载中…</p>
       <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>
 
-      <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group min-w-0">
+      <div v-if="orderDirty" class="order-restore mx-1 mb-1 flex items-center gap-2 rounded-md px-2 py-1 text-xs">
+        <span class="min-w-0 flex-1 truncate text-[var(--limpet-muted)]">已自定义排序</span>
+        <button type="button" class="control shrink-0 text-xs" :disabled="restoring" @click="resetToTimeOrder">
+          恢复按时间排序
+        </button>
+      </div>
+      <p v-if="orderError" role="alert" class="wrap-anywhere p-2 text-xs text-[var(--limpet-danger)]">{{ orderError }}</p>
+
+      <section v-for="(group, index) in workspaces" :key="group.key" :data-workspace-key="group.key"
+        class="workspace-group min-w-0"
+        :class="{
+          'drag-dragging': isDraggingWorkspace(group.key),
+          'drag-target-before': workspaceBefore(group.key, index),
+          'drag-target-after': workspaceAfter(group.key, index, workspaces.length),
+        }">
         <div class="workspace-heading flex min-w-0 items-center gap-1">
           <h2 class="min-w-0 flex-1">
             <button type="button" class="workspace-toggle control w-full min-w-0 justify-start bg-transparent text-left text-[13px] font-medium hover:bg-[var(--limpet-hover)] active:bg-[var(--limpet-pressed)]"
@@ -541,6 +718,12 @@ function fmtTime(iso: string) {
               <AppIcon name="down" class="size-3 shrink-0 text-[var(--limpet-muted)] transition-transform duration-150" :class="{ '-rotate-90': collapsed.has(group.key) }" />
             </button>
           </h2>
+          <button v-if="group.key !== TEMP_WORKSPACE_KEY" type="button"
+            class="control drag-handle shrink-0 bg-transparent text-[var(--limpet-muted)]"
+            aria-label="拖动调整工作区顺序" title="拖动调整顺序"
+            @pointerdown="startDrag($event, { kind: 'workspace', key: group.key })">
+            <AppIcon name="grip" />
+          </button>
           <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-hover)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]"
             :aria-label="'在 ' + group.title + ' 新建会话'" :popovertarget="presetMenuId"
             :aria-busy="creating.has(group.key)" :disabled="creating.has(group.key)" @click="preparePresetMenu(group.key)">
@@ -549,8 +732,19 @@ function fmtTime(iso: string) {
           </button>
         </div>
         <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5 pl-4">
-          <li v-for="s in group.items" :key="s.id" class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
-            :class="{ 'session-row-active': activeId === s.id }">
+          <li v-for="(s, si) in group.items" :key="s.id" :data-session-id="s.id"
+            class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
+            :class="{
+              'session-row-active': activeId === s.id,
+              'drag-dragging': isDraggingSession(group.key, s.id),
+              'drag-target-before': sessionBefore(group.key, si),
+              'drag-target-after': sessionAfter(group.key, group.items.length, si),
+            }">
+            <button type="button" class="control drag-handle shrink-0 bg-transparent text-[var(--limpet-muted)]"
+              aria-label="拖动调整会话顺序" title="拖动调整顺序"
+              @pointerdown="startDrag($event, { kind: 'session', groupKey: group.key, id: s.id })">
+              <AppIcon name="grip" />
+            </button>
             <button
               class="session-entry grid min-h-10 min-w-0 flex-1 content-center gap-0.5 rounded-md px-2 py-1 text-left disabled:opacity-50"
               :aria-current="activeId === s.id ? 'true' : undefined"
@@ -782,6 +976,33 @@ function fmtTime(iso: string) {
 }
 .workspace-toggle:hover {
   color: var(--limpet-text);
+}
+/* 拖动手柄：touch-action 只禁手柄自身，列表其余区域保持原生滚动；
+   桌面端低透明度低调展示，移动端（粗指针）清晰可见。 */
+.drag-handle {
+  touch-action: none;
+  opacity: 0.4;
+}
+.drag-handle:is(:hover, :focus-visible, :active) {
+  opacity: 1;
+  color: var(--limpet-text);
+}
+@media (pointer: coarse) {
+  .drag-handle { opacity: 0.75; }
+}
+.drag-dragging {
+  opacity: 0.45;
+  user-select: none;
+}
+/* 插入位置指示线：用 inset box-shadow 画在目标行边缘，不改变布局高度。 */
+.drag-target-before {
+  box-shadow: inset 0 2px 0 0 var(--limpet-accent);
+}
+.drag-target-after {
+  box-shadow: inset 0 -2px 0 0 var(--limpet-accent);
+}
+.order-restore {
+  background: var(--limpet-hover-soft);
 }
 @media (pointer: coarse) {
   .session-entry { min-height: 2.75rem; }

@@ -78,6 +78,7 @@ onBeforeUnmount(() => {
       :sessions-error="store.loadError.value"
       :auth-expired="store.authExpired.value"
       :scrollback="store.scrollback.value"
+      :order="store.order.value"
       :load-scrollback="store.loadScrollback"
       :save-scrollback="store.saveScrollback"
       @refresh-sessions="store.refresh"

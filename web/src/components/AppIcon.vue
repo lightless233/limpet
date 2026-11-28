@@ -18,6 +18,7 @@ const paths = {
   folderPlus: 'M12 10v6M9 13h6M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z',
   sun: 'M12 3v2m0 14v2M5.6 5.6l1.4 1.4m10 10 1.4 1.4M3 12h2m14 0h2M5.6 18.4l1.4-1.4m10-10 1.4-1.4M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z',
   moon: 'M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z',
+  grip: 'M9 5.5h.01M9 12h.01M9 18.5h.01M15 5.5h.01M15 12h.01M15 18.5h.01',
 }
 
 defineProps<{ name: keyof typeof paths }>()

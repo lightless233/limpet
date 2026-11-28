@@ -41,7 +41,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
-import { groupSessions, MAX_SCROLLBACK, type ScrollbackResult, type SessionItem } from '../sessions'
+import { groupSessions, MAX_SCROLLBACK, type ScrollbackResult, type SessionItem, type SessionOrder } from '../sessions'
 import { resolvedTheme, setThemeMode, themeMode, type ResolvedTheme, type ThemeMode } from '../theme'
 import AppIcon from './AppIcon.vue'
 
@@ -49,13 +49,16 @@ const props = defineProps<{
   sessionId: string; sessionName: string; sessions: SessionItem[]
   sessionsLoading: boolean; sessionsError: string; authExpired: boolean
   scrollback: number
+  order: SessionOrder
   loadScrollback: () => Promise<number>
   saveScrollback: (lines: number) => Promise<ScrollbackResult>
 }>()
 const emit = defineEmits<{
   back: []; openSession: [id: string, name: string]; refreshSessions: []; sessionAuthExpired: []
 }>()
-const workspaces = computed(() => groupSessions(props.sessions))
+// 快速切换弹窗与侧边栏共用一套分组排序：「临时工作区」有会话时才出现且排最底
+// （不传 includeEmptyTemp，空分组不占位）。
+const workspaces = computed(() => groupSessions(props.sessions, props.order))
 
 // server 每 20s 发一帧 ping；超过这个时限没收到任何消息即判定连接已死（与服务端的 60s 判定对称）。
 const PING_TIMEOUT_MS = 60_000

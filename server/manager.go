@@ -73,6 +73,10 @@ type manager struct {
 	settingsPath string
 	settingsMu   sync.Mutex // serializes persistence and broadcast
 	scrollback   int        // guarded by mu
+
+	orderPath string
+	orderMu   sync.Mutex // serializes order.json persistence (independent of settings)
+	order     sessionOrder
 }
 
 func newManager(launch launchMode) (*manager, error) {
@@ -95,6 +99,7 @@ func newManager(launch launchMode) (*manager, error) {
 		exePath:      exe,
 		launch:       launch,
 		settingsPath: filepath.Join(base, "settings.json"),
+		orderPath:    filepath.Join(base, "order.json"),
 	}
 	for _, d := range []string{m.histDir, m.workersDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
@@ -107,6 +112,7 @@ func newManager(launch launchMode) (*manager, error) {
 	if err := m.loadSettings(); err != nil {
 		return nil, err
 	}
+	m.loadOrder()
 	m.recoverWorkers()
 	return m, nil
 }

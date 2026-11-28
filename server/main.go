@@ -132,6 +132,8 @@ func (m *manager) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/settings", m.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", m.handlePutSettings)
+	mux.HandleFunc("GET /api/order", m.handleGetOrder)
+	mux.HandleFunc("PUT /api/order", m.handlePutOrder)
 	mux.HandleFunc("POST /api/term", m.handleCreate)
 	mux.HandleFunc("GET /api/term", m.handleList)
 	mux.HandleFunc("GET /api/workspaces", m.handleWorkspaces)
