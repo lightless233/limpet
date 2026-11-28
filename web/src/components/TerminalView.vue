@@ -749,6 +749,9 @@ function reloadPage() {
       <span class="terminal-status shrink-0 text-xs" :data-status="status" role="status">{{ statusText[status] }}</span>
       <button v-if="status === 'error'" class="control shrink-0 text-xs" @click="connect()">重新连接</button>
       <button v-else-if="status === 'authExpired'" class="control shrink-0 text-xs" @click="reloadPage">刷新页面</button>
+      <button class="control shrink-0" aria-label="滚到底部" title="滚到底部" :disabled="!term" @click="scrollToBottom">
+        <AppIcon name="bottom" />
+      </button>
       <button class="control terminal-lock shrink-0" :aria-pressed="lockedWidth" aria-label="锁定原宽"
         :title="supportsLockWidth === false ? '旧版 worker 不支持锁定原宽' : '锁定原宽'"
         :disabled="status !== 'connected' || !supportsLockWidth" @click="toggleLockWidth">
@@ -794,9 +797,6 @@ function reloadPage() {
           <AppIcon name="add" />
         </button>
         <button class="control" @click="setFontSize()">重置字号</button>
-        <button class="control" aria-label="滚到底部" title="滚到底部" :disabled="!term" @click="scrollToBottom">
-          <AppIcon name="bottom" />
-        </button>
         <button class="control" aria-label="重载页面" title="重载页面" @click="reloadPage">
           <AppIcon name="refresh" />
         </button>
