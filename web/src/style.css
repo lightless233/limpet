@@ -14,6 +14,13 @@
   --limpet-accent: #34d399;
   --limpet-warn: #fbbf24;
   --limpet-danger: #f87171;
+  --limpet-on-accent: #121417;
+  --limpet-hover: rgb(255 255 255 / 5%);
+  --limpet-hover-soft: rgb(255 255 255 / 4%);
+  --limpet-divider: rgb(255 255 255 / 7%);
+  --limpet-heading: #b8c0cc;
+  --limpet-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  --limpet-backdrop: rgb(0 0 0 / 65%);
   --limpet-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", Menlo,
     Consolas, "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei",
     "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans Mono CJK SC", monospace;
@@ -22,6 +29,30 @@
   font-family: "Noto Sans SC Variable", "Noto Sans SC", "Noto Sans CJK SC", "Noto Sans",
     "PingFang SC", "HarmonyOS Sans SC", "MiSans", system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size-adjust: from-font;
+}
+
+/* 柔和护眼的浅色模式：偏暖灰纸感，低眩光，不用纯白画布或纯黑文字。 */
+:root[data-theme="light"] {
+  color-scheme: light;
+  accent-color: #0d9468;
+  scrollbar-color: #a9a396 #eae8e2;
+  --limpet-canvas: #f3f2ee;
+  --limpet-surface: #eae8e2;
+  --limpet-control: #e0ddd5;
+  --limpet-pressed: #d4d0c6;
+  --limpet-line: #d6d3ca;
+  --limpet-text: #1f242c;
+  --limpet-muted: #5c6573;
+  --limpet-accent: #0d9468;
+  --limpet-warn: #b45309;
+  --limpet-danger: #dc2626;
+  --limpet-on-accent: #f8faf9;
+  --limpet-hover: rgb(0 0 0 / 5%);
+  --limpet-hover-soft: rgb(0 0 0 / 4%);
+  --limpet-divider: rgb(0 0 0 / 8%);
+  --limpet-heading: #525c6b;
+  --limpet-shadow: 0 8px 24px rgb(31 36 44 / 16%);
+  --limpet-backdrop: rgb(31 36 44 / 45%);
 }
 
 @layer components {
@@ -43,8 +74,8 @@
 
   .control:disabled { opacity: 0.5; }
   .control:focus-visible { outline: 2px solid var(--limpet-accent); outline-offset: -2px; }
-  .control-primary, .control-primary:is(:hover, :active) { background: var(--limpet-accent); color: var(--limpet-canvas); }
-  .control-danger, .control-danger:is(:hover, :active) { background: var(--limpet-danger); color: var(--limpet-canvas); }
+  .control-primary, .control-primary:is(:hover, :active) { background: var(--limpet-accent); color: var(--limpet-on-accent); }
+  .control-danger, .control-danger:is(:hover, :active) { background: var(--limpet-danger); color: var(--limpet-on-accent); }
 
   @media (pointer: coarse) {
     .control { min-inline-size: 44px; min-block-size: 44px; }

@@ -4,6 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#121417" />
+    <script>
+      // 防首帧闪烁：在 CSS/JS 加载前按存储的主题模式提前设置 data-theme 与 theme-color。
+      // 规则与 src/theme.ts 保持一致：无存储/损坏值默认 dark，system 时查 matchMedia。
+      (function () {
+        try {
+          var mode = localStorage.getItem('limpet.theme')
+          var dark = mode === 'light' ? false
+            : mode === 'system' ? matchMedia('(prefers-color-scheme: dark)').matches
+            : true
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+          var meta = document.querySelector('meta[name="theme-color"]')
+          if (meta) meta.setAttribute('content', dark ? '#121417' : '#eae8e2')
+        } catch (e) { /* 存储不可用时保持默认 dark。 */ }
+      })()
+    </script>
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />

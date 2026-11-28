@@ -34,14 +34,15 @@ function detectRenderer(): 'dom' | 'webgl' {
 // 帧约定：二进制帧 = 终端 I/O；文本帧 = 控制 JSON（后端→ready/size/ping，前端→resize/pong）。
 // 接入由调用方给定的会话 ID 直接进行（会话已在列表中创建）。
 // 断线自动重连（spec 005）：网络抖动、切网、锁屏恢复、server 重启之后自动接回原会话。
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useTemplateRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useTemplateRef, watch } from 'vue'
 import { FitAddon } from '@xterm/addon-fit'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
-import { Terminal } from '@xterm/xterm'
+import { Terminal, type ITheme } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { groupSessions, MAX_SCROLLBACK, type ScrollbackResult, type SessionItem } from '../sessions'
+import { resolvedTheme, setThemeMode, themeMode, type ResolvedTheme, type ThemeMode } from '../theme'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
@@ -104,6 +105,41 @@ const storedFontSize = Number(localStorage.getItem('limpet.font-size'))
 const fontSize = ref(Number.isInteger(storedFontSize) && storedFontSize >= 10 && storedFontSize <= 18 ? storedFontSize : defaultFontSize)
 const viewportHeight = ref<number>()
 const viewportTop = ref(0)
+
+// 终端配色：深色沿用原值；浅色按纸底（#f3f2ee）专门调校 ANSI 16 色，
+// yellow/green/cyan/bright* 都用较深的饱和色，保证在浅灰底上清晰可读、不发荧光泛白。
+const DARK_TERMINAL_THEME: ITheme = {
+  background: '#121417', foreground: '#e6eaf0', cursor: '#34d399',
+  selectionBackground: '#60a5fa66',
+  black: '#242830', red: '#f87171', green: '#34d399', yellow: '#fbbf24',
+  blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#d8dde6',
+  brightBlack: '#80899a', brightRed: '#fca5a5', brightGreen: '#6ee7b7', brightYellow: '#fde68a',
+  brightBlue: '#93c5fd', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#f4f6fa',
+}
+const LIGHT_TERMINAL_THEME: ITheme = {
+  background: '#f3f2ee', foreground: '#1f242c', cursor: '#0d9468', cursorAccent: '#f8faf9',
+  selectionBackground: '#bfd8f2',
+  black: '#333a44', red: '#c13033', green: '#116329', yellow: '#8a6500',
+  blue: '#316dca', magenta: '#a03d9a', cyan: '#0b7a8b', white: '#8b929c',
+  brightBlack: '#68707c', brightRed: '#d4443a', brightGreen: '#1a7f37', brightYellow: '#a97a0b',
+  brightBlue: '#4383dd', brightMagenta: '#ad4bab', brightCyan: '#1188a0', brightWhite: '#565e6a',
+}
+
+function terminalTheme(theme: ResolvedTheme): ITheme {
+  return theme === 'light' ? LIGHT_TERMINAL_THEME : DARK_TERMINAL_THEME
+}
+
+// 主题切换实时联动：只换配色，不断连 WebSocket、不重建终端实例。
+watch(resolvedTheme, (theme) => {
+  if (term.value) term.value.options.theme = terminalTheme(theme)
+})
+
+// 终端工具弹窗里的三态主题控件。
+const THEME_MODES: { id: ThemeMode; label: string }[] = [
+  { id: 'dark', label: '深色' },
+  { id: 'light', label: '浅色' },
+  { id: 'system', label: '跟随系统' },
+]
 
 // 重连状态。gen 是接入代数：旧连接的异步核对与交付回调不得触及新实例。
 let gen = 0
@@ -361,14 +397,7 @@ function openTerminal(current: Connection, remoteSize?: Dimensions) {
     scrollback: current.scrollback === 0 ? MAX_SCROLLBACK : current.scrollback,
     fontFamily: getComputedStyle(host).getPropertyValue('--limpet-mono').trim(),
     fontSize: fontSize.value,
-    theme: {
-      background: '#121417', foreground: '#e6eaf0', cursor: '#34d399',
-      selectionBackground: '#60a5fa66',
-      black: '#242830', red: '#f87171', green: '#34d399', yellow: '#fbbf24',
-      blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#d8dde6',
-      brightBlack: '#80899a', brightRed: '#fca5a5', brightGreen: '#6ee7b7', brightYellow: '#fde68a',
-      brightBlue: '#93c5fd', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#f4f6fa',
-    },
+    theme: terminalTheme(resolvedTheme.value),
   })
   term.value = terminal
   try {
@@ -804,6 +833,15 @@ function reloadPage() {
         <button class="control" aria-label="重载页面" title="重载页面" @click="reloadPage">
           <AppIcon name="refresh" />
         </button>
+      </div>
+      <div class="mt-2 flex min-w-0 items-center gap-1 border-t border-[var(--limpet-line)] pt-2" role="group"
+        aria-label="界面主题">
+        <span class="shrink-0 text-sm text-[var(--limpet-muted)]">主题</span>
+        <div class="ml-auto flex min-w-0 gap-1">
+          <button v-for="m in THEME_MODES" :key="m.id" class="control text-xs"
+            :class="themeMode === m.id ? 'text-[var(--limpet-accent)]' : ''"
+            :aria-pressed="themeMode === m.id" @click="setThemeMode(m.id)">{{ m.label }}</button>
+        </div>
       </div>
       <form class="terminal-scrollback mt-2 grid gap-1 border-t border-[var(--limpet-line)] pt-2" novalidate
         @submit.prevent="submitScrollback">

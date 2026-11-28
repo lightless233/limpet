@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRaw, useId, useTemplateRef, watch } from 'vue'
 import { groupSessions, workspaceKey, type useSessions } from '../sessions'
+import { resolvedTheme, toggleTheme } from '../theme'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{ store: ReturnType<typeof useSessions>; activeId?: string }>()
@@ -497,6 +498,10 @@ function fmtTime(iso: string) {
         <button class="control" aria-label="刷新列表" title="刷新列表" :disabled="refreshing" @click="refresh()">
           <AppIcon name="refresh" :class="{ 'animate-spin': refreshing }" />
         </button>
+        <button class="control" :aria-label="resolvedTheme === 'dark' ? '切换浅色模式' : '切换深色模式'"
+          :title="resolvedTheme === 'dark' ? '切换浅色模式' : '切换深色模式'" @click="toggleTheme">
+          <AppIcon :name="resolvedTheme === 'dark' ? 'sun' : 'moon'" />
+        </button>
         <div class="inline-flex gap-px">
           <button class="control rounded-e-none text-sm" @click="openCreate()">
             <AppIcon name="add" /> 新建
@@ -526,7 +531,7 @@ function fmtTime(iso: string) {
       <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group min-w-0">
         <div class="workspace-heading flex min-w-0 items-center gap-1">
           <h2 class="min-w-0 flex-1">
-            <button type="button" class="workspace-toggle control w-full min-w-0 justify-start bg-transparent text-left text-[13px] font-medium hover:bg-[rgb(255_255_255/5%)] active:bg-[var(--limpet-pressed)]"
+            <button type="button" class="workspace-toggle control w-full min-w-0 justify-start bg-transparent text-left text-[13px] font-medium hover:bg-[var(--limpet-hover)] active:bg-[var(--limpet-pressed)]"
               :aria-expanded="!collapsed.has(group.key)" :aria-controls="workspaceListId + '-' + index"
               @click="setCollapsed(group.key, !collapsed.has(group.key))">
               <AppIcon :name="collapsed.has(group.key) ? 'folder' : 'folderOpen'" class="size-4 shrink-0 text-[var(--limpet-muted)]" />
@@ -536,7 +541,7 @@ function fmtTime(iso: string) {
               <AppIcon name="down" class="size-3 shrink-0 text-[var(--limpet-muted)] transition-transform duration-150" :class="{ '-rotate-90': collapsed.has(group.key) }" />
             </button>
           </h2>
-          <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[rgb(255_255_255/5%)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]"
+          <button type="button" class="control shrink-0 bg-transparent text-[var(--limpet-muted)] hover:bg-[var(--limpet-hover)] hover:text-[var(--limpet-text)] active:bg-[var(--limpet-pressed)]"
             :aria-label="'在 ' + group.title + ' 新建会话'" :popovertarget="presetMenuId"
             :aria-busy="creating.has(group.key)" :disabled="creating.has(group.key)" @click="preparePresetMenu(group.key)">
             <AppIcon v-if="creating.has(group.key)" name="refresh" class="animate-spin" />
@@ -758,7 +763,7 @@ function fmtTime(iso: string) {
 }
 
 .session-row { transition: background-color 120ms ease; }
-.session-row:hover { background: rgb(255 255 255 / 4%); }
+.session-row:hover { background: var(--limpet-hover-soft); }
 .session-row-active,
 .session-row-active:hover {
   background: var(--limpet-control);
@@ -770,10 +775,10 @@ function fmtTime(iso: string) {
 .workspace-group + .workspace-group {
   margin-top: 0.625rem;
   padding-top: 0.625rem;
-  border-top: 1px solid rgb(255 255 255 / 7%);
+  border-top: 1px solid var(--limpet-divider);
 }
 .workspace-toggle {
-  color: #b8c0cc;
+  color: var(--limpet-heading);
 }
 .workspace-toggle:hover {
   color: var(--limpet-text);
@@ -801,6 +806,27 @@ function fmtTime(iso: string) {
   background: rgb(251 191 36 / 14%);
   border-color: rgb(251 191 36 / 34%);
 }
+/* 浅色模式：换成较深的饱和文字色配浅色半透明底与边框，避免浅底浅字看不清。 */
+:root[data-theme="light"] .command-badge {
+  color: #475569;
+  background: rgb(100 116 139 / 14%);
+  border-color: rgb(100 116 139 / 32%);
+}
+:root[data-theme="light"] .command-badge:is([data-command="zsh"], [data-command="bash"], [data-command="sh"], [data-command="fish"]) {
+  color: #0369a1;
+  background: rgb(2 132 199 / 12%);
+  border-color: rgb(2 132 199 / 32%);
+}
+:root[data-theme="light"] .command-badge[data-command="codex"] {
+  color: #6d28d9;
+  background: rgb(124 58 237 / 12%);
+  border-color: rgb(124 58 237 / 30%);
+}
+:root[data-theme="light"] .command-badge[data-command="agy"] {
+  color: #92400e;
+  background: rgb(180 83 9 / 12%);
+  border-color: rgb(180 83 9 / 30%);
+}
 @media (hover: hover) and (pointer: fine) {
   .session-row-action { opacity: 0; }
   .session-row:is(:hover, :focus-within, .session-row-active) .session-row-action { opacity: 1; }
@@ -825,7 +851,7 @@ function fmtTime(iso: string) {
   border-radius: 0.5rem;
   background: var(--limpet-surface);
   color: var(--limpet-text);
-  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  box-shadow: var(--limpet-shadow);
 }
 @supports (position-area: block-end) {
   .preset-popover {
@@ -849,7 +875,7 @@ function fmtTime(iso: string) {
   font-size: 0.75rem;
   line-height: 1.4;
   word-break: break-all;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  box-shadow: var(--limpet-shadow);
 }
 @media (pointer: coarse) {
   .dir-entry { min-height: 2.75rem; }
@@ -867,5 +893,5 @@ function fmtTime(iso: string) {
 }
 
 .session-dialog:modal { overscroll-behavior: contain; }
-.session-dialog::backdrop { background: rgb(0 0 0 / 65%); overflow: hidden; overscroll-behavior: contain; }
+.session-dialog::backdrop { background: var(--limpet-backdrop); overflow: hidden; overscroll-behavior: contain; }
 </style>
