@@ -1,7 +1,7 @@
 # Spec 010：侧边栏工作区聚合、预设快捷新建与列表样式优化
 
 - 日期：2026-11-28
-- 状态：已修订（完成 GPT 预审修订，待复审）
+- 状态：已修订（完成 GPT 终轮复审前收口，待放行）
 - 来源：用户希望提升 Web 端高频使用体验：左侧会话列表按项目工作路径（`workspace`）聚合、支持从顶栏与项目组头快捷选择启动 `Shell` / `Codex`（带 `--yolo`）/ `Agy`（带 `--dangerously-skip-permissions`）、自动汇总历史使用过的工作区路径、新建后直接进入终端，并同步精简优化侧边栏会话行的展示密度；同时明确本期暂不做自定义命令、收藏/置顶项目、搜索过滤、快捷键切换及已结束/harness 对话续接。
 - 关联：延续并扩展 [Spec 003](003-2026-11-23-libghostty-worker-host.md)、[Spec 006](006-2026-11-26-local-cli-attach.md) 与 [Spec 007](007-2026-11-26-web-ui-pwa-and-lock-width.md)；保持 WebSocket 帧协议、Spec 009 回滚配置与录制 `.log`/`.meta` 格式不变。
 
@@ -9,7 +9,7 @@
 
 1. **Web 端预设快捷新建与历史目录直选**：支持在 Web 端按项目路径直接启动交互式 `Shell`、`codex --yolo` 或 `agy --dangerously-skip-permissions`，带目标路径/预设的新建自动按 `<目录名>-<命令名>` 命名并去重，建完立即打开进入终端。
 2. **侧边栏工作区（`workspace`）聚合与样式瘦身**：将同一工作路径下的会话聚合为可折叠的工作区组（默认展示项目名、组头 `+` 一键秒建），移除每行冗余的路径文字，采用更清晰的紧凑两行卡片与悬停/触控自适应操作按钮。
-3. **跨 `direct` 与 `systemd-run` 的一致行为**：无论服务以开发环境还是正式 `systemd --user` 运行，预设 CLI 均能完整解析用户登录 `PATH` 而不触发交互式 Shell 别名自递归，缺失命令及时报错，并在 server 重启恢复后保留完整的 `cwd` 与 `cmd`。
+3. **跨 `direct` 与 `systemd-run` 的一致行为**：无论服务以开发环境还是正式 `systemd --user` 运行，预设 CLI 均能完整解析用户登录 `PATH` 而不触发交互式 Shell 别名自递归，缺失命令或就绪前失败及时报错回滚，并在 server 重启恢复后保留完整的 `cwd` 与 `cmd`。
 
 ## 一、后端预设启动、目录校验与 HTTP API 契约
 
@@ -30,10 +30,11 @@
   - `-lc 'exec "$@"'` 仅支持 POSIX 位置参数语法的登录 Shell（`sh`、`bash`、`zsh`、`dash`、`ksh`）。若解析出的登录 Shell 不在此支持集合（如 `fish`，其位置参数与语法不兼容 `"$@"`），直接返回 `500` 与明确错误信息，不尝试启动。
   - 目标命令（`codex` / `agy`）必须可由登录 Shell 的登录启动文件（如 `.zshenv`、`.zprofile`、`.zlogin`、`.bash_profile`、`.profile`）纳入 `PATH`，而非仅在交互式 `.zshrc` 中初始化；采用 `-lc` 可跳过交互式 `.zshrc` 别名（避免触发 `alias codex='limpet codex'` 导致 worker 套娃），且 `exec` 替换自身不残留多余壳进程。
   - **严禁**把工作路径 `cwd` 拼接进任何 Shell 命令字符串，工作目录仅通过子进程 `cmd.Dir` 设置。
-- **目标可执行预检与状态判定**：
-  - 启动 `"codex"` 或 `"agy"` 前，server 在 `workerEnv()`（或等价环境）及目标 `cmd.Dir = cwd` 下执行一次有界（`2s` 超时）登录 Shell 预检（如 `shell -lc 'p=$(command -v -- "$1") && [ -n "$p" ] && [ -x "$p" ]' shell <bin>`）。
+- **目标可执行预检与快速退出边界**：
+  - 启动 `"codex"` 或 `"agy"` 前，server 在 `workerEnv()`（或等价运行环境）及目标 `cmd.Dir = cwd` 下执行一次有界（`2s` 超时）登录 Shell 预检（如 `shell -lc 'p=$(command -v -- "$1") && [ -n "$p" ] && [ -x "$p" ]' shell <bin>`）。
   - 若目标命令缺失或不可执行，**不拉起 worker**（也不空等 `5s` 就绪超时，更不返回假 `200`），`POST /api/term` 立即返回 `500 Internal Server Error` 与明确错误提示（如 `未在登录环境中找到 codex`）。
-  - 区分边界：目标命令缺失在预检阶段直接拦截报错；可执行文件存在且拉起成功后若目标自身快速退出，按正常会话退出语义（WS `1000`）从活跃列表移除，不退回 Shell。
+  - 若目标命令有效且拉起 worker 后在首次 `probe` 就绪前即退出（`ending` / worker 退出导致无法通过就绪探测），`POST /api/term` 同样返回 `500` 明确失败并清理残留，**不**登记活跃会话、**不**返回 `200`（此时尚未建立任何 WebSocket 连接，不适用 WS `1000`）。
+  - 仅在会话通过就绪探测并有 viewer 接入后才进入运行期退出语义：之后目标进程退出向已接入 viewer 发送 WS 关闭码 `1000`（`ended`）并从活跃列表移除，不退回 Shell。
 - 非枚举预设值一律返回 `400 Bad Request` `{"error": "..."}`，不启动任何进程。
 
 ### 1.2 `cwd` 规范化与校验
@@ -55,18 +56,26 @@
   - 在持有 `m.mu` 期间若基准名已被活跃或创建中会话占用，自动依次追加 `-2`、`-3`…（截断保证总长不超过 `100` rune，复用 `discover` 的后缀长度规则）直至可用并立即占位 `m.creating`，保证组头一键连点新建绝不因重名冲突失败。
 - 前端顶栏新建弹窗与工作区组头 `+` 一键新建提交 `POST /api/term` 时，始终显式传递 `preset`（包括 `"shell"`、`"codex"`、`"agy"`）。
 
-### 1.4 显式 `--web-launch` 标记、失败清理与恢复元数据
+### 1.4 显式 `LIMPET_WEB_LAUNCH=1` 标记、差异化失败清理与注册表顺序
 
-- **显式启动标记与独立契约**：
-  - Web `spawnWorkerDirect` 与 `spawnWorkerSystemdRun` 统一以 `limpet-server worker <uuid> --web-launch` 启动 worker（CLI 的 fd 3 `LIMPET_WORKER_CONFIG` 路径及无参数调用保持原契约不变）。
+- **显式环境变量标记与命令行兼容性**：
+  - Web `spawnWorkerDirect` 与 `spawnWorkerSystemdRun` 保持 worker 命令行参数严格为 `limpet-server worker <uuid>`（不改变既有进程匹配格式与 `TestMain` 入口契约），改由内部环境变量 **`LIMPET_WEB_LAUNCH=1`** 显式标识 Web 启动模式（与既有 `LIMPET_WORKER_CONFIG=1` 机制对称；`direct` 路径在继承环境附加 `LIMPET_WEB_LAUNCH=1`，`systemd-run` 路径通过 `--setenv=LIMPET_WEB_LAUNCH=1` 传入）。
+  - worker 在 `startSession()` 拉起子进程 PTY 时使用 `cliEnv()`（剥离除 `LIMPET_HOME` 外的全部 `LIMPET_*` 变量，含 `LIMPET_WEB_LAUNCH`）+ `TERM=xterm-256color`，确保内部启动标记绝不泄漏进用户 Shell / Codex / Agy 进程。
+  - CLI 的 fd 3 `LIMPET_WORKER_CONFIG=1` 路径及无标记的传统调用保持原契约不变。
+- **严格失败关闭（Fail-Closed）与启动清理顺序**：
   - 在 `manager.create()` 拉起 worker 之前，先向 `0700` 的 `workers/` 目录原子写入 `0600` 的 `<uuid>.launch.json`（包含 `argv`、`cwd`、`cmd`、`name`）。
-  - **严格失败关闭（Fail-Closed）**：带 `--web-launch` 的 worker 必须成功读取、立即删除（`os.Remove`）并校验 `<uuid>.launch.json` 合法后才能启动 PTY；若该文件缺失、不可读、JSON 损坏或字段不合法，worker 必须记录错误并以非零退出码终止，**绝不允许**降级启动默认 Shell，也不得发布可接入的就绪 socket。
-  - **失败清理顺序**：`manager.create()` 在 spawn 失败或等待就绪超时时，必须**先调用 `killHard()` 终止本次 worker 进程或 systemd 临时单元，再删除 `<uuid>.launch.json`**（防止迟到的 worker 在文件被提前删除后出现竞态）。
+  - 检测到 `LIMPET_WEB_LAUNCH=1` 的 worker 必须成功读取、立即删除（`os.Remove`）并校验 `<uuid>.launch.json` 合法后才能启动 PTY；若该文件缺失、不可读、JSON 损坏或字段不合法，worker 必须记录错误并以非零退出码终止，**绝不允许**降级启动默认 Shell，也不得发布可接入的就绪 socket。
+  - **差异化失败清理**：`manager.create()` 按启动结果区分清理步骤，杜绝向未成功创建的句柄解引用或与迟到 worker 竞态：
+    1. `direct` 下 `cmd.Start()` 失败（`killHard == nil`，确认未启动进程）：直接删除 `<uuid>.launch.json`；
+    2. `systemd-run` 返回错误（`killHard == nil`，临时单元提交状态不明）：先按本次 `uuid` 尽力执行 `systemctl --user stop limpet-worker-<uuid>.service` 收尾，再删除 `<uuid>.launch.json`；
+    3. 已返回 `killHard` 但就绪等待超时或就绪前退出：先调用 `killHard()` 终止本次 worker 进程或 systemd 单元，再删除 `<uuid>.launch.json`（及残留 socket）。
   - **崩溃残留边界**：若 `limpet-server` 在原子写入 `.launch.json` 之后、拉起 worker 之前被 `SIGKILL` 强杀，残留的 `.launch.json` 不会被 `scanWorkers`（仅扫描 `*.sock`）识别为会话，也不会触发任何自动执行；定期清扫孤儿 `.launch.json` 不在本期范围。
-  - **严格保留 `s.cli == false`**：由 `--web-launch` 启动的 Web 会话保持 `s.cli == false` 且无需等待首个 viewer 即可 `probe` 就绪，保持既有 Web 多视图协同 resize 语义不变。
-- **`probe` 显式 `cmd` 与注册表持久化失败回滚**：
+  - **严格保留 `s.cli == false`**：由 `LIMPET_WEB_LAUNCH=1` 启动的 Web 会话保持 `s.cli == false` 且无需等待首个 viewer 即可 `probe` 就绪，保持既有 Web 多视图协同 resize 语义不变。
+- **`probe` 显式 `cmd` 与注册表发布/回滚顺序**：
   - worker 从 `.launch.json` 保存显式 `name`、`cwd`、`cmd` 并由 `probe` 握手应答如实返回 `ack.Name`、`ack.Cwd`、`ack.Cmd`（严禁从 `[shell, "-lc", ...]` 的 `argv[0]` 推导而把 `codex`/`agy` 误报为 `zsh`）。
-  - `manager.create()` 必须在写入 `m.registry` 后检查 `m.saveRegistry()` 的返回错误：若落盘失败，在 `m.mu` 下撤销 `m.sessions[id]` 与 `m.registry[id]`，关闭本次新拉起的 worker（`killWorker` 回退 `killHard`），并向调用方返回 `500 Internal Server Error`。
+  - **先落盘后发布、`pendingIDs` 全程遮蔽**：`manager.create()` 在 worker `probe` 就绪后，**保持 `m.pendingIDs[id]` 占位期间**写入 `m.registry[id]` 并执行 `m.saveRegistry()`；
+    - 仅当 `saveRegistry()` 返回 `nil` 时，在 `m.mu` 下写入 `m.sessions[id] = h` 并删除 `m.pendingIDs[id]` 对外发布；
+    - 若 `saveRegistry()` 失败，在 `m.mu` 下撤销 `m.registry[id]`，**继续保持 `m.pendingIDs[id]` 占位**直到终止新拉起的 worker 并确认其 socket 已消失或不可拨号（`killWorker` 后等待 socket 清理/失效，超时则回退 `killHard()` 并移除 socket，**不能**仅凭收到 `killWorker` 应答就视为已关闭），全部收尾完成后才释放 `pendingIDs[id]` 并返回 `500 Internal Server Error`，从而彻底防止并发 `GET /api/term` 在关闭窗口重新发现并登记半死 worker。
   - `discover()` 重启恢复活 worker 时：若 `sessions.json` 中已有该会话登记的名称（含用户重命名结果），优先保留 `reg.Name`；当 `reg.Name`/`reg.Cwd`/`reg.Cmd` 缺失时用 `probe` 回报的对应字段补齐并持久化。
 
 ### 1.5 `POST /api/term` 返回体与历史工作区接口 `GET /api/workspaces`
@@ -155,18 +164,19 @@
 
 ### 5.1 后端 Go 单测（`go test -race -count=1 ./server`）
 
-1. **预设、登录 Shell 语法、PATH 隔离与可执行预检**：
+1. **预设、登录 Shell 语法、PATH 隔离、预检与就绪前退出边界**：
    - 验证 `""`/`"shell"`、`"codex"`、`"agy"` 均合法并产出预期 `cmd` 与 `argv`（`codex --yolo` 与 `agy --dangerously-skip-permissions` 走 `shell -lc 'exec "$@"'`），未知 `preset` 返回 `400`，`cwd` 仅通过 `cmd.Dir` 传递；
    - 以精简基础 `PATH` + 仅在登录启动文件暴露目标 shim + 隔离 `.zshrc` 内置陷阱别名为条件，验证端到端真实按 `--yolo`/`--dangerously-skip-permissions` 启动且不触发 `.zshrc` 别名；
-   - 验证不支持的登录 Shell（如 `fish`）与目标命令缺失时，在拉起 worker 前立即返回 `500` 错误且不等待 5s 超时也不残留 worker。
+   - 验证不支持的登录 Shell（如 `fish`）与目标命令缺失时，在拉起 worker 前立即返回 `500` 错误且不等待 5s 超时也不残留 worker；
+   - **就绪前快速退出边界**：验证使用有效可执行 shim（拉起后立即正常退出 `exit 0`）在首次 `probe` 就绪前结束时，`POST /api/term` 返回 `500` 且不留下已登记会话或假 `200`。
 2. **`cwd` 校验与规范化**：空/空白规范为 `$HOME`、`~` 与 `~/sub` 正确展开并 Clean、保留合法目录空格；相对路径、不存在路径、普通文件路径、含 NUL 字节路径一律 `400`。
 3. **自动命名与兼容性**：
    - 验证空体或 `{}` 旧版 `POST /api/term` 保持 UUID 显示名；
    - 验证显式传 `preset` 或 `cwd` 且空 `name` 时在项目目录生成 `<dir>-<cmd>`、主目录生成 `<cmd>`，并发/连续创建自动去重 `-2`/`-3`（含超 `100` rune 截断），显式重名仍返回 `409`。
-4. **`--web-launch` 严格失败关闭、清理顺序、重启恢复与 `saveRegistry` 回滚**：
-   - 验证 `--web-launch` 缺失、损坏或非法 `.launch.json` 时 worker 直接报错退出，绝不回退启动默认 Shell 或发布就绪 socket；
-   - 验证 `.launch.json` 以 `0600` 创建、读取即删，启动超时/失败时按「先 `killHard` 再删 `.launch.json`」清理，Web 会话保持 `s.cli == false` 且无 viewer 即可就绪；
-   - 验证 `saveRegistry()` 写入失败时回滚登记并关闭新拉起的 worker；
+4. **`LIMPET_WEB_LAUNCH=1` 严格失败关闭、清理顺序、重启恢复与 `saveRegistry` 回滚**：
+   - 验证 `LIMPET_WEB_LAUNCH=1` 下缺失、损坏或非法 `.launch.json` 时 worker 直接非零退出（绝不启动默认 Shell 或发布就绪 socket），子进程 PTY 环境中不包含 `LIMPET_WEB_LAUNCH`，且命令行维持 `worker <uuid>` 不变；
+   - 验证 `.launch.json` 以 `0600` 创建、读取即删，不同失败路径（`direct` 启动失败、`systemd-run` 提交失败、就绪超时）均按顺序清理且不残留 `.launch.json`，Web 会话保持 `s.cli == false` 且无 viewer 即可就绪；
+   - 验证 `saveRegistry()` 写入失败时在释放 `pendingIDs` 前阻止并发 `scanWorkers` 重新发现该 worker，待确认 worker/socket 已关闭清理后再释放 `pendingIDs` 并返回 `500`；
    - 验证 `sessions.json` 中缺失某活 `codex`/`agy` 条目时，重启恢复（`recoverWorkers`）可从 `probe` 准确找回 `cwd` 与显式 `cmd`（如 `"codex"`/`"agy"` 而非 `"zsh"`）；同时当 `sessions.json` 中已存在用户重命名名称时予以保留。
 5. **`GET /api/workspaces`**：验证汇总存在 `cwd` 的历史/活跃记录、跳过缺失 `cwd` 的旧记录、过滤 `$HOME` 与已删除目录、去重并按最近 `createdAt` 倒序（同时间按路径升序）、输出 `~/` 缩写，同时 `GET /api/term` 保持既有数组结构。
 
@@ -176,7 +186,7 @@
 
 1. **构建与既有回归基准（`LIMPET_WORKER_LAUNCH=direct`）**：
    - `cd web && pnpm build`（含 `vue-tsc -b`）通过，`go build -tags limpet_embed` 成功；
-   - 传绝对路径 `SERVER_BIN`、专用 `LIMPET_HOME`、空闲 `PORT` 与 `LIMPET_WORKER_LAUNCH=direct` 运行 `tests/limet-reconnect-browser-test.mjs`，确认既有 **10/10 场景**全部通过；U2 未改 `server/` 时可复用 U1 Go `-race` 基准。
+   - 传绝对路径 `SERVER_BIN`、专用 `LIMPET_HOME`、空闲 `PORT` 与 `LIMPET_WORKER_LAUNCH=direct` 运行 `tests/limet-reconnect-browser-test.mjs`，确认既有 **10/10 场景**（含 S8 按 `(^|/)<bin> worker <uuid>$` 精确匹配 PID）全部通过；U2 未改 `server/` 时可复用 U1 Go `-race` 基准。
 2. **工作区聚合、消歧、折叠与 S10 DOM 兼容**：
    - 创建属于两个不同目录（含一对同名叶目录 `a/demo` 与 `b/demo`）、`~` 及旧无 `cwd` 会话，验证分组归属、同名父级消歧、「主目录」在后、点击折叠/刷新后记忆、打开/新建自动展开、`#quick-switch` 同步分组；
    - 验证会话行紧凑两行无重复路径、显示命令徽章、桌面细指针下行尾按钮静态 `opacity: 0` 但无 `pointer-events: none` 且在 hover/focus-within 下可点击（保留精确 `新建`、会话 `<li>`、`title="重命名"`、`title="关闭"`）。
