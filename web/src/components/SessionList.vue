@@ -350,10 +350,10 @@ function fmtTime(iso: string) {
       <p v-else-if="loading && !sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">加载中…</p>
       <p v-else-if="!sessions.length" class="p-2 text-sm text-[var(--limpet-muted)]">还没有会话</p>
 
-      <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group mb-2 min-w-0">
+      <section v-for="(group, index) in workspaces" :key="group.key" class="workspace-group mb-3 min-w-0">
         <div class="workspace-heading flex min-w-0 items-center gap-1">
           <h2 class="min-w-0 flex-1">
-            <button type="button" class="control w-full min-w-0 justify-start bg-transparent text-left text-xs"
+            <button type="button" class="control w-full min-w-0 justify-start bg-transparent text-left text-xs text-[var(--limpet-muted)] hover:text-[var(--limpet-text)]"
               :aria-expanded="!collapsed.has(group.key)" :aria-controls="workspaceListId + '-' + index"
               @click="setCollapsed(group.key, !collapsed.has(group.key))">
               <AppIcon name="down" class="size-3 shrink-0 text-[var(--limpet-muted)]" :class="{ '-rotate-90': collapsed.has(group.key) }" />
@@ -369,7 +369,7 @@ function fmtTime(iso: string) {
             <AppIcon v-else name="add" />
           </button>
         </div>
-        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5">
+        <ul v-show="!collapsed.has(group.key)" :id="workspaceListId + '-' + index" class="grid min-w-0 gap-0.5 pl-3.5">
           <li v-for="s in group.items" :key="s.id" class="session-row flex min-w-0 items-center gap-1 rounded-md px-1"
             :class="{ 'session-row-active': activeId === s.id }">
             <button
@@ -384,7 +384,7 @@ function fmtTime(iso: string) {
                 <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ s.name }}</span>
               </span>
               <span class="flex min-w-0 items-center gap-1.5 pl-3.5 text-xs text-[var(--limpet-muted)]">
-                <span v-if="s.cmd" :data-command="s.cmd" class="command-badge min-w-0 max-w-[6rem] truncate rounded border px-1 [font-family:var(--limpet-mono)]">{{ s.cmd }}</span>
+                <span v-if="s.cmd" :data-command="s.cmd" class="command-badge min-w-0 max-w-[6rem] truncate rounded border px-1.5 font-medium [font-family:var(--limpet-mono)]">{{ s.cmd }}</span>
                 <time :datetime="s.created" class="shrink-0">{{ fmtTime(s.created) }}</time>
               </span>
             </button>
@@ -479,22 +479,27 @@ function fmtTime(iso: string) {
   box-shadow: inset 2px 0 0 var(--limpet-accent);
 }
 .workspace-heading {
-  border-bottom: 1px solid var(--limpet-line);
-  margin-bottom: 0.25rem;
+  margin-bottom: 0.125rem;
 }
 .command-badge {
-  border-color: var(--limpet-line);
-  background: var(--limpet-canvas);
+  color: #cbd5e1;
+  border-color: rgb(148 163 184 / 30%);
+  background: rgb(148 163 184 / 12%);
+}
+.command-badge:is([data-command="zsh"], [data-command="bash"], [data-command="sh"], [data-command="fish"]) {
+  color: #7dd3fc;
+  background: rgb(56 189 248 / 14%);
+  border-color: rgb(56 189 248 / 34%);
 }
 .command-badge[data-command="codex"] {
-  color: #b4abd1;
-  background: #232031;
-  border-color: #322b42;
+  color: #c4b5fd;
+  background: rgb(167 139 250 / 16%);
+  border-color: rgb(167 139 250 / 36%);
 }
 .command-badge[data-command="agy"] {
-  color: #a5c4ba;
-  background: #1c2928;
-  border-color: #2a3b38;
+  color: #fcd34d;
+  background: rgb(251 191 36 / 14%);
+  border-color: rgb(251 191 36 / 34%);
 }
 @media (hover: hover) and (pointer: fine) {
   .session-row-action { opacity: 0; }
