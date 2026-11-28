@@ -136,6 +136,15 @@
   color: var(--limpet-text);
 }
 
+.terminal-tools {
+  width: 21rem;
+}
+
+.terminal-scrollback input,
+.terminal-scrollback .control {
+  min-height: 2.75rem;
+}
+
 .terminal-switcher {
   width: min(20rem, 85vw);
   left: max(0.5rem, env(safe-area-inset-left));

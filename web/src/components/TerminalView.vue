@@ -41,12 +41,15 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
-import type { SessionItem } from '../sessions'
+import { MAX_SCROLLBACK, type ScrollbackResult, type SessionItem } from '../sessions'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
   sessionId: string; sessionName: string; sessions: SessionItem[]
   sessionsLoading: boolean; sessionsError: string; authExpired: boolean
+  scrollback: number
+  loadScrollback: () => Promise<number>
+  saveScrollback: (lines: number) => Promise<ScrollbackResult>
 }>()
 const emit = defineEmits<{
   back: []; openSession: [id: string, name: string]; refreshSessions: []; sessionAuthExpired: []
@@ -56,6 +59,7 @@ const emit = defineEmits<{
 const PING_TIMEOUT_MS = 60_000
 const BACKOFF_START_MS = 1000
 const BACKOFF_MAX_MS = 30_000
+const WRITE_HIGH_WATERMARK = 16 * 1024 * 1024
 
 const terminalFrame = useTemplateRef('terminalFrame')
 const terminalHost = useTemplateRef('terminalHost')
@@ -64,6 +68,13 @@ const horizontalRange = ref(0)
 const composerInput = useTemplateRef('composerInput')
 const term = shallowRef<Terminal>()
 const fatalError = ref('')
+const scrollbackInput = useTemplateRef('scrollbackInput')
+const scrollbackDraft = ref(String(props.scrollback))
+const scrollbackDirty = ref(false)
+const scrollbackSaving = ref(false)
+const scrollbackInvalid = ref(false)
+const scrollbackError = ref('')
+const scrollbackFeedback = ref('')
 
 // reconnecting 包含退避等待。ended / authExpired 是终态，不再重连。
 type Status = 'connecting' | 'reconnecting' | 'connected' | 'ended' | 'authExpired' | 'error'
@@ -74,6 +85,8 @@ type Connection = {
   generation: number
   socket: WebSocket
   queue: Delivery[]
+  writingBytes: number
+  scrollback: number
   draining: boolean
   resizing: boolean
   fit: FitAddon
@@ -142,7 +155,7 @@ function disposeConnection() {
   }
 }
 
-function connect() {
+async function connect(confirmedScrollback?: number) {
   clearTimeout(reconnectTimer)
   reconnectTimer = 0
   waitingToReconnect = false
@@ -153,10 +166,18 @@ function connect() {
   lockedWidth.value = false
   lastMsgAt = 0
 
+  const attempt = gen
+  const latestScrollback = await props.loadScrollback()
+  if (unmounted || attempt !== gen) return
+  if (props.authExpired) {
+    status.value = 'authExpired'
+    return
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const socket = new WebSocket(`${proto}//${location.host}/api/ws/term/${encodeURIComponent(props.sessionId)}`)
   const current: Connection = {
     generation: gen, socket, queue: [], draining: false, resizing: false, fit: new FitAddon(), fitFrame: 0,
+    writingBytes: 0, scrollback: confirmedScrollback ?? latestScrollback,
   }
   connection = current
   socket.binaryType = 'arraybuffer'
@@ -278,10 +299,16 @@ function drain(current: Connection) {
   current.draining = true
   let consumed = 0
   try {
-    while (consumed < current.queue.length && !current.resizing) {
+    while (consumed < current.queue.length && !current.resizing && current.writingBytes < WRITE_HIGH_WATERMARK) {
       const event = current.queue[consumed++]!
       if (event instanceof Uint8Array) {
-        terminal.write(event)
+        const bytes = event.byteLength
+        current.writingBytes += bytes
+        terminal.write(event, () => {
+          if (current.generation !== gen || term.value !== terminal) return
+          current.writingBytes -= bytes
+          drain(current)
+        })
         continue
       }
 
@@ -330,7 +357,7 @@ function openTerminal(current: Connection, remoteSize?: Dimensions) {
   const terminal = new Terminal({
     ...(lockedWidth.value ? remoteSize : undefined),
     allowProposedApi: true,
-    scrollback: 10000,
+    scrollback: current.scrollback === 0 ? MAX_SCROLLBACK : current.scrollback,
     fontFamily: getComputedStyle(host).getPropertyValue('--limpet-mono').trim(),
     fontSize: fontSize.value,
     theme: {
@@ -401,10 +428,63 @@ function openTerminal(current: Connection, remoteSize?: Dimensions) {
   void nextTick(() => {
     const focus = document.activeElement
     if (connection === current && status.value === 'connected' &&
-        focus !== composerInput.value && !focus?.closest('dialog[open]')) {
+        focus !== composerInput.value && !focus?.closest('dialog[open], .terminal-popover, button[popovertarget]') &&
+        !document.querySelector('.terminal-popover:popover-open')) {
       terminal.focus()
     }
   })
+}
+
+async function refreshTerminalTools(event: ToggleEvent) {
+  if (event.newState !== 'open') return
+  if (!scrollbackDirty.value) scrollbackDraft.value = String(props.scrollback)
+  const lines = await props.loadScrollback()
+  if (!scrollbackDirty.value) scrollbackDraft.value = String(lines)
+}
+
+function editScrollback() {
+  const input = scrollbackInput.value!
+  scrollbackDraft.value = input.value
+  scrollbackDirty.value = true
+  scrollbackInvalid.value = false
+  scrollbackError.value = ''
+  scrollbackFeedback.value = ''
+}
+
+async function submitScrollback() {
+  if (scrollbackSaving.value) return
+  const input = scrollbackInput.value!
+  const draft = input.value
+  const lines = input.valueAsNumber
+  scrollbackFeedback.value = ''
+  if (draft === '' || input.validity.badInput || !Number.isInteger(lines) || lines < 0 || lines > MAX_SCROLLBACK) {
+    scrollbackInvalid.value = true
+    scrollbackError.value = '请输入 0 到 1000000 之间的整数'
+    input.focus()
+    return
+  }
+  scrollbackError.value = ''
+  scrollbackInvalid.value = false
+  scrollbackSaving.value = true
+  try {
+    const result = await props.saveScrollback(lines)
+    if (unmounted) return
+    if (scrollbackDraft.value === draft) {
+      scrollbackDraft.value = String(result.scrollback)
+      scrollbackDirty.value = false
+    }
+    const details: string[] = []
+    if (result.unsupported > 0) details.push(`${result.unsupported} 个旧版会话需新建后生效`)
+    if (result.failed > 0) details.push(`${result.failed} 个会话未同步`)
+    scrollbackFeedback.value = details.length ? `已保存（${details.join('、')}）` : '已保存'
+    if (connection && connection.scrollback !== result.scrollback && status.value !== 'ended') {
+      void connect(result.scrollback)
+    }
+  } catch (error) {
+    scrollbackError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    scrollbackSaving.value = false
+  }
 }
 
 // 输入闸门：WS 打开 + 已收到 ready。接入中与重连中的按键直接丢弃，不缓冲。
@@ -667,7 +747,7 @@ function reloadPage() {
         <span class="min-w-0 truncate font-semibold">{{ sessionName }}</span><AppIcon name="down" class="shrink-0" />
       </button>
       <span class="terminal-status shrink-0 text-xs" :data-status="status" role="status">{{ statusText[status] }}</span>
-      <button v-if="status === 'error'" class="control shrink-0 text-xs" @click="connect">重新连接</button>
+      <button v-if="status === 'error'" class="control shrink-0 text-xs" @click="connect()">重新连接</button>
       <button v-else-if="status === 'authExpired'" class="control shrink-0 text-xs" @click="reloadPage">刷新页面</button>
       <button class="control terminal-lock shrink-0" :aria-pressed="lockedWidth" aria-label="锁定原宽"
         :title="supportsLockWidth === false ? '旧版 worker 不支持锁定原宽' : '锁定原宽'"
@@ -703,7 +783,8 @@ function reloadPage() {
       </button>
     </nav>
 
-    <div id="terminal-tools" class="terminal-popover terminal-tools" aria-label="终端工具" popover>
+    <div id="terminal-tools" class="terminal-popover terminal-tools" aria-label="终端工具" popover
+      @toggle="refreshTerminalTools">
       <div class="flex items-center gap-1 text-sm">
         <button class="control" aria-label="减小字号" title="减小字号" :disabled="fontSize <= 10" @click="setFontSize(fontSize - 1)">
           <AppIcon name="minus" />
@@ -720,6 +801,30 @@ function reloadPage() {
           <AppIcon name="refresh" />
         </button>
       </div>
+      <form class="terminal-scrollback mt-2 grid gap-1 border-t border-[var(--limpet-line)] pt-2" novalidate
+        @submit.prevent="submitScrollback">
+        <label for="terminal-scrollback" class="text-sm">回滚行数</label>
+        <div class="flex min-w-0 gap-2">
+          <input id="terminal-scrollback" ref="scrollbackInput" type="number" inputmode="numeric" min="0"
+            :max="MAX_SCROLLBACK" step="1" required
+            class="min-w-0 flex-1 rounded-md border border-[var(--limpet-line)] bg-[var(--limpet-canvas)] px-2 text-base tabular-nums"
+            :value="scrollbackDraft" :aria-invalid="scrollbackInvalid"
+            :aria-describedby="scrollbackInvalid ? 'scrollback-hint scrollback-error' : 'scrollback-hint'"
+            @input="editScrollback" />
+          <button class="control shrink-0" type="submit" :disabled="scrollbackSaving || authExpired">应用</button>
+        </div>
+        <p id="scrollback-hint" class="min-w-0 text-xs wrap-anywhere"
+          :class="scrollback === 0 || (scrollbackDraft !== '' && Number(scrollbackDraft) === 0)
+            ? 'text-[var(--limpet-warn)]' : 'text-[var(--limpet-muted)]'">
+          0 表示近似无限（浏览器上限 100 万行）；设为无限且历史过多时，可能导致内存升高、重连变慢或页面卡顿
+        </p>
+        <p v-if="scrollbackError" id="scrollback-error" role="alert" class="text-xs wrap-anywhere text-[var(--limpet-danger)]">
+          {{ scrollbackError }}
+        </p>
+        <p v-if="scrollbackFeedback" role="status" class="text-xs wrap-anywhere text-[var(--limpet-muted)]">
+          {{ scrollbackFeedback }}
+        </p>
+      </form>
       <p v-if="supportsLockWidth === false" role="status" class="mt-2 text-xs text-[var(--limpet-muted)]">
         旧版 worker 不支持锁定原宽
       </p>

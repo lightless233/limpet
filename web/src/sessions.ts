@@ -10,6 +10,14 @@ export interface SessionItem {
 }
 
 const POLL_INTERVAL_MS = 5000
+export const MAX_SCROLLBACK = 1_000_000
+
+export interface ScrollbackResult {
+  scrollback: number
+  applied: number
+  unsupported: number
+  failed: number
+}
 
 export function useSessions() {
   const sessions = ref<SessionItem[]>([])
@@ -17,6 +25,9 @@ export function useSessions() {
   const refreshing = ref(false)
   const loadError = ref('')
   const authExpired = ref(false)
+  const scrollback = ref(10_000)
+  let settingsVersion = 0
+  let appliedSettingsVersion = 0
   let refreshVersion = 0
   let scheduleNextPoll: (() => void) | undefined
 
@@ -27,6 +38,41 @@ export function useSessions() {
       return
     }
     return res
+  }
+
+  async function loadScrollback() {
+    if (authExpired.value) return scrollback.value
+    const version = ++settingsVersion
+    try {
+      const res = await request('/api/settings', { signal: AbortSignal.timeout(2000) })
+      if (res?.ok) {
+        const data: Pick<ScrollbackResult, 'scrollback'> = await res.json()
+        if (version > appliedSettingsVersion) {
+          scrollback.value = data.scrollback
+          appliedSettingsVersion = version
+        }
+      }
+    } catch {
+      // A failed read leaves the last successful value (or the default) usable.
+    }
+    return scrollback.value
+  }
+
+  async function saveScrollback(lines: number) {
+    const res = await request('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scrollback: lines }),
+    })
+    if (!res) throw new Error('登录已失效')
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error ?? 'HTTP ' + res.status)
+    }
+    const result: ScrollbackResult = await res.json()
+    appliedSettingsVersion = ++settingsVersion
+    scrollback.value = result.scrollback
+    return result
   }
 
   async function refresh(opts?: { silent?: boolean }) {
@@ -109,5 +155,8 @@ export function useSessions() {
     }
   }
 
-  return { sessions, loading, refreshing, loadError, authExpired, request, refresh, startAutoRefresh }
+  return {
+    sessions, loading, refreshing, loadError, authExpired, request, refresh, startAutoRefresh,
+    scrollback, loadScrollback, saveScrollback,
+  }
 }

@@ -24,6 +24,7 @@ function back() {
 
 onMounted(() => {
   void store.refresh()
+  void store.loadScrollback()
   stopAutoRefresh = store.startAutoRefresh(() => !activeId.value)
 })
 
@@ -50,6 +51,9 @@ onBeforeUnmount(() => {
       :sessions-loading="store.loading.value"
       :sessions-error="store.loadError.value"
       :auth-expired="store.authExpired.value"
+      :scrollback="store.scrollback.value"
+      :load-scrollback="store.loadScrollback"
+      :save-scrollback="store.saveScrollback"
       @refresh-sessions="store.refresh"
       @session-auth-expired="store.authExpired.value = true"
       @open-session="open"
