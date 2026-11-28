@@ -14,7 +14,7 @@
 //   S6 Shell 内 exit → 「会话已结束」，不再重连
 //   S7 列表里关闭会话 → 「会话已结束」
 //   S8 worker 被 kill -9 → 核对后「会话已结束」
-//   S9 移动视口（375）：接入、输入及快捷键状态
+//   S9 移动视口（375）：接入、快捷键、输入条发送和重连保稿
 //   S10 列表：表单提示与单会话关闭中状态
 // 设置环境变量 SHOTS=<目录> 时保存截图（接入后的桌面与移动视口各一张）。
 import { execFileSync, spawn } from 'node:child_process'
@@ -361,6 +361,12 @@ try {
   const mctx = await browser.newContext({ viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true })
   const mpage = await mctx.newPage()
   page = mpage
+  const inputFrames = []
+  page.on('websocket', (socket) => {
+    socket.on('framesent', ({ payload }) => {
+      if (Buffer.isBuffer(payload)) inputFrames.push(payload.toString('utf8'))
+    })
+  })
   const s9 = await createSession('重连-S9')
   await openInPage('重连-S9')
   has('移动视口下徽标为「已连接」', (await badgeText()) === '已连接', await badgeText())
@@ -373,6 +379,62 @@ try {
   await ctrl.click()
   await typeLine('echo MARK-9')
   has('移动视口下按键到达 Shell', (await recordedCount(s9, 'MARK-9', 2)) >= 2)
+
+  await page.getByRole('button', { name: '输入条', exact: true }).click()
+  const draft = page.getByRole('textbox', { name: '终端输入' })
+  const hasFocus = () => draft.evaluate((el) => document.activeElement === el)
+  const draftText = '# 输入条保留草稿'
+  await draft.fill(draftText)
+  const beforeIME = inputFrames.length
+  const imeCanceled = await draft.evaluate((el) => [
+    { isComposing: true },
+    { keyCode: 229 },
+  ].every((ime) => !el.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'Enter', bubbles: true, cancelable: true, ...ime,
+  }))))
+  has('IME 确认候选词时拦截 Enter 并保留草稿',
+    imeCanceled && await draft.inputValue() === draftText && inputFrames.length === beforeIME)
+  await draft.press('End')
+  await draft.press('Shift+Enter')
+  has('Shift+Enter 换行', await draft.inputValue() === draftText + '\n')
+  await draft.fill(draftText)
+
+  let resumeCheck
+  const reconnectCheck = new Promise((resolve) => { resumeCheck = resolve })
+  await page.route(listURL, async (route) => {
+    await reconnectCheck
+    await route.continue()
+  }, { times: 1 })
+  const checkingComposerSession = page.waitForRequest(listURL, { timeout: 8000 })
+  try {
+    relayCut()
+    await checkingComposerSession
+    await waitBadge('重连中')
+    await draft.press('Enter')
+    has('重连中提交失败时保留草稿',
+      await page.getByRole('button', { name: '发送', exact: true }).isDisabled() &&
+      await draft.inputValue() === draftText && inputFrames.length === beforeIME)
+  } finally {
+    resumeCheck()
+  }
+  await waitBadge('已连接')
+  has('重连就绪不抢输入条焦点，草稿完整', await hasFocus() && await draft.inputValue() === draftText)
+
+  const onlyText = '# 仅发字'
+  const submitText = ' 发送'
+  const beforeComposer = inputFrames.length
+  await draft.fill(onlyText)
+  await page.getByRole('button', { name: '仅发字', exact: true }).click()
+  has('仅发字成功后清空草稿', await draft.inputValue() === '')
+  await draft.fill(submitText)
+  await draft.press('Enter')
+  const frameDeadline = Date.now() + 3000
+  while (inputFrames.length < beforeComposer + 2 && Date.now() < frameDeadline) await sleep(25)
+  const sent = inputFrames.slice(beforeComposer)
+  has('仅发字不带回车，发送带单个回车',
+    sent.length === 2 && sent[0] === onlyText && sent[1] === submitText + '\r',
+    JSON.stringify(sent))
+  has('发送成功后清空草稿并保留输入条焦点', await draft.inputValue() === '' && await hasFocus())
   await shot(mpage, 'browser-mobile.png')
   await mctx.close()
 
