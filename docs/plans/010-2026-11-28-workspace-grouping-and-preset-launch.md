@@ -25,8 +25,8 @@ U1（后端 preset/cwd 校验与预检、LIMPET_WEB_LAUNCH=1 + .launch.json 生�
 - **关键改动与防坑点**：
   1. **闭合预设枚举、登录 Shell 检查与预检（`server/handlers.go`、`server/manager.go`、`server/session.go`）**：
      - 仅允许 `""` / `"shell"`、`"codex"`、`"agy"`；未知 `preset` 返回 `400`。
-     - `"shell"` 沿用 `[shell, "-i"]`；`"codex"` 与 `"agy"` 要求登录 Shell 属于 POSIX 兼容集合（`sh`、`bash`、`zsh`、`dash`、`ksh`，否则如 `fish` 返回 `500` 明确错误），并映射为 `[shell, "-lc", "exec \"$@\"", shell, "codex", "--yolo"]` / `[shell, "-lc", "exec \"$@\"", shell, "agy", "--dangerously-skip-permissions"]`（既通过登录启动文件获取完整 `PATH`，又跳过 `.zshrc` 防 `alias codex='limpet codex'` 套娃）。
-     - **目标可执行预检与快速退出边界**：启动 `codex`/`agy` 前，在 `workerEnv()`（或等价运行环境）与目标 `cwd` 下执行 `2s` 超时的 `shell -lc 'p=$(command -v -- "$1") && [ -n "$p" ] && [ -x "$p" ]' shell <bin>` 预检，缺失或不可执行立即 `500` 不拉起 worker；有效目标若在首次 `probe` 就绪前退出同样使 `POST /api/term` 返回 `500` 且不留登记，WS `1000` 仅指接入之后退出。
+     - `"shell"` 沿用 `[shell, "-i"]`。Codex/Agy 使用 `[shell, "-lic", launchScript, shell, preset, flag]` 加载交互式登录环境，包括 zsh 的 `.zshrc` 中初始化的 `PATH`。脚本固定为 `unset -f -- "$1" 2>/dev/null || true; exec "$@"`，取消同名函数并通过位置参数绕过同名别名。参数分别为 `--yolo` 和 `--dangerously-skip-permissions`。支持 `sh`、`bash`、`zsh`、`dash`、`ksh`，其他 shell（如 `fish`）返回 `500`。
+     - **目标可执行预检与快速退出边界**：启动 `codex`/`agy` 前，在与 PTY 等价的环境和目标 `cwd` 下执行 `5s` 超时的 `shell -lic` 预检。先清除别名和同名函数，再用 `command -v`、`-f` 与 `-x` 确认目标。缺失或不可执行时返回 `500`，不拉起 worker。有效目标若在首次 `probe` 就绪前退出，`POST /api/term` 返回 `500` 且不留登记。WS `1000` 仅用于接入之后退出。
      - **严禁**将 `cwd` 拼接到任何 Shell 命令行字符串中；`cwd` 仅通过 `cmd.Dir` 设置。
   2. **`cwd` 校验、旧 POST 兼容与自动命名去重（`server/handlers.go`、`server/manager.go`）**：
      - 规范化 `cwd`：空/纯空白→`$HOME`；`~`/`~/...` 展开并 `filepath.Clean`（不做 `EvalSymlinks`，保留非空有效空格）；非绝对路径、含 NUL、不存在或非目录（`os.Stat`）一律 `400`。
@@ -39,7 +39,7 @@ U1（后端 preset/cwd 校验与预检、LIMPET_WEB_LAUNCH=1 + .launch.json 生�
      - worker 显式保存并由 `probe` 返回 `ack.Name`/`ack.Cwd`/`ack.Cmd`（不从 `argv[0]` 误推 shell 名）；`manager.create()` **保持 `pendingIDs[id]` 占位期间先调用 `saveRegistry()`**，落盘成功后才写 `m.sessions[id]` 并删除 `pendingIDs[id]`；若 `saveRegistry()` 失败，撤销 `m.registry[id]`、保持 `pendingIDs[id]` 直至关闭本次 worker 并确认其 socket 已消失/不可拨号（`killWorker` 后等待 socket 失效，超时回退 `killHard()` + 删 socket）再释放 `pendingIDs[id]` 返回 `500`；`discover()` 恢复保留已有 `reg.Name` 并补齐缺失字段；`POST /api/term` 返回兼容超集 `{ id, name, cwd, cmd }`。
   4. **`GET /api/workspaces`（`server/main.go`、`server/handlers.go`、`server/manager.go`）**：
      - 短持 `m.mu` 汇总 `m.registry` 中非空且非 `$HOME` 的 `cwd`（按规范化路径取最大 `CreatedAt`），锁外 `os.Stat` 校验存在目录并按时间倒序（同时间按路径升序）输出 `~/` 缩写数组。
-- **完成证据**：带 `PKG_CONFIG_PATH` 执行 `go test -race -count=1 ./server` 全部通过，覆盖 Spec 010 §5.1 全部单测项（含精简 PATH + 登录文件 shim + `.zshrc` 陷阱隔离、unsupported shell、缺失命令 500、就绪前退出 shim 返回 500、`LIMPET_WEB_LAUNCH=1` 失败关闭及环境剥离、`saveRegistry` 失败期间 `pendingIDs` 防重发现与回滚、无 registry 条目恢复显式 `cmd`、旧空体 POST 兼容与去重、`GET /api/workspaces`）。
+- **完成证据**：带 `PKG_CONFIG_PATH` 执行 `go test -race -count=1 ./server` 全部通过，覆盖 Spec 010 §5.1 全部单测项（含精简基础 PATH 下仅由 `.zshrc` 引入 shim 且绕过同名别名与函数、unsupported shell、缺失命令 500、就绪前退出 shim 返回 500、`LIMPET_WEB_LAUNCH=1` 失败关闭及环境剥离、`saveRegistry` 失败期间 `pendingIDs` 防重发现与回滚、无 registry 条目恢复显式 `cmd`、旧空体 POST 兼容与去重、`GET /api/workspaces`）。
 
 ### U2：前端工作区聚合、快捷新建、样式升级与隔离端到端验收
 
@@ -56,7 +56,7 @@ U1（后端 preset/cwd 校验与预检、LIMPET_WEB_LAUNCH=1 + .launch.json 生�
   3. **隔离构建、浏览器回归、`systemd-run` 专项与收尾清理**：
      - 执行 `cd web && pnpm build`，带 `PKG_CONFIG_PATH` 编译 `go build -tags limpet_embed -o .runtime/limpet-server-010 ./server`。
      - **既有 S1–S10 回归**：传绝对路径 `SERVER_BIN="$PWD/.runtime/limpet-server-010"`、`LIMPET_HOME="$PWD/.runtime/dev-home-010"`、空闲 `PORT`（`PORT` 与 `PORT+2` 空闲）与 `LIMPET_WORKER_LAUNCH=direct` 运行 `node tests/limet-reconnect-browser-test.mjs`，确认 **10/10 场景**（因 `worker <uuid>` 参数保持不变，S8 `pgrep` 无需改动）全部通过。
-     - **Spec 010 §5.2 专项 Playwright 验收**：在独立临时目录跑通分组/同名消歧/折叠与 `#quick-switch`、延迟 `GET /api/term` 验证非阻塞立即直开、组头 `+` 秒建与 `-2` 去重、精简基础 PATH + 登录文件 shim + 隔离 `.zshrc` 陷阱验证 `codex --yolo` 与 `agy --dangerously-skip-permissions` 真实启动及 `cwd`、桌面悬停按钮可点、`360px` 下**整页与侧边栏容器内部均无横向溢出**。
+     - **Spec 010 §5.2 专项 Playwright 验收**：在独立临时目录跑通分组/同名消歧/折叠与 `#quick-switch`、延迟 `GET /api/term` 验证非阻塞立即直开、组头 `+` 秒建与 `-2` 去重、精简基础 PATH 下仅在隔离 `.zshrc` 引入 shim 并定义陷阱别名和函数，验证 `codex --yolo` 与 `agy --dangerously-skip-permissions` 真实启动及 `cwd`、桌面悬停按钮可点、`360px` 下**整页与侧边栏容器内部均无横向溢出**。
      - **真实 `systemd-run --user` 专项验收**：在同一隔离临时目录以 `LIMPET_WORKER_LAUNCH=systemd-run` 启动内嵌 server，创建预设会话并核对独立 `limpet-worker-<uuid>.service` 单元、真实 `cwd` 与参数、以及重启 server 后 `recoverWorkers` 恢复全部元数据。
      - **清理顺序**：按 UUID 关闭本轮剩余测试会话 → 普通 `kill` 停测试 server → 彻底删除 `.runtime/dev-home-010`、`.runtime/limpet-server-010` 与本轮临时脚本（确保工作区干净、U2 无 `server/` 改动、`~/.limpet-dev` 与 `~/.limpet` 未受触碰）。
 - **完成证据**：`cd web && pnpm build` PASS、U1 `go test -race -count=1 ./server` 基准有效、既有 `10/10` + Spec 010 §5.2 Playwright + `systemd-run --user` 专项全部通过，仓库干净无残留。

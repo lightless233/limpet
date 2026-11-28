@@ -53,8 +53,13 @@ func loginFixture(t *testing.T) string {
 	t.Setenv("ZDOTDIR", home)
 	t.Setenv("PATH", "/usr/bin:/bin")
 	t.Setenv("SHELL", zsh)
-	writeLaunchFixture(t, filepath.Join(home, ".zprofile"), "export PATH=\"$HOME/bin:$PATH\"\n", 0o600)
-	writeLaunchFixture(t, filepath.Join(home, ".zshrc"), "alias codex='false'\nalias agy='false'\nexport LIMPET_TEST_RC=loaded\n", 0o600)
+	writeLaunchFixture(t, filepath.Join(home, ".zshrc"), `export PATH="$HOME/bin:$PATH"
+codex() { printf '%s\n' codex-function >> "$HOME/preset-trap"; return 1; }
+agy() { printf '%s\n' agy-function >> "$HOME/preset-trap"; return 1; }
+alias codex='printf "%s\n" codex-alias >> "$HOME/preset-trap"; false'
+alias agy='printf "%s\n" agy-alias >> "$HOME/preset-trap"; false'
+export LIMPET_TEST_RC=loaded
+`, 0o600)
 	return bin
 }
 
@@ -77,8 +82,11 @@ func TestWebPresetLaunchAndRecover(t *testing.T) {
 			t.Fatalf("POST = %v, want %v", reply, want)
 		}
 		data, err := os.ReadFile(filepath.Join(cwd, "preset-result"))
-		if want := cwd + "|" + entry.flag + "|unset|unset\n"; err != nil || string(data) != want {
+		if want := cwd + "|" + entry.flag + "|unset|loaded\n"; err != nil || string(data) != want {
 			t.Fatalf("PTY startup = %q, %v, want %q", data, err, want)
+		}
+		if trap, err := os.ReadFile(filepath.Join(filepath.Dir(bin), "preset-trap")); !os.IsNotExist(err) {
+			t.Fatalf("interactive preset trap = %q, %v", trap, err)
 		}
 		if err := os.Remove(filepath.Join(cwd, "preset-result")); err != nil {
 			t.Fatal(err)
@@ -129,8 +137,11 @@ func TestWebPresetRejectedAndEarlyExit(t *testing.T) {
 	if files, err := os.ReadDir(m.workersDir); err != nil || len(files) != 0 {
 		t.Fatalf("preflight started a worker: %v, %v", files, err)
 	}
-	writeLaunchFixture(t, filepath.Join(bin, "codex"), "#!/bin/sh\nexit 0\n", 0o700)
+	writeLaunchFixture(t, filepath.Join(bin, "codex"), "#!/bin/sh\n: > \"$HOME/preset-ran\"\nexit 0\n", 0o700)
 	check("{\"preset\":\"codex\"}", 500, "worker")
+	if _, err := os.Stat(filepath.Join(filepath.Dir(bin), "preset-ran")); err != nil {
+		t.Fatalf("early-exit shim did not run: %v", err)
+	}
 }
 
 func TestWebCreateCwdAndConcurrentNames(t *testing.T) {

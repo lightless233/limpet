@@ -41,9 +41,12 @@ func webPreset(preset, cwd string) (webLaunchConfig, error) {
 	default:
 		return webLaunchConfig{}, fmt.Errorf("预设 %s 不支持登录 Shell %s", preset, filepath.Base(shell))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	check := exec.CommandContext(ctx, shell, "-lc", `p=$(command -v -- "$1") && [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]`, shell, preset)
+	check := exec.CommandContext(ctx, shell, "-lic", `
+unalias -a 2>/dev/null || true
+unset -f -- "$1" 2>/dev/null || true
+p=$(command -v -- "$1") && [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]`, shell, preset)
 	check.Dir, check.Env = cwd, append(cliEnv(), "TERM=xterm-256color")
 	if err := check.Run(); err != nil {
 		if ctx.Err() != nil {
@@ -56,7 +59,8 @@ func webPreset(preset, cwd string) (webLaunchConfig, error) {
 		flag = "--dangerously-skip-permissions"
 	}
 	config.Cmd = preset
-	config.Argv = []string{shell, "-lc", `exec "$@"`, shell, preset, flag}
+	// zsh's exec can resolve a shell function in its default mode.
+	config.Argv = []string{shell, "-lic", `unset -f -- "$1" 2>/dev/null || true; exec "$@"`, shell, preset, flag}
 	return config, nil
 }
 

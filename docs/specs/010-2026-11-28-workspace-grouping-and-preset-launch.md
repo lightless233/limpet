@@ -9,7 +9,7 @@
 
 1. **Web 端预设快捷新建与历史目录直选**：支持在 Web 端按项目路径直接启动交互式 `Shell`、`codex --yolo` 或 `agy --dangerously-skip-permissions`，带目标路径/预设的新建自动按 `<目录名>-<命令名>` 命名并去重，建完立即打开进入终端。
 2. **侧边栏工作区（`workspace`）聚合与样式瘦身**：将同一工作路径下的会话聚合为可折叠的工作区组（默认展示项目名、组头 `+` 一键秒建），移除每行冗余的路径文字，采用更清晰的紧凑两行卡片与悬停/触控自适应操作按钮。
-3. **跨 `direct` 与 `systemd-run` 的一致行为**：无论服务以开发环境还是正式 `systemd --user` 运行，预设 CLI 均能完整解析用户登录 `PATH` 而不触发交互式 Shell 别名自递归，缺失命令或就绪前失败及时报错回滚，并在 server 重启恢复后保留完整的 `cwd` 与 `cmd`。
+3. **跨 `direct` 与 `systemd-run` 的一致行为**：预设 CLI 从用户的交互式登录环境取得 `PATH`，绕过同名别名和函数。缺失命令或就绪前失败时返回错误并回滚，server 重启恢复后保留 `cwd` 与 `cmd`。
 
 ## 一、后端预设启动、目录校验与 HTTP API 契约
 
@@ -21,17 +21,18 @@
   - 沿用用户默认交互式 Shell 启动：`argv = [shell, "-i"]`（`shell` 沿用 `os.Getenv("SHELL")` 回退 `loginShell()`）；
   - 元数据 `cmd` 记为 `filepath.Base(shell)`。
 - **`"codex"`**：
-  - 通过非交互登录 Shell 解析完整环境并直替进程：`argv = [shell, "-lc", "exec \"$@\"", shell, "codex", "--yolo"]`；
+  - 使用交互式登录 Shell，`argv = [shell, "-lic", launchScript, shell, "codex", "--yolo"]`；
   - 元数据 `cmd` 记为 `"codex"`。
 - **`"agy"`**：
-  - 通过非交互登录 Shell 解析完整环境并直替进程：`argv = [shell, "-lc", "exec \"$@\"", shell, "agy", "--dangerously-skip-permissions"]`；
+  - 使用交互式登录 Shell，`argv = [shell, "-lic", launchScript, shell, "agy", "--dangerously-skip-permissions"]`；
   - 元数据 `cmd` 记为 `"agy"`。
-- **登录 Shell 兼容范围与 PATH 前提**：
-  - `-lc 'exec "$@"'` 仅支持 POSIX 位置参数语法的登录 Shell（`sh`、`bash`、`zsh`、`dash`、`ksh`）。若解析出的登录 Shell 不在此支持集合（如 `fish`，其位置参数与语法不兼容 `"$@"`），直接返回 `500` 与明确错误信息，不尝试启动。
-  - 目标命令（`codex` / `agy`）必须可由登录 Shell 的登录启动文件（如 `.zshenv`、`.zprofile`、`.zlogin`、`.bash_profile`、`.profile`）纳入 `PATH`，而非仅在交互式 `.zshrc` 中初始化；采用 `-lc` 可跳过交互式 `.zshrc` 别名（避免触发 `alias codex='limpet codex'` 导致 worker 套娃），且 `exec` 替换自身不残留多余壳进程。
+- **交互式登录 Shell 兼容范围与 PATH 前提**：
+  - `-lic` 预设仅支持 `sh`、`bash`、`zsh`、`dash`、`ksh`。若解析出的登录 Shell 不在此支持集合（如 `fish`），直接返回 `500` 与明确错误信息。
+  - `-lic` 按 shell 的规则加载交互式登录环境。zsh 会加载 `.zprofile` 和 `.zshrc`（如存在），因此仅在 `.zshrc` 初始化的 nvm 或 `~/.local/bin` 也能进入 `PATH`。Bash 通过登录启动文件中已有的加载逻辑读取 `.bashrc`。
+  - `launchScript` 固定为 `unset -f -- "$1" 2>/dev/null || true; exec "$@"`。默认 zsh 的 `exec` 可能解析到同名函数，因此先取消该函数。目标命令通过位置参数展开，避开同名别名，`exec` 用可执行文件替换 shell 进程。
   - **严禁**把工作路径 `cwd` 拼接进任何 Shell 命令字符串，工作目录仅通过子进程 `cmd.Dir` 设置。
 - **目标可执行预检与快速退出边界**：
-  - 启动 `"codex"` 或 `"agy"` 前，server 在 `workerEnv()`（或等价运行环境）及目标 `cmd.Dir = cwd` 下执行一次有界（`2s` 超时）登录 Shell 预检（如 `shell -lc 'p=$(command -v -- "$1") && [ -n "$p" ] && [ -x "$p" ]' shell <bin>`）。
+  - 启动 `"codex"` 或 `"agy"` 前，server 在与 PTY 等价的环境及目标 `cmd.Dir = cwd` 下执行一次 `5s` 超时的 `shell -lic` 预检。先执行 `unalias -a 2>/dev/null || true` 和 `unset -f -- "$1" 2>/dev/null || true`，再用 `command -v -- "$1"` 查找目标，校验结果非空且是可执行的普通文件（`-f` 与 `-x`）。
   - 若目标命令缺失或不可执行，**不拉起 worker**（也不空等 `5s` 就绪超时，更不返回假 `200`），`POST /api/term` 立即返回 `500 Internal Server Error` 与明确错误提示（如 `未在登录环境中找到 codex`）。
   - 若目标命令有效且拉起 worker 后在首次 `probe` 就绪前即退出（`ending` / worker 退出导致无法通过就绪探测），`POST /api/term` 同样返回 `500` 明确失败并清理残留，**不**登记活跃会话、**不**返回 `200`（此时尚未建立任何 WebSocket 连接，不适用 WS `1000`）。
   - 仅在会话通过就绪探测并有 viewer 接入后才进入运行期退出语义：之后目标进程退出向已接入 viewer 发送 WS 关闭码 `1000`（`ended`）并从活跃列表移除，不退回 Shell。
@@ -72,7 +73,7 @@
   - **崩溃残留边界**：若 `limpet-server` 在原子写入 `.launch.json` 之后、拉起 worker 之前被 `SIGKILL` 强杀，残留的 `.launch.json` 不会被 `scanWorkers`（仅扫描 `*.sock`）识别为会话，也不会触发任何自动执行；定期清扫孤儿 `.launch.json` 不在本期范围。
   - **严格保留 `s.cli == false`**：由 `LIMPET_WEB_LAUNCH=1` 启动的 Web 会话保持 `s.cli == false` 且无需等待首个 viewer 即可 `probe` 就绪，保持既有 Web 多视图协同 resize 语义不变。
 - **`probe` 显式 `cmd` 与注册表发布/回滚顺序**：
-  - worker 从 `.launch.json` 保存显式 `name`、`cwd`、`cmd` 并由 `probe` 握手应答如实返回 `ack.Name`、`ack.Cwd`、`ack.Cmd`（严禁从 `[shell, "-lc", ...]` 的 `argv[0]` 推导而把 `codex`/`agy` 误报为 `zsh`）。
+  - worker 从 `.launch.json` 保存显式 `name`、`cwd`、`cmd` 并由 `probe` 握手应答如实返回 `ack.Name`、`ack.Cwd`、`ack.Cmd`（严禁从 `[shell, "-lic", ...]` 的 `argv[0]` 推导而把 `codex`/`agy` 误报为 `zsh`）。
   - **先落盘后发布、`pendingIDs` 全程遮蔽**：`manager.create()` 在 worker `probe` 就绪后，**保持 `m.pendingIDs[id]` 占位期间**写入 `m.registry[id]` 并执行 `m.saveRegistry()`；
     - 仅当 `saveRegistry()` 返回 `nil` 时，在 `m.mu` 下写入 `m.sessions[id] = h` 并删除 `m.pendingIDs[id]` 对外发布；
     - 若 `saveRegistry()` 失败，在 `m.mu` 下撤销 `m.registry[id]`，**继续保持 `m.pendingIDs[id]` 占位**直到终止新拉起的 worker 并确认其 socket 已消失或不可拨号（`killWorker` 后等待 socket 清理/失效，超时则回退 `killHard()` 并移除 socket，**不能**仅凭收到 `killWorker` 应答就视为已关闭），全部收尾完成后才释放 `pendingIDs[id]` 并返回 `500 Internal Server Error`，从而彻底防止并发 `GET /api/term` 在关闭窗口重新发现并登记半死 worker。
@@ -165,8 +166,8 @@
 ### 5.1 后端 Go 单测（`go test -race -count=1 ./server`）
 
 1. **预设、登录 Shell 语法、PATH 隔离、预检与就绪前退出边界**：
-   - 验证 `""`/`"shell"`、`"codex"`、`"agy"` 均合法并产出预期 `cmd` 与 `argv`（`codex --yolo` 与 `agy --dangerously-skip-permissions` 走 `shell -lc 'exec "$@"'`），未知 `preset` 返回 `400`，`cwd` 仅通过 `cmd.Dir` 传递；
-   - 以精简基础 `PATH` + 仅在登录启动文件暴露目标 shim + 隔离 `.zshrc` 内置陷阱别名为条件，验证端到端真实按 `--yolo`/`--dangerously-skip-permissions` 启动且不触发 `.zshrc` 别名；
+   - 验证 `""`/`"shell"`、`"codex"`、`"agy"` 均合法并产出预期 `cmd` 与 `argv`。Codex/Agy 经 `shell -lic` 取消同名函数后直替进程，未知 `preset` 返回 `400`，`cwd` 仅通过 `cmd.Dir` 传递；
+   - 使用精简基础 `PATH`，仅在隔离的 `.zshrc` 加入 shim 目录，同时定义同名陷阱别名和函数。验证预检通过，PTY 加载了交互环境并按 `--yolo`/`--dangerously-skip-permissions` 实际运行 shim，陷阱均未触发；
    - 验证不支持的登录 Shell（如 `fish`）与目标命令缺失时，在拉起 worker 前立即返回 `500` 错误且不等待 5s 超时也不残留 worker；
    - **就绪前快速退出边界**：验证使用有效可执行 shim（拉起后立即正常退出 `exit 0`）在首次 `probe` 就绪前结束时，`POST /api/term` 返回 `500` 且不留下已登记会话或假 `200`。
 2. **`cwd` 校验与规范化**：空/空白规范为 `$HOME`、`~` 与 `~/sub` 正确展开并 Clean、保留合法目录空格；相对路径、不存在路径、普通文件路径、含 NUL 字节路径一律 `400`。
@@ -195,7 +196,7 @@
    - **非阻塞验证**：刻意延迟 `GET /api/term` 刷新响应，验证通过顶栏或组头 `+` 提交 `POST /api/term` 成功后不等待列表刷新即展开分组并打开进入新终端；
    - 在某组头点 `+` 连选两次快速创建，验证无确认弹窗且自动 `-2` 去重、同组请求中防连点、后端错误展示列表告警。
 4. **登录 PATH + 防别名套娃与 `360px` 内外无溢出**：
-   - 在隔离测试环境的精简基础 `PATH` 下，仅在登录文件暴露临时 `codex`/`agy` shim，并在隔离 `.zshrc` 放置可检测别名标记，端到端验证通过网页创建的 `codex`/`agy` 会话在目标 `cwd` 真实带 `--yolo`/`--dangerously-skip-permissions` 启动且未触发 `.zshrc` 别名；
+   - 在隔离测试环境的精简基础 `PATH` 下，仅通过 `.zshrc` 加入临时 `codex`/`agy` shim 目录并定义同名陷阱别名和函数。端到端验证通过网页创建的会话在目标 `cwd` 带正确参数启动，且陷阱均未触发；
    - 在 `360px` 视口下以长消歧项目名与长路径断言**文档与侧边栏容器内部均无横向溢出**，且粗指针下操作按钮热区合规。
 5. **真实 `systemd-run --user` 专项验收**：
    - 在同一隔离临时目录以 `LIMPET_WORKER_LAUNCH=systemd-run` 启动内嵌二进制测试 server，创建一条指定 `cwd` 与 `codex`（或 `agy`）预设会话，确认其运行在独立 `limpet-worker-<uuid>.service` 临时单元、真实 `cwd` 与启动参数符合预期，且重启 test server 后能被完整找回（`cwd`/`cmd`/`name` 不丢）；最后按 UUID 关闭会话并停掉测试 server、清理临时单元与目录。
