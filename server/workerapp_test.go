@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -159,8 +160,9 @@ func skipPreamble(t *testing.T, c net.Conn) (frameType, []byte, error) {
 }
 
 // 验收①：连续高频小包合并成更少的 ftOutput 帧，字节无丢失、顺序一致。
-// 先落一帧首包让 lastFlush 生效，再以 ~1ms 间隔持续发碎包，使其全部落入
-// 16ms 合批窗口——覆盖 batchWait 时间窗路径，而非首包的非阻塞 drain 快路径。
+// 先落一帧首包让 lastFlush 生效，随后并发实时读帧（net.Pipe 无缓冲，若等发送
+// 完再读，泵会卡在写管道上，旧版无时间窗的 drain 也能把积压合并成极少帧，
+// 测试就失去分辨力），主协程以 ~1ms 间隔持续发碎包，使其全部落入 16ms 合批窗口。
 func TestServeViewerBatchesBurstOutput(t *testing.T) {
 	client, v, _, _ := pumpViewer(t)
 	emit(v, "h")
@@ -173,32 +175,56 @@ func TestServeViewerBatchesBurstOutput(t *testing.T) {
 	for i := 0; i < chunks; i++ {
 		want.WriteString("abcd")
 	}
+	type burstReading struct {
+		out    string
+		frames int
+		err    error
+	}
+	resCh := make(chan burstReading, 1)
+	go func() {
+		var got strings.Builder
+		frames := 0
+		_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			k, b, rerr := readFrame(client)
+			if rerr != nil {
+				if errors.Is(rerr, os.ErrDeadlineExceeded) {
+					rerr = nil // 读限超时即输出已安静（合批窗口早已结束）
+				}
+				resCh <- burstReading{out: got.String(), frames: frames, err: rerr}
+				return
+			}
+			_ = client.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+			switch k {
+			case ftOutput:
+				got.Write(b)
+				frames++
+			default:
+				resCh <- burstReading{out: got.String(), frames: frames, err: fmt.Errorf("意外帧 %v: %q", k, b)}
+				return
+			}
+		}
+	}()
 	for i := 0; i < chunks; i++ {
 		emit(v, "abcd")
 		time.Sleep(time.Millisecond)
 	}
-	var got strings.Builder
-	frames := 0
-	// 滚动读帧：每读一帧把读限顺延 150ms，超时即输出已安静（合批窗口早已结束）。
-	for kind, body, err = readFrameDeadline(client, 2*time.Second); err == nil; kind, body, err = readFrameDeadline(client, 150*time.Millisecond) {
-		switch kind {
-		case ftOutput:
-			got.Write(body)
-			frames++
-		case ftSize:
-			t.Fatalf("意外尺寸帧 %q", body)
-		case ftExit:
-			t.Fatal("意外退出帧")
-		}
+	var res burstReading
+	select {
+	case res = <-resCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("并发读帧未收尾")
 	}
-	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("读帧失败: %v", err)
+	if res.err != nil {
+		t.Fatalf("读帧失败: %v", res.err)
 	}
-	if got.String() != want.String() {
-		t.Fatalf("输出字节不一致: got %d bytes, want %d bytes", got.Len(), want.Len())
+	if res.out != want.String() {
+		t.Fatalf("输出字节不一致: got %d bytes, want %d bytes", len(res.out), want.Len())
 	}
-	if frames >= chunks/10 {
-		t.Fatalf("%d 个碎包写出了 %d 帧，未有效合批", chunks, frames)
+	// 旧版逐包直发（drain 至多并掉排队中的相邻包）会有近 chunks 帧；
+	// 16ms 时间窗合批应远低于 chunks/5。
+	if res.frames >= chunks/5 {
+		t.Fatalf("%d 个碎包写出了 %d 帧，未有效合批", chunks, res.frames)
 	}
 	if queued := v.queued.Load(); queued != 0 {
 		t.Errorf("合批后 queued 未清零: %d", queued)

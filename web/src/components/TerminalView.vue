@@ -312,15 +312,15 @@ function parseDimensions(ctl: Dimensions): Dimensions | undefined {
   }
 }
 
-// ---- 输出合批与渲染节流 ----
-// WS 的二进制分片先在轻量队列里合并成一个 Uint8Array，再一次性喂给 write()。
+// ---- 输出写入与渲染节流 ----
+// 字节同步 write()：后端已有 16ms 微批合帧，前端不再异步合批——异步队列会让
+// 未锁宽模式下本地 ResizeObserver 的 resize 插队到已到达的 VT 字节之前，越序。
 // setRenderingPaused 只推迟绘制：字节始终持续喂入，Ghostty WASM 状态、终端
 // 查询回复与 scrollback 实时准确，不积压也不丢帧。
 const THROTTLE_BURST_BYTES = 32 * 1024 // 每秒输出超过该字节数视为高频爆发
 const THROTTLE_SLOW_FRAME_MS = 12 // 单次喂入耗时超过该值视为慢帧
 const THROTTLE_IDLE_UNPAUSE_MS = 80 // 输出停顿这么久立即解除暂停刷出画面
-const outbox: Uint8Array[] = []
-let outboxTimer = 0
+const INTERACTIVE_GRACE_MS = 120 // 用户交互后这段时间不节流，保住刚解除的绘制
 let lastOutputAt = 0
 let burstBytes = 0
 let burstWindowAt = 0
@@ -329,53 +329,19 @@ let renderPaused = false
 let pauseTimer = 0
 let idleTimer = 0
 let unpauseRaf = 0
+// write() 执行中：core 的分块回调会同步发出终端查询回包（走 onData）。它们
+// 照常 sendInput，但不得惊动节流状态机，更不得抢先注册决策帧。
+let writing = false
+let interactiveUntil = 0
 
 function setRenderingPaused(paused: boolean) {
   term.value?.instance?.setRenderingPaused(paused)
 }
 
-function scheduleOutboxFlush() {
-  if (outboxTimer) return
-  outboxTimer = window.setTimeout(flushOutbox, 0)
-}
-
-function flushOutbox() {
-  if (outboxTimer) {
-    clearTimeout(outboxTimer)
-    outboxTimer = 0
-  }
-  if (!outbox.length) return
-  let total = 0
-  for (const chunk of outbox) total += chunk.length
-  const merged = new Uint8Array(total)
-  let at = 0
-  for (const chunk of outbox) {
-    merged.set(chunk, at)
-    at += chunk.length
-  }
-  outbox.length = 0
-  const started = performance.now()
-  term.value?.write(merged)
-  const cost = performance.now() - started
-  lastFrameCost = lastFrameCost === 0 ? cost : lastFrameCost * 0.6 + cost * 0.4
-  const now = performance.now()
-  if (now - burstWindowAt >= 1000) {
-    burstWindowAt = now
-    burstBytes = 0
-  }
-  burstBytes += merged.length
-  if (renderPaused) {
-    // 输出仍在持续：顺延「停顿解除」；节拍解除照常到点刷出。
-    clearTimeout(idleTimer)
-    idleTimer = window.setTimeout(endRenderPause, THROTTLE_IDLE_UNPAUSE_MS)
-  } else {
-    maybeThrottle()
-  }
-}
-
 // 爆发判定：输出流正在进行中，且吞吐超阈值或上一帧偏慢。
 function shouldThrottle(): boolean {
   if (document.visibilityState !== 'visible') return false
+  if (performance.now() < interactiveUntil) return false
   if (performance.now() - lastOutputAt > 40) return false
   return burstBytes >= THROTTLE_BURST_BYTES || lastFrameCost > THROTTLE_SLOW_FRAME_MS
 }
@@ -414,6 +380,8 @@ function endRenderPause() {
   if (!renderPaused) return
   renderPaused = false
   setRenderingPaused(false)
+  // WTerm 的绘制 rAF 在 setRenderingPaused(false) 内先注册，决策帧后注册：
+  // 同帧 FIFO 先画完再决定下一拍。armUnpauseDecision 只允许出现在这里。
   armUnpauseDecision()
 }
 
@@ -428,27 +396,27 @@ function armUnpauseDecision() {
   })
 }
 
-// 用户输入或窗口重新聚焦：立即解除暂停刷出最新画面，绝不留在 paused 状态；
-// 并保证至少完整画完这一帧，之后才由 maybeThrottle 决定是否继续节流。
+// 用户输入或窗口重新聚焦：立即解除暂停刷出最新画面，绝不留在 paused 状态。
+// interactiveUntil 交互宽限让 shouldThrottle 暂时为 false，刚解除的绘制不会被
+// 后续输出抢先把节流挂回去。这里绝不注册决策帧——决策帧只能紧跟
+// setRenderingPaused(false) 注册（见 endRenderPause），否则会在下一帧反超
+// WTerm._flushRenders 而误杀绘制。
 function requestImmediateRender() {
   clearTimeout(pauseTimer)
   clearTimeout(idleTimer)
   pauseTimer = idleTimer = 0
-  if (renderPaused) {
-    renderPaused = false
-    setRenderingPaused(false)
-  }
-  armUnpauseDecision()
+  interactiveUntil = performance.now() + INTERACTIVE_GRACE_MS
+  if (!renderPaused) return
+  renderPaused = false
+  setRenderingPaused(false)
 }
 
-// 断线、重连或卸载：清空缓存队列与所有定时器，旧连接的残余字节绝不串进新实例。
+// 断线、重连或卸载：清空节流状态与所有定时器，旧连接的残余绝不串进新实例。
 function resetThrottle() {
   cancelAnimationFrame(unpauseRaf)
   clearTimeout(pauseTimer)
   clearTimeout(idleTimer)
-  clearTimeout(outboxTimer)
-  unpauseRaf = pauseTimer = idleTimer = outboxTimer = 0
-  outbox.length = 0
+  unpauseRaf = pauseTimer = idleTimer = 0
   if (renderPaused) {
     renderPaused = false
     setRenderingPaused(false)
@@ -457,19 +425,39 @@ function resetThrottle() {
   burstBytes = 0
   burstWindowAt = 0
   lastFrameCost = 0
+  interactiveUntil = 0
 }
 
 function deliver(event: Uint8Array | Dimensions) {
   if (!termReady) {
     pending.push(event)
   } else if (event instanceof Uint8Array) {
+    // 同步 write 保证 VT 字节与本地 resize、尺寸事件的先后与到达顺序一致。
     lastOutputAt = performance.now()
-    outbox.push(event)
-    scheduleOutboxFlush()
+    const started = performance.now()
+    writing = true
+    try {
+      term.value?.write(event)
+    } finally {
+      writing = false
+    }
+    const cost = performance.now() - started
+    lastFrameCost = lastFrameCost === 0 ? cost : lastFrameCost * 0.6 + cost * 0.4
+    const now = performance.now()
+    if (now - burstWindowAt >= 1000) {
+      burstWindowAt = now
+      burstBytes = 0
+    }
+    burstBytes += event.length
+    if (renderPaused) {
+      // 输出仍在持续：顺延「停顿解除」；节拍解除照常到点刷出。
+      clearTimeout(idleTimer)
+      idleTimer = window.setTimeout(endRenderPause, THROTTLE_IDLE_UNPAUSE_MS)
+    } else {
+      maybeThrottle()
+    }
   } else {
-    // 尺寸帧严格保序：先同步刷空此前缓存的输出字节再 resize，
-    // 保证尺寸不会越过前后的 VT 字节。props 同时保留当前几何。
-    flushOutbox()
+    // 前序字节均已同步写入，直接 resize 天然严格保序。props 同时保留当前几何。
     remoteSize.value = event
     term.value?.resize(event.cols, event.rows)
   }
@@ -492,7 +480,9 @@ function sendInput(bytes: Uint8Array): boolean {
 }
 
 function onData(chunk: string) {
-  requestImmediateRender()
+  // write() 期间 core 分块回调同步发出的查询回包不是用户输入：照常发送，
+  // 但不触发 requestImmediateRender（否则会抢先注册决策帧/宽限，见节流段注释）。
+  if (!writing) requestImmediateRender()
   if (ctrlSticky.value) {
     ctrlSticky.value = false
     if (chunk.length === 1) {
@@ -771,9 +761,15 @@ function reloadPage() {
     <div v-if="fatalError" class="min-h-0 flex-1 overflow-auto p-4 text-sm text-[var(--limpet-danger)]">
       {{ fatalError }}
     </div>
+    <!-- 捕获阶段先于 .wterm 的 mousedown/wheel 处理解除节流暂停：WebGL 模式下
+         wterm 会在这些事件里先 _syncText 再隐藏 GPU canvas，而 paused 时
+         _syncText 会跳过，露出一块过期 DOM。touchstart 覆盖移动端滚动。 -->
     <div v-else class="terminal-viewport flex min-h-0 min-w-0 flex-1 flex-col"
       :class="{ 'terminal-locked': lockedWidth }" :style="terminalStyle"
-      :inert="status === 'connecting' || status === 'reconnecting'">
+      :inert="status === 'connecting' || status === 'reconnecting'"
+      @mousedown.capture="requestImmediateRender"
+      @wheel.capture.passive="requestImmediateRender"
+      @touchstart.capture.passive="requestImmediateRender">
       <div class="relative min-h-0 min-w-0 flex-1">
         <Terminal
           v-if="core"
